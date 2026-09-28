@@ -1,0 +1,8 @@
+#!/bin/sh
+# git askpass：用户名取 $GIT_USERNAME（Gitee OAuth 用 oauth2、GitHub 用 x-access-token），
+# 密码取会话令牌文件。
+# 与平台无关 —— 令牌来自 Gitee 还是 GitHub 由会话注入，脚本不关心。
+case "$1" in
+  Username*) echo "${GIT_USERNAME:-oauth2}" ;;
+  Password*) cat /ai_coding/.secrets/git_token ;;
+esac

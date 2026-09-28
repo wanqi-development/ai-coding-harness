@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ai-coding-harness 沙箱内的 Maven 配置。
+
+  由 provider 推入 /ai_coding/maven/settings.xml，setup.sh 再复制到 $HOME/.m2/settings.xml，
+  所以任何 `mvn` 命令都不需要加 `-s` 参数即可生效。它管两件事：
+
+  1. mirror —— 所有远程仓库都走阿里云公共仓库。国内直连 Maven Central 很慢，而沙箱是按会话
+     新建的，「每次构建都重新下依赖」会把大半时间花在等网络；
+  2. localRepository —— 固定写 /ai_coding/.m2/repository。这个路径在**沙箱卷**上
+     （见 SANDBOX_MAVEN_CACHE_* 那组配置），所以容器被重建 / 换新之后依赖仍然在，
+     不必重新下载一遍。
+
+  改这个文件不需要改代码：建会话时整棵推入（改完新建会话即生效）。
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+  <localRepository>/ai_coding/.m2/repository</localRepository>
+
+  <mirrors>
+    <mirror>
+      <id>aliyunmaven</id>
+      <mirrorOf>*</mirrorOf>
+      <name>阿里云公共仓库</name>
+      <url>https://maven.aliyun.com/repository/public</url>
+    </mirror>
+  </mirrors>
+</settings>

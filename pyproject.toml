@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-coding-harness"
+version = "0.1.0"
+description = "Coding-assist harness agent built on deepagents + OpenSandbox"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents",
+    "langchain-openai",
+    "langgraph",
+    "langgraph-checkpoint-postgres",
+    "psycopg[binary]",
+    # 多 worker 时的跨进程旁路状态（运行缓冲 / 会话运行权 / 熔断状态）。
+    # 不配 REDIS_URL 时用不到它 —— 代码里是懒 import，单 worker 部署照旧跑。
+    "redis>=5.0",
+    "sqlalchemy[asyncio]",
+    "alembic",
+    "fastapi",
+    "uvicorn[standard]",
+    "sse-starlette",
+    "pydantic-settings",
+    "opensandbox",
+    "httpx",
+    "markdownify",
+    "beautifulsoup4",
+    "zai-sdk",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_coding_harness"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

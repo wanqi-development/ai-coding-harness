@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+# `.env` 的变体（`.env.local` / `.env.bak` …）同样不进库；示例文件要留着
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+logs/
+.idea/
+.vscode/
+# Claude Code 的**本机**设置（权限允许清单里是这台机器的绝对路径），工程级的
+# `.claude/launch.json` 照旧进库
+.claude/settings.local.json

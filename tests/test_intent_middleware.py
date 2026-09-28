@@ -1,0 +1,125 @@
+"""意图指令：按 ``configurable.intent`` 注入到模型真正收到的系统消息。
+
+不跑真 LLM：用一个只记录入参的假模型，直接检查它拿到什么。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field
+
+from ai_coding_harness.agent.graph import build_agent
+from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM
+from ai_coding_harness.safety.policy import policy_for
+
+_SYSTEM_PROMPT = "SYS-PROMPT-哨兵"
+# 这组用例只看意图指令，边界取最宽的那个形态（不隐藏任何工具）以免混入别的变量
+_POLICY = policy_for(ORCHESTRATE_FORM)
+
+
+class _Recorder(BaseChatModel):
+    """最小假模型：记录每次调用收到的消息，不做生成。"""
+
+    seen: list[list[BaseMessage]] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "recorder"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> _Recorder:
+        return self
+
+    def _generate(
+        self, messages, stop=None, run_manager=None, **kwargs
+    ) -> ChatResult:
+        self.seen.append(list(messages))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="好"))])
+
+
+def _first_system_text(model: _Recorder) -> str:
+    assert model.seen, "模型没被调用"
+    first = model.seen[0][0]
+    assert first.type == "system", f"首条不是 system 消息：{first.type}"
+    return first.text
+
+
+async def _run(intent: str | None, subagents: list[dict] | None = None) -> _Recorder:
+    model = _Recorder()
+    agent = build_agent(
+        model=model,
+        backend=None,  # type: ignore[arg-type]  # 用 deepagents 默认后端
+        tools=[],
+        store=None,
+        checkpointer=None,
+        system_prompt=_SYSTEM_PROMPT,
+        policy=_POLICY,
+        subagents=subagents,
+        skills=None,
+    )
+    config: dict[str, Any] = {"configurable": {} if intent is None else {"intent": intent}}
+    await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "帮我做点什么"}]}, config=config
+    )
+    return model
+
+
+class TestIntentMiddleware:
+    async def test_plan_intent_reaches_model(self):
+        """plan 意图要把「你自己出方案、这轮派不了 task」送到模型手里（构建期 prompt 之外另加）。"""
+        text = _first_system_text(await _run("plan"))
+        assert _SYSTEM_PROMPT in text, "原有系统提示词被覆盖了"
+        assert "你自己" in text and "派不了 `task`" in text, "plan 指令没注入"
+
+    async def test_coding_intent_reaches_model(self):
+        text = _first_system_text(await _run("coding"))
+        assert "确认实施" in text and "coder" in text
+
+    async def test_rework_intent_reaches_model(self):
+        """按评审意见改的这轮要拿到：先取原文、只改用户点名的、不派 planner、闸门归平台判。"""
+        text = _first_system_text(await _run("rework"))
+        assert "按评审意见修改" in text
+        assert "先取回审查原文" in text
+        assert "不需要 `planner`" in text
+
+    async def test_analysis_intent_carries_the_memory_writeback(self):
+        """分析轮是唯一带记忆写回的只读形态：指令里要写清「收尾把结论沉淀进记忆」，
+        且明确不写变更记录（这一轮没有代码改动、也没有 PR）。"""
+        text = _first_system_text(await _run("analysis"))
+        assert "只读分析" in text
+        assert "save_repo_memory" in text
+        assert "不写「变更记录」" in text
+
+    async def test_qa_intent_adds_no_directive(self):
+        """无指令的意图（qa）不塞意图指令 —— 但仍然拿得到当前时间。"""
+        text = _first_system_text(await _run("qa"))
+        assert "本轮意图" not in text
+        assert "## 当前时间" in text
+
+    async def test_missing_intent_adds_no_directive(self):
+        text = _first_system_text(await _run(None))
+        assert "本轮意图" not in text
+
+    async def test_current_time_is_injected_for_every_intent(self):
+        """日期必须逐次注入：智能体是会话级长期对象，构建期的日期会一路陈旧。"""
+        for intent in ("plan", "coding", "review", "qa", None):
+            text = _first_system_text(await _run(intent))
+            assert "## 当前时间" in text
+            assert "（Asia/Shanghai）" in text
+
+    async def test_directive_survives_subagent_middleware(self):
+        """带子智能体时（它自己也会重写系统消息），两条内容都得在。"""
+        subagents = [
+            {
+                "name": "planner",
+                "description": "SUBAGENT-哨兵",
+                "system_prompt": "你是 planner",
+                "tools": [],
+            }
+        ]
+        text = _first_system_text(await _run("plan", subagents=subagents))
+        assert "SUBAGENT-哨兵" in text, "子智能体描述没进系统消息"
+        assert "`task`" in text, "意图指令被子智能体中间件挤掉了"
