@@ -382,6 +382,24 @@ async def set_plan_step_status(
 # ---------------------------------------------------------------------------
 # session records（页面展示：轻表 + 详情表）
 # ---------------------------------------------------------------------------
+async def plan_record_exists(
+    db: AsyncSession, *, session_id: int, plan_id: int
+) -> bool:
+    """这个会话里有没有**这一份**方案的记录（``type='plan'`` + ``ref_id=plan_id``）。
+
+    给「方案只在首次生成时进聊天流」当判据：一次新的运行里内存标记从零起步，跨轮去重
+    只能靠库里查（同一份方案被 updatePlan / updatePlanSteps 改过多少次都只该有一条记录）。
+    """
+    found = await db.scalar(
+        select(SessionRecord.id)
+        .where(SessionRecord.session_id == session_id)
+        .where(SessionRecord.type == "plan")
+        .where(SessionRecord.ref_id == plan_id)
+        .limit(1)
+    )
+    return found is not None
+
+
 async def add_record(
     db: AsyncSession,
     *,

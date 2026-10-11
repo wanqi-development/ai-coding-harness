@@ -182,6 +182,28 @@ async def test_an_expired_buffer_reads_as_an_idle_session() -> None:
     assert await _drain(b, "s") == []
 
 
+async def test_a_run_whose_owner_died_is_not_reported_as_running() -> None:
+    """持有者死了（进程被 kill / 重启）之后，那一轮不该再报「在跑」。
+
+    回归：``RunHub`` 原先只看缓冲 —— 缓冲里剩一把 ``seq``（``open`` 时写的、TTL 一小时）
+    却没有 ``done``，于是 ``is_running`` 永远返回 True、``subscribe`` 永远空转。实测撞到过：
+    界面上一直显示「正在接续本轮」，要等 ``seq`` 的 TTL 到期才自愈。运行权带 TTL 且由持有者
+    定期续期，所以「锁还在不在」才是存活信号。
+    """
+    redis = FakeRedis()
+    svc = GatedService([{"type": "done"}, {"type": "done"}])
+    a, b = _worker(redis, svc), _worker(redis, svc)
+    await a.start("s", StubSession(), "hi")
+
+    # 持有者进程被杀：本地 task 还在 park（模拟「没人再推进它」），但锁到期了
+    redis.advance(121)
+
+    assert await b.is_running("s") is False, "锁过期 ＝ 持有者已死，不该再报在跑"
+    assert await _drain(b, "s") == [], "订阅要立刻收尾，不能空转等 TTL"
+
+    await a.shutdown()
+
+
 async def test_a_dead_redis_degrades_to_the_process_buffer() -> None:
     """Redis 报错就退回进程内那半：这一轮照跑，帧照样能重放（只是不再跨 worker）。"""
     redis = FakeRedis()

@@ -88,6 +88,14 @@ class RunLock(Protocol):
     async def release(self, session_id: str) -> None:
         """放手。"""
 
+    async def held(self, session_id: str) -> bool:
+        """**现在**有没有人持有这份运行权（谁持有都算）。
+
+        给「这一轮还有人推进吗」当存活信号：运行权带 TTL 且由持有者定期续期，持有者进程被
+        kill / 重启之后锁最多一个 TTL 就没了 —— 而缓冲只是数据、没有心跳，有 ``seq`` 但
+        永远等不到 ``done`` 的残留状态会一直骗人（见 ``RunHub.is_running`` 的注释）。
+        """
+
 
 @dataclass
 class _MemoryRun:
@@ -158,6 +166,10 @@ class MemoryRunLock:
 
     async def release(self, session_id: str) -> None:
         return None
+
+    async def held(self, session_id: str) -> bool:
+        # 进程内那份没有「持有者死了」这回事：本地注册表（``RunHub._runs``）已经说清了
+        return True
 
 
 class RedisRunBuffer(RedisBacked):
@@ -378,6 +390,16 @@ class RedisRunLock(RedisBacked):
                 await self._redis.delete(self._key(session_id))
 
         await self.run(primary, _noop)
+
+    async def held(self, session_id: str) -> bool:
+        async def primary() -> bool:
+            return bool(await self._redis.exists(self._key(session_id)))
+
+        # 降级（Redis 不可用）时别插话：那会儿缓冲也已经退回进程内、本地注册表才是准的
+        async def fallback() -> bool:
+            return True
+
+        return await self.run(primary, fallback)
 
 
 async def _noop() -> None:

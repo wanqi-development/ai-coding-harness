@@ -4,24 +4,34 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Mapping
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 
 from ai_coding_harness.api.schemas import (
     CreateSessionRequest,
+    LogLineItem,
+    LogPage,
+    MemorySnapshot,
     PlanInfo,
+    PullItem,
+    PullList,
     RecordItem,
     SessionDetail,
     SessionListItem,
     SessionResponse,
 )
 from ai_coding_harness.api.session_lookup import resolve_session
+from ai_coding_harness.backends.composite import memory_path, read_memory
 from ai_coding_harness.db import dao
+from ai_coding_harness.observability.log_tail import read_session_logs
+from ai_coding_harness.redact import redact, secret_terms
 from ai_coding_harness.server.service import WORKSPACE_ERROR_MESSAGE, plan_payload
-from ai_coding_harness.session.manager import (
-    WORKSPACE_READY,
-    WorkspaceError,
-)
+from ai_coding_harness.session.manager import WORKSPACE_READY, Session, WorkspaceError
+from ai_coding_harness.tools.git import build_git_client
+from ai_coding_harness.tools.pr_client import PULL_OPEN, PrLookupError, pull_summary
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +181,157 @@ async def get_plan(session_id: str, request: Request) -> PlanInfo | None:
             raise HTTPException(status_code=404, detail="session not found")
         plan = await dao.get_latest_plan(s, session_id=sess.id)
     return None if plan is None else PlanInfo(**plan_payload(plan))
+
+
+def _pull_number(text: str) -> int:
+    """编号转数字用于排序；转不出来的当 0（平台理论上只给数字，这里不冒抛异常的险）。"""
+    try:
+        return int(text)
+    except ValueError:
+        return 0
+
+
+def _log_paths(request: Request) -> list[Path]:
+    """要看/要下载的日志文件。顺序固定（先接口后运行时），合并时间线时由时间戳决定先后。"""
+    settings = request.app.state.settings
+    log_dir = Path(settings.log_dir)
+    return [log_dir / settings.log_api_file, log_dir / settings.log_agent_file]
+
+
+def _redaction_terms(session: Session, request: Request) -> tuple[str, ...]:
+    """读日志时用的凭据词表：会话令牌 + 该平台的兜底令牌。
+
+    日志**写盘时**已经过一遍脱敏；但读出来是第五条出口，多过一道不吃亏（词表在这里算得出
+    来，是因为我们手上有这个会话）。
+    """
+    settings = request.app.state.settings
+    return secret_terms(session.repo.token, settings.token_for(session.repo.platform))
+
+
+@router.get("/{session_id}/logs", response_model=LogPage)
+async def get_logs(
+    session_id: str,
+    request: Request,
+    limit: int = 300,
+    level: str | None = None,
+    q: str | None = None,
+    with_http: bool = False,
+) -> LogPage:
+    """该会话的日志（尾部 ``limit`` 行，按时间合并成一条线）。
+
+    **按会话筛**而不是把整份日志倒出来：命中 ``[<会话id>]``（格式里的会话格）、
+    ``/sessions/<id>`` ``/chat/<id>``（接口请求行只带路径）、``public_id=<id>``（老行兼容）
+    这四种写法之一。``level`` 是**阈值**（给 WARNING 就是 WARNING 及以上），``q`` 是关键字
+    （大小写不敏感的子串），``with_http=true`` 才把 HTTP 请求噪声算进来（默认滤掉，见
+    ``observability/log_tail.py`` 的两条噪声口径 —— 其中「日志接口自己」那类永远不显示）。
+
+    只读当前那份文件，不追 ``.1``/``.2`` 备份 —— 「尾部 N 行」的含义不该取决于轮转状态；
+    要看更早的整份，用同目录的下载接口。
+    """
+    session = await resolve_session(request, session_id)
+    terms = _redaction_terms(session, request)
+    picked = read_session_logs(
+        _log_paths(request),
+        session_id,
+        limit=max(1, min(limit, 5000)),
+        level=level,
+        query=q,
+        with_http=with_http,
+    )
+    return LogPage(
+        total=picked.total,
+        lines=[
+            LogLineItem(
+                ts=item.ts, level=item.level, logger=item.logger, text=redact(item.text, terms)
+            )
+            for item in picked.lines
+        ],
+    )
+
+
+@router.get("/{session_id}/logs/download", response_class=PlainTextResponse)
+async def download_logs(session_id: str, request: Request) -> PlainTextResponse:
+    """把**这个会话的**日志整份下载下来（``.txt`` 附件）。
+
+    面板里那个「下载」按钮走它：界面只显示尾部若干行，这里给全（同样只读当前文件）。
+    内容一样过一遍脱敏。
+    """
+    session = await resolve_session(request, session_id)
+    terms = _redaction_terms(session, request)
+    # 下载与面板同一套噪声口径（HTTP 请求默认不算），但不带 limit / 关键字 —— 它给的是整份
+    picked = read_session_logs(_log_paths(request), session_id)
+    body = redact("\n".join(item.text for item in picked.lines), terms)
+    owner, name = session.repo.owner, session.repo.repo
+    return PlainTextResponse(
+        body + ("\n" if body else ""),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{owner}-{name}-logs.txt"'
+        },
+    )
+
+
+@router.get("/{session_id}/pulls", response_model=PullList)
+async def get_pulls(session_id: str, request: Request) -> PullList:
+    """本仓库的 PR 列表（右栏「PR」标签；``open_count`` 顺带喂主区顶部的角标）。
+
+    **查不到 ≠ 没有**：查询失败一律 502 + 原因，**绝不返回空列表** —— 「这个仓库一个 PR 都
+    没有」和「这次没查成」在界面上必须是两句话。这条纪律与仓库记忆同源（见
+    ``tools/pr_client.pulls_or_raise``）。
+
+    状态码由 ``pull_summary`` 归一（Gitee 把 merged 写在 state 上、GitHub 看 merged_at），
+    与闸门判「有没有未合入的 PR」用的是同一个判定。
+    """
+    session = await resolve_session(request, session_id)
+    client = build_git_client(request.app.state.settings, session.repo)
+    try:
+        raw = await client.all_pulls()
+    except PrLookupError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"查询本仓库 PR 失败：{exc}"
+        ) from exc
+    items = [
+        PullItem(**pull_summary(pull))
+        for pull in raw
+        if isinstance(pull, Mapping) and str(pull.get("number") or "").strip()
+    ]
+    # 未合并的排最前，其余按编号倒序（新的在上）：打开面板第一眼要看到「还开着的」
+    items.sort(key=lambda item: (item.state != PULL_OPEN, -_pull_number(item.number)))
+    return PullList(
+        open_count=sum(1 for item in items if item.state == PULL_OPEN), pulls=items
+    )
+
+
+@router.get("/{session_id}/memory", response_model=MemorySnapshot)
+async def get_memory(session_id: str, request: Request) -> MemorySnapshot:
+    """仓库记忆全文（**只读**）。
+
+    记忆原先只活在系统提示词里 —— 模型看得到、用户看不到。这里把它显示出来（右栏「记忆」
+    标签）：读的是 StoreBackend 上那一份，与中间件读写的是**同一个 key**。
+
+    **不提供写入、也不提供手动刷新**：正文只在 coding / review 的收尾由主控写，文件头由平台
+    每轮开工前按 PR 实况重算（见 AGENTS.md 的写入口径）。在这里开一个「改一下」的口子，
+    就把那条约束破了；要更新记忆就走对话（刷新仓库记忆）或跑一轮编码/审查。
+    """
+    db = request.app.state.database
+    try:
+        public_id = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid session_id") from None
+    async with db.session() as s:
+        found = await dao.get_session_with_repo(s, public_id=public_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    _row, repo = found
+    if repo is None:
+        raise HTTPException(status_code=409, detail="会话缺少仓库信息，请新建会话。")
+    prefix = request.app.state.settings.memories_prefix
+    return MemorySnapshot(
+        path=memory_path(repo.owner, repo.name, prefix),
+        content=await read_memory(
+            request.app.state.store, repo.owner, repo.name, prefix
+        ),
+    )
 
 
 @router.post("/{session_id}/cancel")

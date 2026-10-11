@@ -42,11 +42,23 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from ai_coding_harness.tools.pr_client import (
+    PULL_CLOSED,
+    PULL_MERGED,
+    PULL_OPEN,
+    pull_state,
+    pull_summary,
+)
+
 #: PR 状态的三态映射 —— 词面与模版/提示词同一口径（``变更记录`` 的状态那格就写这三个词）。
 #: ``PENDING``（PR 开着）是唯一会触发闸门的。
 PENDING = "待合并"
 MERGED = "已合并"
 DISCARDED = "已关闭"
+
+#: 状态码 → 记忆里那三个词。判定本身在 ``tools/pr_client.pull_state``（右栏「PR」面板与
+#: 这里共用同一套），这边只负责翻成中文 —— 两处各判一次，就会各自漂。
+_LABEL_BY_CODE = {PULL_OPEN: PENDING, PULL_MERGED: MERGED, PULL_CLOSED: DISCARDED}
 
 #: 老模板留下的、现在整节摘掉的标题。认的是**去掉节号后正好等于**这些词 ——
 #: 模型自己写的「历史功能列表」「需求变更记录」不被牵连（摘节是删东西，宁严勿宽）。
@@ -168,26 +180,18 @@ def _drop_legacy(sections: list[_Section]) -> None:
 
 
 def _pull_state(pull: Mapping[str, Any]) -> str:
-    """一个 PR 的实际状态；认不出来的返回空串（空串 = 不算未合入，也不当别的状态）。"""
-    if pull.get("merged_at"):
-        return MERGED
-    state = str(pull.get("state") or "").strip().lower()
-    if state == "merged":
-        return MERGED
-    if state == "open":
-        return PENDING
-    if state in ("closed", "rejected"):
-        return DISCARDED
-    # 其余取值（未来的新状态）一律不猜 —— 猜错会把「未知」说成「已合入」或「已废弃」
-    return ""
+    """一个 PR 的实际状态（记忆里那三个词）；认不出来的返回空串（＝不算未合入）。
+
+    判定**只有一处**（``tools/pr_client.pull_state``，右栏「PR」面板用的是同一个），
+    这里只把状态码翻成中文 —— 两处各判一次，就会出现「面板说还开着、闸门说没有」。
+    """
+    return _LABEL_BY_CODE.get(pull_state(pull), "")
 
 
 def _pull_fields(pull: Mapping[str, Any]) -> tuple[str, str, str]:
-    """``(编号, 链接, 分支)``。"""
-    number = str(pull.get("number") or "").strip()
-    head = pull.get("head")
-    branch = str(head.get("ref") or "").strip() if isinstance(head, Mapping) else ""
-    return number, str(pull.get("html_url") or "").strip(), branch
+    """``(编号, 链接, 分支)`` —— 与面板同一个取法（``tools/pr_client.pull_summary``）。"""
+    summary = pull_summary(pull)
+    return summary["number"], summary["url"], summary["branch"]
 
 
 def _open_pulls(pulls: Sequence[Mapping[str, Any]]) -> tuple[OpenPull, ...]:

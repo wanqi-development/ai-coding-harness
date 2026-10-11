@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from deepagents.backends import CompositeBackend, StoreBackend
+from deepagents.backends.utils import file_data_to_string
 from langgraph.store.base import BaseStore
 
 from ai_coding_harness.backends.opensandbox_backend import OpenSandboxBackend
@@ -23,6 +24,11 @@ from ai_coding_harness.backends.opensandbox_backend import OpenSandboxBackend
 HISTORY_PREFIX = "/conversation_history/"
 LARGE_TOOL_RESULTS_PREFIX = "/large_tool_results/"
 
+#: 仓库记忆在 store 里的 namespace。**唯一口径**：``build_composite_backend`` 的路由与
+#: ``read_memory`` 都取它 —— 与 ``memory_path`` 同一条纪律，两处各写一份，就会出现
+#: 「写入成功、没人读得到」那种事故（内容等于丢了）。
+MEMORIES_NAMESPACE: tuple[str, ...] = ("memories",)
+
 
 def memory_path(owner: str, repo: str, prefix: str = "/memories/") -> str:
     """仓库记忆文件的运行时路径 —— **记忆路径的唯一口径**，读写两侧都调它。
@@ -34,6 +40,20 @@ def memory_path(owner: str, repo: str, prefix: str = "/memories/") -> str:
     传别的值就等于写到没人读的 key 上。
     """
     return f"{prefix.rstrip('/')}/{owner}/{repo}.md"
+
+
+def memory_store_key(owner: str, repo: str, prefix: str = "/memories/") -> str:
+    """仓库记忆在 store 里的**实际 key**：``/<owner>/<repo>.md``（路由前缀已被吃掉）。
+
+    ``CompositeBackend`` 命中路由前缀后是**先把前缀剥掉**再交给子后端（见上游
+    ``_route_for_path`` 的说明），所以 ``StoreBackend`` 看到的 key 是去前缀的那半截。
+    2026-10-11 实测踩到：右栏「记忆」标签拿 ``memory_path()`` 直接 ``aget``，对**已经有记忆**
+    的仓库显示「还没写过」—— 而当时的测试把错误假设抄成了断言（两边用同一个表达式，必然
+    相等），所以没抓到。现在这条测试改成「经 CompositeBackend 写进去、用这个函数读回来」。
+
+    实现上从 ``memory_path`` 剥前缀而不是再拼一遍字符串：路径形状只留 ``memory_path`` 一处定义。
+    """
+    return memory_path(owner, repo, prefix).removeprefix(prefix.rstrip("/"))
 
 
 def build_composite_backend(
@@ -49,7 +69,7 @@ def build_composite_backend(
     （``LARGE_TOOL_RESULTS_PREFIX``）—— 后两者是**会话级**数据（key 里带 thread_id），
     与记忆同库不同 namespace，互不干扰。
     """
-    memories = StoreBackend(store=store, namespace=lambda rt: ("memories",))
+    memories = StoreBackend(store=store, namespace=lambda rt: MEMORIES_NAMESPACE)
     history = StoreBackend(store=store, namespace=lambda rt: ("conversation_history",))
     large_results = StoreBackend(store=store, namespace=lambda rt: ("large_tool_results",))
     return CompositeBackend(
@@ -61,3 +81,25 @@ def build_composite_backend(
         },
         artifacts_root="/",
     )
+
+
+async def read_memory(
+    store: BaseStore, owner: str, repo: str, prefix: str = "/memories/"
+) -> str | None:
+    """读仓库记忆全文；这个仓库还没写过记忆时返回 ``None``。
+
+    **走的 key 与中间件读写的那把完全一样**（``MEMORIES_NAMESPACE`` + ``memory_store_key``）。
+    这里直连 store，而不是复用 ``StoreBackend.aread``：后者解析 namespace 要靠 LangGraph 的
+    运行上下文（``get_runtime``），而 HTTP 接口没有那个上下文 —— 硬用会静默落到
+    ``("filesystem",)`` 这个错 namespace 上，读出来永远是「没有记忆」。
+
+    ``file_data_to_string`` 是库自己的归一化（老的 list[str] 内容也认），用它而不是直接取
+    ``value["content"]``，少一份要自己维护的兼容逻辑。
+    """
+    item = await store.aget(MEMORIES_NAMESPACE, memory_store_key(owner, repo, prefix))
+    if item is None:
+        return None
+    value = getattr(item, "value", None)
+    if not isinstance(value, dict):
+        return None
+    return file_data_to_string(value)

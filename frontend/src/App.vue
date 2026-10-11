@@ -6,7 +6,6 @@ import {
   createSession,
   destroySession,
   ensureWorkspace,
-  getPlan,
   getRecords,
   getSession,
   listSessions,
@@ -14,21 +13,32 @@ import {
   resumeChat,
   type ChatEvent,
   type PlanInfo,
+  type PlanStep,
   type SessionItem,
   type TodoItem,
   type WorkspaceStatus,
 } from './api'
 import { renderMarkdown } from './markdown'
+import MemoryPanel from './MemoryPanel.vue'
+import LogPanel from './LogPanel.vue'
+import PrPanel from './PrPanel.vue'
 import RepoPanel from './RepoPanel.vue'
 import { usePanelWidth } from './splitter'
 import { splitLongText } from './streamblocks'
 import { shouldShowTodos } from './todos'
 
-/** AI 消息里的两种块；用户消息恒为单个 text 块。待办树固定渲染在回复最下边。 */
+/** AI 消息里的三种块；用户消息恒为单个 text 块。待办树固定渲染在回复最下边。 */
 type Part =
   /** `sealed` = 这块已经写完，不会再变（流式分块用，见 streamblocks.ts）。 */
   | { kind: 'text'; content: string; sealed?: boolean }
   | { kind: 'todos'; items: TodoItem[] }
+  /**
+   * 方案：以**一条链接**出现在聊天流里，点开就地展开。
+   *
+   * 原来方案只活在右侧「计划」面板里 —— 面板取消之后，方案改由聊天流承载：实时那帧来自
+   * SSE 的 `plan` 事件，刷新后那条来自落库的 `type='plan'` 记录，两边形状一样。
+   */
+  | { kind: 'plan'; plan: PlanInfo }
 
 interface Message {
   role: 'user' | 'assistant'
@@ -89,6 +99,83 @@ function pushTodos(parts: Part[], items: TodoItem[]) {
     }
   }
   parts.push({ kind: 'todos', items })
+}
+
+/** 取这条消息里的方案块（没有就是 null）。一条消息最多一块 —— 见 `pushPlan`。 */
+function planPart(m: Message): PlanInfo | null {
+  for (const p of m.parts) if (p.kind === 'plan') return p.plan
+  return null
+}
+
+/**
+ * 方案块：**同一份方案只占一块**。
+ *
+ * 方案在实施过程中会被反复改（`updatePlanSteps` 每完成一步就推一帧），追加式渲染会变成
+ * 一屏「方案已更新」；所以按「这条消息里已有的那块」就地替换。传 `null` 表示方案被删了，
+ * 把块摘掉。
+ */
+function pushPlan(parts: Part[], info: PlanInfo | null) {
+  const at = parts.findIndex((p) => p.kind === 'plan')
+  if (!info) {
+    if (at >= 0) parts.splice(at, 1)
+    return
+  }
+  if (at >= 0) (parts[at] as { kind: 'plan'; plan: PlanInfo }).plan = info
+  else parts.push({ kind: 'plan', plan: info })
+}
+
+/** 落库那条方案记录 → 方案块。字段来自后端 `plan_payload`（extra 里带 plan_id/status/steps）。 */
+function planFromRecord(r: {
+  content: string | null
+  summary: string | null
+  extra: any
+}): PlanInfo | null {
+  const extra = r.extra ?? {}
+  const planId = Number(extra.plan_id ?? 0)
+  if (!planId) return null
+  return {
+    plan_id: planId,
+    title: r.summary ?? null,
+    status: String(extra.status ?? 'pending'),
+    steps: Array.isArray(extra.steps) ? extra.steps : [],
+    content: r.content ?? null,
+    updated_at: '',
+  }
+}
+
+// 方案链接的展开态（按 plan_id 记）。默认收起：它常常只是「这轮做了什么」的索引，
+// 正文和步骤都点开才看，免得一屏被方案全文占满。
+const planOpen = ref<Record<number, boolean>>({})
+
+function isPlanOpen(id: number): boolean {
+  return Boolean(planOpen.value[id])
+}
+
+function togglePlan(id: number) {
+  planOpen.value = { ...planOpen.value, [id]: !planOpen.value[id] }
+}
+
+/* 模板里用的取值助手：都返回安全值，省得在模板里写非空断言。 */
+function planTitle(m: Message): string {
+  return planPart(m)?.title || '实施计划'
+}
+
+function planStatus(m: Message): string {
+  return planPart(m)?.status || 'pending'
+}
+
+function planSteps(m: Message): PlanStep[] {
+  return planPart(m)?.steps ?? []
+}
+
+function planMarkdown(m: Message): string {
+  return planPart(m)?.content ?? ''
+}
+
+function planProgress(m: Message): string {
+  const info = planPart(m)
+  if (!info || !info.steps.length) return ''
+  return `已完成 ${planDone(info)}/${info.steps.length}`
 }
 
 /** 取一条消息的待办树（没有就是空数组）。 */
@@ -233,6 +320,8 @@ function showEarlier() {
 }
 const input = ref('')
 const loading = ref(false)
+// 输入框上方那条快捷动作：默认收起（见模板处的说明）
+const quickOpen = ref(false)
 // 这一轮流是「用户自己喊停」的吗：本地据此补终止标记，并抑制 abort 带出来的那行「错误」
 const stopping = ref(false)
 // 当前流的本地中断句柄：点终止时 abort 它，本地立刻松手，不等后端收尾
@@ -298,9 +387,9 @@ const {
   invert: true,
 })
 
-// 右侧栏（计划 / 代码两个标签）：展开的步骤随会话切换重置
-const plan = ref<PlanInfo | null>(null)
-const rightTab = ref<'plan' | 'code'>('plan')
+// 右侧栏：代码 / 记忆 / PR / 日志（四个视图齐了）
+const rightTab = ref<'code' | 'memory' | 'pulls' | 'logs'>('code')
+// 方案链接里展开的步骤（按 index 记）：随会话切换重置
 const expandedSteps = ref<number[]>([])
 // 右侧栏「全屏」（面板盖满整个窗口）：临时状态，不持久化
 const panelFullscreen = ref(false)
@@ -372,7 +461,7 @@ async function restoreLastView() {
     currentId.value = ''
     messages.value = []
     resetWorkspace()
-    resetPlan()
+    resetPanels()
     setNotice('上次打开的会话已失效，已回到列表')
   }
 }
@@ -465,7 +554,7 @@ function startNewChat() {
   // 会话号清空后旧流再也复位不了 loading，这里自己收：否则「开始」按钮会一直禁用
   loading.value = false
   resetWorkspace()
-  resetPlan()
+  resetPanels()
 }
 
 /** 切走会话：停掉轮询、状态归位，别让旧会话的进度残留到新会话上。 */
@@ -491,7 +580,7 @@ async function confirmNewChat() {
       currentId.value = created.sessionId
       pendingRepo.value = false
       messages.value = []
-      resetPlan()
+      resetPanels()
       await reloadSessions()
       // 不 await：接口已返回，剩下的准备进度交给状态条（await 会白占住整屏 loading）
       void prepareWorkspace(created.sessionId)
@@ -518,25 +607,36 @@ async function openSession(id: string) {
   notice.value = ''
   // 换会话就把「显示更早」的展开量收回默认值
   visibleTail.value = VISIBLE_TAIL
-  resetPlan()
+  resetPanels()
   resetWorkspace()
   // 上一个会话的流若还在收尾，它的 finally 不会再碰 loading（会话号对不上了）；这里复位，
   // 下面若发现本轮真在跑会重新置回 true
   loading.value = false
-  // 方案拉不到不该挡住历史消息，故单独兜住
-  const [records, saved, detail] = await Promise.all([
+  // 会话详情拉不到不该挡住历史消息，故单独兜住
+  const [records, detail] = await Promise.all([
     getRecords(id),
-    getPlan(id).catch(() => null),
     getSession(id).catch(() => null),
   ])
+  // 三类记录进聊天流：用户 / 助手 / **方案**（方案以链接形式出现，见 planFromRecord）
   messages.value = records
-    .filter((r) => r.type === 'user' || r.type === 'assistant')
-    .map((r) => ({
-      role: r.type === 'user' ? ('user' as const) : ('assistant' as const),
-      parts: partsOf(r),
-      at: r.created_at,
-    }))
-  plan.value = saved
+    .filter((r) => r.type === 'user' || r.type === 'assistant' || r.type === 'plan')
+    .map((r) => {
+      if (r.type === 'plan') {
+        const plan = planFromRecord(r)
+        return {
+          role: 'assistant' as const,
+          parts: plan ? [{ kind: 'plan' as const, plan }] : [],
+          at: r.created_at,
+        }
+      }
+      return {
+        role: r.type === 'user' ? ('user' as const) : ('assistant' as const),
+        parts: partsOf(r),
+        at: r.created_at,
+      }
+    })
+    // 方案记录万一缺 plan_id（老数据）会映射成空块：丢掉它，别留一条空消息
+    .filter((m) => m.parts.length)
   scrollToBottom()
   // 刷新时这一轮还在跑：库里的记录还没有它（收尾才落库），得接回直播流
   if (detail?.running) void attachRunning(id)
@@ -557,7 +657,7 @@ async function removeSession(id: string) {
     pendingRepo.value = false
     loading.value = false
     resetWorkspace()
-    resetPlan()
+    resetPanels()
   }
   await reloadSessions()
 }
@@ -618,9 +718,10 @@ const SUBAGENT_ACTIVITY: Record<string, string> = {
   reviewer: '正在评审',
 }
 
-const planDone = computed(
-  () => plan.value?.steps.filter((s) => s.status === 'done').length ?? 0,
-)
+/** 方案里已完成的步数（方案链接上的「3/7」用它）。 */
+function planDone(info: PlanInfo): number {
+  return info.steps.filter((s) => s.status === 'done').length
+}
 
 function stepLabel(status: string): string {
   return STEP_LABEL[status] ?? status
@@ -636,26 +737,27 @@ function toggleStep(index: number) {
     : [...expandedSteps.value, index]
 }
 
-// 面板当前显示哪个标签：没有方案时「计划」这个标签不存在，一律退回代码
-const activeTab = computed<'plan' | 'code'>(() =>
-  rightTab.value === 'plan' && plan.value ? 'plan' : 'code',
-)
+const activeTab = computed<'code' | 'memory' | 'pulls' | 'logs'>(() => rightTab.value)
 
 /**
  * 右侧标签（竖着排）。
  *
- * **加第三个标签只往这张表里加一项** —— 模板是 `v-for` 渲染的，不用动结构；「计划」只在
- * 有方案时出现，并带上它的状态色点。
+ * **加标签只往这张表里加一项** —— 模板是 `v-for` 渲染的，不用动结构。
+ *
+ * 「计划」不再在这里：方案改成聊天流里的一条链接（面板取消，2026-10-06）。第二批会往这张
+ * 表里加「仓库记忆 / PR / 日志」。
  */
-const panelTabs = computed<{ key: 'plan' | 'code'; label: string; dot?: string }[]>(() => {
-  const tabs: { key: 'plan' | 'code'; label: string; dot?: string }[] = []
-  if (plan.value) tabs.push({ key: 'plan', label: '计划', dot: plan.value.status })
-  tabs.push({ key: 'code', label: '代码' })
-  return tabs
-})
+const panelTabs = computed<
+  { key: 'code' | 'memory' | 'pulls' | 'logs'; label: string; dot?: string }[]
+>(() => [
+  { key: 'code', label: '代码' },
+  { key: 'memory', label: '记忆' },
+  { key: 'pulls', label: 'PR' },
+  { key: 'logs', label: '日志' },
+])
 
 /** 点竖标签：切过去并展开（收起状态下点一下就展开到那个标签）。 */
-function selectTab(tab: 'plan' | 'code') {
+function selectTab(tab: 'code' | 'memory' | 'pulls' | 'logs') {
   rightTab.value = tab
   panelCollapsed.value = false
 }
@@ -687,16 +789,15 @@ function planPathToRepoPath(path: string): string {
     .replace(/^\.?\/*/, '')
 }
 
-// 计划步骤里的「涉及文件」→ 切到代码标签并打开它（同一路径连点两次也重开）
+// 方案步骤里的「涉及文件」→ 切到代码标签并打开它（同一路径连点两次也重开）
 function openCodeFile(path: string) {
   rightTab.value = 'code'
   panelCollapsed.value = false
   codeTarget.value = { ref: '', path: planPathToRepoPath(path), at: Date.now() }
 }
 
-function resetPlan() {
-  plan.value = null
-  rightTab.value = 'plan'
+/** 切会话时把面板与各种「展开态」复位：跳转目标、方案步骤、待办折叠。 */
+function resetPanels() {
   codeTarget.value = null
   expandedSteps.value = []
   // 折叠态按「消息下标 + 文本」记，跨会话留着会让新会话的同位项莫名是展开的
@@ -807,8 +908,8 @@ function attachStream(msg: Message) {
       activity.value =
         SUBAGENT_ACTIVITY[ev.agent ?? ''] ?? TOOL_ACTIVITY[ev.name ?? ''] ?? '正在处理'
     } else if (ev.type === 'plan') {
-      // 后端每次推的都是全量快照，直接整体替换
-      plan.value = ev.plan ?? null
+      // 后端每次推的都是全量快照：同一份方案只占一块，就地替换（`plan: null` = 方案被删）
+      pushPlan(msg.parts, ev.plan ?? null)
     } else if (ev.type === 'error') {
       append(`\n[错误] ${ev.error}`)
     }
@@ -845,12 +946,6 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
     msg.at = new Date().toISOString()
     if (currentId.value === id) {
       loading.value = false
-      // 方案落到终态（实施完成 / 失败）才自动收起：这一刻面板只剩占地方的作用，点
-      // 侧栏那条 rail 随时能展开回来。pending（刚出方案，正要读）与 executing（半途）
-      // 都不收 —— 收了正好把要看的东西藏起来。
-      if (plan.value?.status === 'done' || plan.value?.status === 'failed') {
-        panelCollapsed.value = true
-      }
       scrollToBottom()
     }
     // 只清**自己**那份句柄与标记：切走会话后这条旧流的收尾不该去动新会话的状态
@@ -876,6 +971,20 @@ async function isRunInProgress(id: string): Promise<boolean> {
     // 详情都拿不到（会话没了 / 网络断），那也不是「接回」能解决的事
     return false
   }
+}
+
+/**
+ * 快捷动作：把预置的那句话填进输入框并直接发出去。
+ *
+ * 只留「无参数、点了就该发生」的两条 —— 措辞都**命中关键字层的强口令**
+ * （`刷新仓库记忆` → analysis；`同步仓库` → sync **直接执行**，不经智能体、不烧 token），
+ * 所以判定是确定的，不取决于分类模型怎么想。
+ */
+function quickAct(text: string) {
+  if (loading.value || !workspaceReady.value || !currentId.value) return
+  input.value = text
+  quickOpen.value = false
+  void send()
 }
 
 async function send() {
@@ -1109,6 +1218,70 @@ onUnmounted(stopWorkspacePoll)
             <!-- 待办树固定画在正文下面：它表示「现在什么状态」，不是「说到哪儿了」。
                  整棵全完成、且这一轮已收尾就不画（见 showsTodos）—— 那份全绿清单只是噪音，
                  没做完才要留着；空列表是「参数还没流完」的中间态，也不占位 -->
+            <!-- 方案：以一条链接出现，点开就地展开步骤与全文。原来它只活在右侧「计划」
+                 面板里，面板取消后改由聊天流承载（落库记录 + 实时帧同一形状）。 -->
+            <div v-if="planPart(m)" class="ai-part plan-link">
+              <button class="plan-head" :aria-expanded="isPlanOpen(planPart(m)!.plan_id)" @click="togglePlan(planPart(m)!.plan_id)">
+                <span class="plan-icon">📋</span>
+                <span class="plan-anchor">方案：{{ planTitle(m) }}</span>
+                <span class="plan-badge" :class="planStatus(m)">{{ planLabel(planStatus(m)) }}</span>
+                <span v-if="planProgress(m)" class="plan-progress">{{ planProgress(m) }}</span>
+                <span class="plan-caret" :class="{ open: isPlanOpen(planPart(m)!.plan_id) }"></span>
+              </button>
+              <div v-if="isPlanOpen(planPart(m)!.plan_id)" class="plan-body">
+                <ol v-if="planSteps(m).length" class="plan-steps">
+                  <li v-for="s in planSteps(m)" :key="s.index" class="plan-step" :class="s.status">
+                    <div class="step-row" :title="s.goal || ''" @click="toggleStep(s.index)">
+                      <span class="step-dot" :class="s.status"></span>
+                      <span class="step-index">{{ s.index }}</span>
+                      <span class="step-goal">{{ s.goal }}</span>
+                      <span class="step-caret" :class="{ open: expandedSteps.includes(s.index) }">›</span>
+                    </div>
+                    <div v-if="expandedSteps.includes(s.index)" class="step-detail">
+                      <!-- 列表里 goal 被截成一行，点开才给全 —— 旧格式（goal 写得长）也能读全 -->
+                      <div class="step-field">
+                        <span class="detail-label">目标</span>
+                        <span class="step-criteria">{{ s.goal }}</span>
+                      </div>
+                      <div class="step-field">
+                        <span class="detail-label">状态</span>
+                        <span class="step-status" :class="s.status">{{ stepLabel(s.status) }}</span>
+                      </div>
+                      <div v-if="s.files && s.files.length" class="step-field">
+                        <span class="detail-label">涉及文件</span>
+                        <span class="step-files">
+                          <!-- 点一下就跳到代码面板并打开这个文件（不切走当前对话） -->
+                          <button
+                            v-for="(f, i) in s.files"
+                            :key="i"
+                            class="step-file"
+                            :title="`在代码面板打开 ${f}`"
+                            @click="openCodeFile(f)"
+                          >
+                            {{ f }}
+                          </button>
+                        </span>
+                      </div>
+                      <div v-if="s.done_criteria" class="step-field">
+                        <span class="detail-label">完成标准</span>
+                        <span class="step-criteria">{{ s.done_criteria }}</span>
+                      </div>
+                      <div v-if="!s.files?.length && !s.done_criteria" class="step-field muted">
+                        该步未填写涉及文件与完成标准
+                      </div>
+                    </div>
+                  </li>
+                </ol>
+                <p v-else class="plan-empty">该方案没有结构化步骤</p>
+                <!-- 方案全文（Markdown）：步骤是索引，正文才是细节 -->
+                <div
+                  v-if="planMarkdown(m)"
+                  v-memo="[planMarkdown(m)]"
+                  class="plan-content md-block markdown"
+                  v-html="renderMarkdown(planMarkdown(m))"
+                ></div>
+              </div>
+            </div>
             <ul v-if="showsTodos(m)" class="ai-part todos">
               <li v-for="(t, k) in todosPart(m)" :key="k" :class="statusClass(t.status)">
                 <div class="todo-row">
@@ -1172,6 +1345,27 @@ onUnmounted(stopWorkspacePoll)
       </div>
 
       <!-- 输入区 -->
+      <!-- 快捷动作：只留两个**无参数、点了就该发生**的。默认收起 —— 常驻一行会占掉
+           输入的注意力，需要时点一下展开。动作就是替你发一句话（命中关键字层那一关，
+           判定确定，不依赖分类模型）。 -->
+      <div v-if="!pendingRepo && currentId" class="quickbar">
+        <button
+          class="quick-toggle"
+          :aria-expanded="quickOpen"
+          :disabled="loading || !workspaceReady"
+          @click="quickOpen = !quickOpen"
+        >
+          快捷 {{ quickOpen ? '▾' : '▸' }}
+        </button>
+        <template v-if="quickOpen">
+          <button class="quick-act" :disabled="loading || !workspaceReady" @click="quickAct('刷新仓库记忆')">
+            刷新仓库记忆
+          </button>
+          <button class="quick-act" :disabled="loading || !workspaceReady" @click="quickAct('同步仓库')">
+            同步代码
+          </button>
+        </template>
+      </div>
       <div v-if="!pendingRepo" class="composer">
         <textarea
           v-model="input"
@@ -1280,68 +1474,14 @@ onUnmounted(stopWorkspacePoll)
       <div v-if="!panelCollapsed" class="panel-body">
 
         <!-- 计划：有方案才渲染 -->
-        <template v-if="activeTab === 'plan' && plan">
-          <div class="plan-meta">
-            <span class="plan-status" :class="plan.status">{{ planLabel(plan.status) }}</span>
-            <span class="plan-progress">已完成 {{ planDone }}/{{ plan.steps.length }}</span>
-          </div>
-          <div class="plan-title" :title="plan.title || '实施计划'">
-            {{ plan.title || '实施计划' }}
-          </div>
-
-          <ol v-if="plan.steps.length" class="plan-steps">
-            <li
-              v-for="s in plan.steps"
-              :key="s.index"
-              class="plan-step"
-              :class="s.status"
-            >
-              <div class="step-row" :title="s.goal || ''" @click="toggleStep(s.index)">
-                <span class="step-dot" :class="s.status"></span>
-                <span class="step-index">{{ s.index }}</span>
-                <span class="step-goal">{{ s.goal }}</span>
-                <span class="step-caret" :class="{ open: expandedSteps.includes(s.index) }">›</span>
-              </div>
-              <div v-if="expandedSteps.includes(s.index)" class="step-detail">
-                <!-- 列表里 goal 被截成一行，点开才给全 —— 方案落在旧格式（goal 写得很长）时也能读全 -->
-                <div class="step-field">
-                  <span class="detail-label">目标</span>
-                  <span class="step-criteria">{{ s.goal }}</span>
-                </div>
-                <div class="step-field">
-                  <span class="detail-label">状态</span>
-                  <span class="step-status" :class="s.status">{{ stepLabel(s.status) }}</span>
-                </div>
-                <div v-if="s.files && s.files.length" class="step-field">
-                  <span class="detail-label">涉及文件</span>
-                  <span class="step-files">
-                    <!-- 点一下就跳到代码标签并打开这个文件（不切走当前对话） -->
-                    <button
-                      v-for="(f, i) in s.files"
-                      :key="i"
-                      class="step-file"
-                      :title="`在代码面板打开 ${f}`"
-                      @click="openCodeFile(f)"
-                    >
-                      {{ f }}
-                    </button>
-                  </span>
-                </div>
-                <div v-if="s.done_criteria" class="step-field">
-                  <span class="detail-label">完成标准</span>
-                  <span class="step-criteria">{{ s.done_criteria }}</span>
-                </div>
-                <div v-if="!s.files?.length && !s.done_criteria" class="step-field muted">
-                  该步未填写涉及文件与完成标准
-                </div>
-              </div>
-            </li>
-          </ol>
-          <p v-else class="plan-empty">该方案没有结构化步骤</p>
-        </template>
-
-        <!-- 代码：本机那份只读缓存（与沙箱无关） -->
-        <RepoPanel v-else :session-id="currentId" :target="codeTarget" />
+        <!-- 代码：本机那份只读缓存（与沙箱无关）。方案不再是标签 —— 它进了聊天流 -->
+        <RepoPanel v-if="activeTab === 'code'" :session-id="currentId" :target="codeTarget" />
+        <!-- 记忆：StoreBackend 上那份仓库记忆（只读；正文由 coding / review 收尾写） -->
+        <MemoryPanel v-else-if="activeTab === 'memory'" :session-id="currentId" />
+        <!-- PR：本仓库的 PR 列表（查不到会显示成错误，不是空列表） -->
+        <PrPanel v-else-if="activeTab === 'pulls'" :session-id="currentId" />
+        <!-- 日志：这个会话自己的日志（面板只显示尾部；整份走「下载」） -->
+        <LogPanel v-else :session-id="currentId" />
       </div>
     </aside>
 

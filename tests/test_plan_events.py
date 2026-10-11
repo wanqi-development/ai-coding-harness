@@ -39,6 +39,8 @@ def _plan(**over) -> SimpleNamespace:
         "status": "executing",
         "updated_at": datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
         "steps": [{"index": 1, "goal": "第一步", "status": "running"}],
+        # 方案全文：聊天里那条「方案」链接点开就地展开的就是它（见 service.plan_payload）
+        "content": "# 测试方案\n\n一、二、三。",
     }
     base.update(over)
     return SimpleNamespace(**base)
@@ -124,7 +126,12 @@ def plan_reads(monkeypatch) -> list[int]:
     async def fake_add_record(db, **kwargs):
         return None
 
+    async def fake_plan_record_exists(db, *, session_id, plan_id):
+        # 这里的用例只关心 plan 帧；去重判据另在 ``TestPlanRecord`` 里单独验
+        return False
+
     monkeypatch.setattr(service_mod.dao, "get_latest_plan", fake_get_latest_plan)
+    monkeypatch.setattr(service_mod.dao, "plan_record_exists", fake_plan_record_exists)
     monkeypatch.setattr(service_mod.dao, "add_record", fake_add_record)
     return reads
 
@@ -250,6 +257,78 @@ def recorded(monkeypatch) -> list[dict]:
     monkeypatch.setattr(service_mod.dao, "add_record", fake_add_record)
     monkeypatch.setattr(service_mod.dao, "get_latest_plan", no_plan)
     return records
+
+
+class TestPlanRecord:
+    """方案要作为**聊天记录**出现（前端那条链接就靠它），且同一份方案只写一条。
+
+    回归背景：方案原先只在右侧面板显示，``session_records`` 里从来没有 ``type='plan'``
+    的行；面板取消之后，方案改由聊天流承载，就必须落库 —— 否则刷新页面方案就没了。
+    """
+
+    async def test_the_first_plan_is_recorded_once(self, monkeypatch):
+        records: list[dict] = []
+        written: set[int] = set()
+
+        async def fake_get_latest_plan(db, *, session_id):
+            return _plan()
+
+        async def fake_plan_record_exists(db, *, session_id, plan_id):
+            return plan_id in written
+
+        async def fake_add_record(db, **kwargs):
+            records.append(kwargs)
+            if kwargs.get("ref_id") is not None:
+                written.add(int(kwargs["ref_id"]))
+
+        monkeypatch.setattr(service_mod.dao, "get_latest_plan", fake_get_latest_plan)
+        monkeypatch.setattr(service_mod.dao, "plan_record_exists", fake_plan_record_exists)
+        monkeypatch.setattr(service_mod.dao, "add_record", fake_add_record)
+
+        await _run(_tool_call("updatePlanStep"))
+
+        # 轮末还会回填一条 assistant，这里只看方案那条
+        plans = [r for r in records if r["type"] == "plan"]
+        assert len(plans) == 1
+        record = plans[0]
+        assert record["ref_id"] == 1, "按 plan_id 关联，去重与「点开看哪份」都靠它"
+        assert record["summary"] == "测试方案"
+        assert record["content"] == "# 测试方案\n\n一、二、三。", "全文进记录：链接就地展开靠它"
+        assert record["extra"]["steps"][0]["goal"] == "第一步"
+
+        # 同一份方案再改一次（另起一轮）：不再追加第二条
+        await _run(_tool_call("updatePlanStep", call_id="t2"))
+
+        assert len([r for r in records if r["type"] == "plan"]) == 1, (
+            "方案被反复改也只该在聊天流里出现一次"
+        )
+
+    async def test_a_deleted_plan_writes_nothing(self, monkeypatch):
+        """方案被删（``plan: null``）时不再写第二条 —— 没有内容可展示。"""
+        records: list[dict] = []
+        reads: list[int] = []
+
+        async def fake_get_latest_plan(db, *, session_id):
+            reads.append(session_id)
+            return _plan() if len(reads) == 1 else None
+
+        async def fake_plan_record_exists(db, *, session_id, plan_id):
+            return any(r.get("ref_id") == plan_id for r in records)
+
+        async def fake_add_record(db, **kwargs):
+            records.append(kwargs)
+
+        monkeypatch.setattr(service_mod.dao, "get_latest_plan", fake_get_latest_plan)
+        monkeypatch.setattr(service_mod.dao, "plan_record_exists", fake_plan_record_exists)
+        monkeypatch.setattr(service_mod.dao, "add_record", fake_add_record)
+
+        out = await _run(
+            [*_tool_call("storePlan"), *_tool_call("deletePlan", call_id="t2")]
+        )
+
+        plans = [e for e in out if e["type"] == "plan"]
+        assert plans[-1]["plan"] is None, "删掉之后要推一帧 plan: null"
+        assert [r["type"] for r in records].count("plan") == 1, "删除不该再写第二条"
 
 
 class TestUserVisibleStream:

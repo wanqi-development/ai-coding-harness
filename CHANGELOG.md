@@ -23,6 +23,299 @@
 
 ## 修改记录
 
+### 2026-10-11
+
+#### 界面卡在「正在接续本轮」：残留的运行缓冲骗了 `is_running`，用运行权当存活信号
+
+- **动机**（用户报障）：「界面显示正在继续本轮，到底在干嘛呢」——一直挂在那个状态，什么也没发生。
+- **定位（三步都拿到了硬证据）**：
+  1. 那句话是前端 `App.vue` 的 `activity.value = '正在接续本轮'`，由 `attachRunning()` 设置 ——
+     它只在 `GET /sessions/{id}` 回 `running: true` 时走到这儿。
+  2. 后端确实回了 `running = True`，但 **Redis 里这个会话只剩一把键**：
+     ```
+     harness:run:<sid>:seq = "0"   TTL=1757     （没有 frames、没有 done、也没有 lock）
+     ```
+     `seq=0` 是 ``open()`` 写的 —— 开了一轮，却**一个帧都没有、也没打 done、运行权也没了**。
+  3. 结合历史记录（那一轮**正常跑完并落库**，回复完整）与那条 WARNING
+     （`Redis 上的 运行缓冲 不可用，本进程后续退回进程内实现`），因果链是：
+     **运行期那次 Redis 调用失败 → 帧全走进程内缓冲（所以那一轮没受影响）→ Redis 上只剩
+     `open()` 写的 `seq=0` 半成品**。后端重启后新进程（Redis 没降级）一读：有 seq、没 done
+     → `is_running` 永远 True；`subscribe` 的循环 `read`（空）→ `is_done`（False）→ sleep
+     → **空转到 seq 的 TTL 到期**（还剩近半小时）。
+- **改动**：**运行权当存活信号**。运行权带 TTL、由持有者定期续期（默认 120s / 30s），持有者
+  进程被 kill / 重启后最多一个 TTL 就没了 —— 而缓冲只是数据、没有心跳。
+  - `server/run_store.py`：`RunLock` 协议加 `held(session_id)`；`RedisRunLock` 实现为
+    `EXISTS lock`（Redis 降级时返回 True —— 那会儿缓冲也已退回进程内、本地注册表才准），
+    `MemoryRunLock` 恒 True（进程内没有「持有者死了」这回事，本地注册表已经说清）。
+  - `server/runs.py`：`is_running` 与 `subscribe` 在「缓冲还在、没打 done」之后再加一问
+    「运行权还在吗」，不在就按已结束处理（订阅立刻收尾，不空转）并记一条 warning。
+- **关键决策**：不引心跳、也不加新键 —— 运行权本来就有 TTL + 续期，就是现成的存活信号。
+  两条防线都加（`is_running` 管「要不要接回」，`subscribe` 管「已经接上的那个别空转」）。
+- **验证**：
+  - `pytest` 全量 **1080 passed**；新增回归 `test_a_run_whose_owner_died_is_not_reported_as_running`
+    （锁过期后 `is_running` 为假、订阅立刻收尾）；既有 11 例（含「另一个 worker 在跑时可见」、
+    「TTL 到期读成空闲」）照旧通过 —— 正常在跑的轮次不受影响。
+  - `ruff` 干净。
+  - **用户那个真实卡住的状态当活体验证**：同一会话、同一份残留，新代码 `running = False`
+    （你的 8000 仍是 `True`）；`GET /chat/{sid}/stream` **0.73 秒收尾**（旧代码会挂到 TTL）。
+    历史记录完好（那一轮本来就跑完了），所以用户看到的是「这轮的回复在，只是不再显示接续中」。
+- **遗留**：
+  - **要重启后端才生效**（8000 上跑的是改动前的进程）。
+  - **触发这个残留的根因（运行期某次 Redis 调用失败）还没查**：它有真实后果了 —— 除了在控制台
+    刷一条 WARNING，还会留下一个能骗近一小时的半成品缓冲。上一批把它记成了遗留，现在建议排一次
+    （那条 WARNING 现在也能在右栏「日志」面板里直接看到）。
+
+#### 三个 bug 修完：日志按会话展示（滤掉噪声）、日志关键字搜索、仓库记忆读不出来
+
+- **动机**（用户报障，三条一起）：① 日志要按会话分开展示，「打开哪个会话看哪个会话的」，
+  不要一屏像是全部；② 日志要能按关键字搜；③ 仓库记忆明明存在，面板却刷不出来
+  （`zzpfordevelopment/wanqi-mall`）。
+- **③ 记忆读不出来 —— 根因（实测抓到的硬证据）**：
+  ```
+  store 里实际存的 key：  ('memories', '/zzpfordevelopment/wanqi-mall.md')
+  我的接口去读的 key：    ('memories', '/memories/zzpfordevelopment/wanqi-mall.md')
+  ```
+  `CompositeBackend` 命中路由前缀后**先把前缀剥掉**再交给子后端（上游 `_route_for_path` 的
+  说明），所以 store 里的 key 是去前缀那半截。上一批我直接按 `memory_path()`（带前缀）去
+  `aget`，对**已经有记忆**的仓库永远返回「还没写过」。
+  - **修法**：新增 `backends/composite.py::memory_store_key()`（从 `memory_path` 剥前缀，
+    路径形状仍只有一处定义），`read_memory` 改用它；接口回给前端的 `path` 仍是**逻辑路径**
+    （带 `/memories`，与 `save_repo_memory` 同一口径）—— 两个概念分开，不再混用一个值。
+  - **为什么上一批的测试没抓到**：它把错误假设抄成了断言（两边用同一个表达式，必然相等）。
+    现在改成**经复合后端写进去、用 `read_memory` 读回来**（`tests/test_composite_backend.py`）
+    —— 口径对不上就会红。同文件里早有 `HISTORY_KEY = "/<thread>.md"` 这条「去前缀」的既有
+    口径，我漏看了。
+- **① + ④（④是用户补充的：日志查询自己不该出现在面板里）**：`observability/log_tail.py`
+  加两条噪声口径：
+  - **日志接口自己的请求**（路径含 `/sessions/<id>/logs`）—— **永远滤掉，不给开关**。实测：
+    验证时调了 ~55 次 `/logs`，给那个会话留下 **178 行**自己造的日志，正好把要看的东西淹了。
+  - **HTTP 请求噪声**（`api.middleware` + `uvicorn.access`）—— **默认滤掉**，面板上给开关。
+    一个请求打三行，而前端每 1.5 秒轮询一次工作区状态：实测某会话 **324 行里 247 行（76%）**
+    是它，真正有用的运行日志只有 62 行。
+  - 顺带把 logger 名解析出来（`LogLine.logger`）：噪声规则要它，接口也一并回给前端。
+- **② 关键字搜索**：接口加 `q=`（大小写不敏感子串）与 `with_http=` 两个参数；前端加搜索框
+  与「含 HTTP 请求行」勾选框。**关键字先筛再截尾** —— 否则「搜出 0 行」只是尾部那 300 行里
+  没有，而不是整个会话里没有。
+- **验证**：
+  - `pytest` 全量 **1079 passed**；`ruff` 干净；`npm --prefix frontend run build` 通过。
+  - 新增/改写的测试：复合后端记忆往返（会抓到上面那个 key bug）、HTTP 噪声默认滤掉 /
+    开关打开才回来、日志接口自己的行**永远**不出现（就算开了开关）、关键字先筛后截尾、
+    接口把 `q`/`with_http` 传下去并回 `logger`。
+  - **真后端实数据验证**（同一个真会话 `cb4c905c…`，8001 跑新代码、8000 是你起着的旧进程）：
+    默认命中 **354 行 → 77 行**（构成：62 行 `run_log` 工具/LLM + 6 行轮次 + 会话/记忆/intent 各几行）；
+    `with_http=true` → 182 行且其中 `/logs` 自己的行 **0**；`q=wanqi` → 18 行，首行正是命中的那条；
+    记忆接口从 `content: null` 变成 **5091 字符**的真记忆。
+- **遗留**：
+  - **要重启后端才生效**：你本机 8000 上跑的是**你自己的进程**（我起的那个因端口占用退出了），
+    它用的是改动前的代码 —— 上面三条修复都得重启才看得到。我临时起的 8001 已停掉（两个进程
+    写同一个库不合适）。
+  - **下载**与面板同一套噪声口径（整份，但不含 HTTP 请求行，也没有 limit / 关键字）；
+    要看请求行本身就去 `logs/api.log`。
+
+#### 右栏新增「日志」标签 + 日志补上「会话」维度（a+c）
+
+- **动机**（用户口径，选 a+c）：右栏第四个视图；外加一个「下载日志」的出口。
+- **先说一个事实（决定了做法）**：日志里**原先几乎没有会话维度** —— `agent.log` 共
+  28,907 行，只有 **877 行（≈3%）**带 `public_id=`；工具调用、LLM 调用、沙箱操作这些
+  真正想看的行只有 `[trace_id] [agent]`，而 trace_id 是**请求级**的、没落库，事后没法从
+  会话反查。**按会话过滤只能捞到 3%** —— 那样的面板会像「这一轮什么都没发生」，比没有
+  更误导。所以先补维度（a），再做视图。
+- **改动（a：补维度）**：
+  - `observability/context.py` 加 `session_id` 的 ContextVar（与既有 `trace_id` 同一套
+    `set/reset/get`，无上下文时 `-`）。
+  - `observability/logging.py`：格式串加一格 → `[%(trace_id)s] [%(session_id)s] [%(agent)s]`，
+    `_TraceIdFilter` 一并注入 `record.session_id`。
+  - **设置点只有一处**：`api/session_lookup.resolve_session()`。每个会话级请求都从那儿过，
+    所以连 `/workspace` 触发的 provisioning 也算这个会话的日志；`RunHub` 起的那一轮跑在
+    `create_task` 里，创建时会把当前上下文复制过去，于是那一轮的日志也带着它。起初写在
+    `service.chat()` 里，后来发现**覆盖不到路由层的 provisioning**（那才是出事最多的阶段），
+    就搬到了这里 —— `service.chat` 只留一句注释指向它。
+- **改动（视图）：**
+  - 新增 `observability/log_tail.py`：按会话挑行 + 把两个文件**按时间合并**成一条线 +
+    级别阈值 + 尾部 limit。命中规则最后收敛成**一条**：行里出现了这个会话 id（它同时覆盖
+    `[<id>]`、`/sessions/<id>`、`/chat/<id>`、`public_id=<id>`，还认裸 id —— 一开始按
+    「带装饰的几种写法」逐个匹配，单测当场抓到它连 traceback 的续行都漏）。
+  - 接口 `GET /sessions/{id}/logs?limit=300&level=` 与 `GET /sessions/{id}/logs/download`；
+    两者**返回前都再过一遍脱敏**（词表 = 会话令牌 + 该平台兜底令牌）—— 日志落盘时脱敏过，
+    但读出来是**第五条出口**。
+  - 前端新增 `LogPanel.vue`（右栏第四个标签）：级别下拉（阈值语义）、等宽显示、按级别着色
+    （INFO 灰、WARNING 黄、ERROR 红）、读出来自动贴到底、顶部「最后 N 行 / 共 M 行」、
+    **「下载」按钮**指向下载接口（服务端 `Content-Disposition` 管附件名）。
+- **关键决策**：
+  - **只读当前那份日志文件**，不追 `.1`/`.2` 备份：把备份读进来会让「尾部 N 行」的含义
+    取决于轮转状态。要看更早的走下载（按钮就在面板上），去 `logs/` 目录拿。
+  - 「命中总数」与「返回行数」**两个数都给**：界面才能说清「最后 300 行 / 共 1240 行」。
+  - 续行（traceback 等没有自己时间戳的行）**沿用上一行的时间戳**，否则它会被排到最前、
+    还可能被 tail 丢掉。
+- **验证**：
+  - `pytest` 全量 **1073 passed**；新增 `tests/test_logs_route.py` **9 例**：真实
+    `setup_logging` 下「设置了会话 id 之后每行都带 `[<id>]`」、四种写法都认、级别阈值、
+    尾部与总数、续行跟随父行、文件缺失＝空、接口脱敏（令牌不回显）、下载是附件且给全、
+    会话不存在 404、`resolve_session` 会把会话 id 写进上下文。
+  - `ruff` 改动文件干净；`npm --prefix frontend run build`（含 `vue-tsc`）通过。
+  - **真后端端到端**（PG / Redis 这次都起了，8000 空着）：起真后端 → 建一个真会话
+    （`ai-coding-probe/does-not-exist`，故意 clone 不上的仓库）→ `POST /workspace` 触发
+    provisioning → 发一条 `同步仓库`（**direct intent，不经智能体、不烧 token**）
+    → 查该会话的日志：**命中 15 行**，其中 `POST /workspace` 之后的行都带
+    `[4486991a-…]` 这一格（`uvicorn.access`、`api.middleware ←`、
+    `server.service: 意图分析 intent=sync source=keyword` 都在），而路由前打的
+    `→ POST /workspace` 与建会话那两行靠**路径 / public_id** 命中；
+    `level=WARNING` 命中 1 行；`/logs/download` 返回 200 +
+    `attachment; filename="ai-coding-probe-does-not-exist-logs.txt"`（3952 字节）。
+  - 顺带说明**这次没出图**：本会话的浏览器自动化工具没了（`cua` / playwright 都不可用），
+    而我看不到图片 —— 用命令行盲截一张我无法核对的图，等于交付一张未验证的图。所以改用
+    上面的接口实测数据作证据；要看画面可以直接起前端点「日志」（后端还开着，见下面遗留）。
+- **遗留**：
+  - **验收用的那个会话留在库里了**：`ai-coding-probe/does-not-exist`
+    （`public_id=4486991a-e53a-42d9-a648-db58db759e41`，db_id=43）—— 留着是为了让它成为
+    你看「日志」面板的现成样本；点右上「删除会话」即可清掉。
+  - **本次起着的后端没停**（8000，PID 34844）：留着方便你直接看日志面板。前端按你平时的
+    方式起（5173 被你另一个项目占着，`start.bat` 会问你是否结束占用进程）。
+  - 面板里第一条 WARNING 就是老熟人：`Redis 上的 运行缓冲 不可用，本进程后续退回进程内
+    实现`。**启动时 ping 是通的**，说明是运行期某次调用失败了 —— 这条以前只在控制台能看到，
+    现在面板里一眼可见，值得照着这条线索再查一次（另记）。
+
+### 2026-10-10
+
+#### 右栏新增「PR」标签：本仓库 PR 列表（查不到 ≠ 没有）
+
+- **动机**（用户口径）：第二批右栏视图的第二个 —— 之前想知道「还开着哪些 PR」只能去
+  Gitee/GitHub 页面看，或者从仓库记忆的文件头里猜。
+- **改动**：
+  - 后端新增 `GET /sessions/{id}/pulls` → `{open_count, pulls[]}`；每条含编号 / 标题 /
+    状态码 / 链接 / 分支 / 作者 / 时间。
+  - `api/schemas.py` 加 `PullItem` / `PullList`；`frontend/src/api.ts` 加 `getPulls()`。
+  - 前端新增 `PrPanel.vue`（右栏第三个标签）：未合并的排最前（后端排序）、状态徽章 +
+    左侧色条（待合并=accent、已合并=绿）、标题是新窗口打开平台链接、「重新读取」重拉接口。
+  - `App.vue`：`panelTabs` 加「PR」、`rightTab` 类型放宽、`.panel-body` 加一路分派。
+- **关键决策**：
+  - **状态判定收敛到一处**：把「一条 PR 是什么状态」搬到 `tools/pr_client.pull_state()`
+    （平台差异在那里消化一次：Gitee 把合并态写在 `state=merged` 上，GitHub 看 `merged_at`），
+    `agent/memory_reconcile._pull_state()` 改成调它、只负责翻成中文标签。原来这套判定在
+    reconcile 里私有实现，面板要复用得再写一遍 —— 两处判定一漂，就会出现「面板说还开着、
+    闸门说没有未合入的」这种自相矛盾，而那正是最难查的一类 bug（测试里直接拿两份实现
+    对照断言）。`_pull_fields` 同理改为调 `pull_summary()`。
+  - **查不到 ≠ 没有（硬约束）**：查询失败走 502 + 原因，**绝不返回空列表**。面板把它显示成
+    一条错误 + 「先确认凭据 / 网络」，而不是「这个仓库还没有 PR」。
+  - 接口回**状态码**（`open`/`merged`/`closed`/`unknown`）而不是中文标签：展示口径留在前端，
+    与 `workspace_status` / `plan.status` 的既有做法一致。认不出的状态一律 `unknown`，
+    显示成「状态未知」并保持中性色 —— 不猜。
+- **验证**：
+  - 新增 `tests/test_pulls_route.py` 4 例：归一 + 排序（未合并最前、其余编号倒序、脏数据跳过）、
+    **查询失败 502 而不是空列表**、**面板与闸门判定逐条一致**（含 Gitee 的 `state=merged`、
+    未知状态两边都不猜）、会话不存在 404。
+  - `pytest` 全量 **1064 passed**；`ruff check` 改动文件干净（含 `memory_reconcile` 的重构）；
+    `npm --prefix frontend run build`（含 `vue-tsc`）通过。
+  - **真机渲染验证**（假后端 + 临时 vite 配置，用完即删）：三个标签都在、点「PR」后记忆面板
+    正确卸载、顶部「未合并 1 / 共 3」、三条的徽章（待合并/已合并/已关闭）与左侧色条
+    （`rgb(59,91,219)` / `rgb(26,158,92)` / 中性）都对、标题链接指向 PR 页面。
+- **遗留**：
+  - 主区顶部那个「未合并 PR N」角标**这次没做**：它要在 App 层轮询（面板只在切过去时才挂载），
+    属于另一套成本，等右栏三个视图齐了再看要不要加。
+  - 右栏还剩 **日志** 视图；之后是 Token 消耗（要插桩 + 迁移）。
+
+#### 右栏新增「记忆」标签：把仓库记忆显示出来（只读）
+
+- **动机**（用户口径）：第二批右栏视图的第一个 —— 仓库记忆原先**只活在系统提示词里**：
+  模型看得到、用户看不到（想知道里面写了什么，只能去翻 store）。
+- **改动**：
+  - 后端新增 `GET /sessions/{id}/memory`，返回 `{path, content}`；`content` 为 `null` ＝
+    这个仓库还没写过记忆（不是错误、也不是空串）。
+  - `backends/composite.py` 新增 `MEMORIES_NAMESPACE` 常量与 `read_memory()`；
+    `build_composite_backend` 里那条记忆路由也改用同一个常量。
+  - `api/schemas.py` 加 `MemorySnapshot`；`frontend/src/api.ts` 加 `getMemory()`。
+  - 前端新增 `MemoryPanel.vue`（右栏第二个标签）：顶部一行「路径 + 重新读取」，正文用现成的
+    `renderMarkdown` 渲染；空态给出「它会在编码/审查收尾时写出来」的说明。
+  - `App.vue`：`panelTabs` 加「记忆」一项、`rightTab` 类型放宽、`.panel-body` 按 `activeTab`
+    分派（代码 / 记忆）—— 上次改版留的「加标签只加一行」这次第一次用上。
+- **关键决策**：
+  - **直连 `store.aget(namespace, key)`，不复用 `StoreBackend.aread`**。后者解析 namespace
+    要走 LangGraph 的**运行上下文**（`get_runtime()`），而 HTTP 接口没有那个上下文 —— 硬用会
+    静默落到 `("filesystem",)` 这个错的 namespace 上，结果是永远显示「没有记忆」，**不报错**。
+    所以按 `MEMORIES_NAMESPACE` + `memory_path()` 直接定位，与中间件读写的是同一把 key。
+  - namespace 抽成常量给两处共用（写入路由与只读接口），与 `memory_path` 同一条纪律：
+    两处各写一份，就会出现「写入成功、没人读得到」那种事故。
+  - **只读**：不给编辑、也不给「手动刷新记忆」—— 正文只在 coding / review 收尾由主控写，
+    文件头由平台每轮开工前按 PR 实况重算（AGENTS.md 的写入口径）。面板上那个按钮叫
+    **「重新读取」**（重新拉一次接口），刻意不叫「刷新」，免得与「刷新仓库记忆」混淆。
+  - 老数据兼容交给库自己的 `file_data_to_string`（认得 `list[str]` 那种旧内容形状），
+    不自己写一份归一化。
+- **验证**：
+  - `pytest` 全量 **1060 passed**；新增 `tests/test_memory_route.py` 6 例：**读的 key 与中间件
+    写的是同一把**（断言 `(namespace, key)` 逐字相等）、没记忆返回 `content: null`、老的
+    `list[str]` 内容能读、非法 id 400 / 会话不存在 404（且**不去读 store**）/ 缺仓库信息 409、
+    store 里形状不对时按「没有记忆」处理。
+  - `ruff check` 改动文件干净；`npm --prefix frontend run build`（含 `vue-tsc`）通过。
+  - **真机渲染验证**（同上一批：假后端 8010 + 临时 vite 配置 5174，用完即删）：两个标签都在、
+    点「记忆」后**代码面板正确卸载**、标题/三个章节/PR 链接/路径都渲染出来、正文区高 653px
+    可滚动、rail 仍贴最右（x=1280）。
+- **遗留**：
+  - 记忆正文里的文件路径不可点（正文是 Markdown 文本；代码面板的跳转仍靠方案步骤里的
+    「涉及文件」）。
+  - 右栏还剩 **PR / 日志** 两个视图（都不改库），以及 Token 消耗（要插桩 + 迁移）。
+
+### 2026-10-06
+
+#### 界面改版第一批：样式方案 B + 取消计划面板（方案进聊天流）+ 快捷动作条
+
+- **动机**（用户口径，逐条拍过）：样式选 **B**（去气泡化 + 色相统一 + 建立刻度）；**计划面板
+  取消**，方案改成在聊天列表里以**链接**出现；快捷动作**只留两个**（刷新仓库记忆 / 同步代码）
+  并挪到**输入框上方**（可折叠）；右侧功能列表挪到**最右边**。功能顺序：仓库记忆 / PR / 日志
+  先做，Token 消耗最后做。
+- **改动**：
+  - `frontend/src/style.css`：令牌整套换成 B —— 三层底（`#f7f9fc` 主区 / `#eef2f9` 侧栏 /
+    `#ffffff` 卡片）、灰全部换成**偏蓝的那一族**（中性灰压在蓝底上会发脏）、圆角收敛成
+    **4/8/12/999** 四档、字号收敛成 **12/13/14/15/16/20/26**、补上 `--danger`/`--danger-hover`
+    （原来只写了 `var(--danger, #d64545)` 兜底、**从没定义**过）、加一层唯一的轻阴影。
+  - 视觉三处重排：**用户气泡实心 accent + 白字**（右下角收一个圆角）、**AI 正文去气泡**
+    （直接排在页面上，只有代码块与待办成卡片）、**待办块**从整块粉色改成中性卡 + 左侧 3px
+    accent 条（粉色是全页唯一暖色，跟冷调底子是两套体系）。
+  - 右栏 `.right-panel` 改 `flex-direction: row-reverse`、`.panel-tabs` 的 `border-right` 换
+    `border-left` —— 竖排标签条贴到**窗口最右边缘**，内容在它左边。**只换方向不动 DOM 顺序**。
+  - `frontend/src/App.vue`：
+    - `Part` 加第三种块 `plan`；新增 `pushPlan`（同一份方案**只占一块**，就地替换）、
+      `planFromRecord`（落库那条记录 → 方案块）、`planPart/planTitle/planStatus/planSteps/
+      planMarkdown/planProgress` 一组取值助手（模板里不写非空断言）。
+    - 聊天流里渲染方案链接（`📋 方案：<标题> ｜ 状态 ｜ 已完成 3/7`），点开**就地展开**步骤与
+      全文；「涉及文件」仍然一键跳到右侧代码面板。
+    - 删掉方案面板那一整套：`plan` 状态、`activeTab` 的 plan 分支、`panelTabs` 的「计划」项、
+      面板版模板；`resetPlan()` 改名 `resetPanels()`（它管的是跳转目标 / 方案步骤展开 /
+      待办折叠）。
+    - 记录 → 消息时放开 `type === 'plan'`；不再需要 `getPlan()` 拉面板数据（方案随记录来）。
+    - 输入框上方新增快捷条：默认只剩「快捷 ▸」开关，展开后是**刷新仓库记忆 / 同步代码**两个
+      动作 —— 各自发一句**命中关键字层强口令**的消息（`刷新仓库记忆` → analysis；
+      `同步仓库` → sync **直接执行**，不经智能体、不烧 token），判定确定，不依赖分类模型。
+  - 后端（方案要能进聊天流，就得落库）：
+    - `server/service.py::plan_payload` 带上 `content`（方案全文）：实时帧与刷新后读记录
+      **同一份数据**，前端不必再补一次请求；`_record(...)` 加 `ref_id` 透传。
+    - 新增 `_record_plan_once`：方案首次生成时写一条 `session_records`（`type='plan'`、
+      `ref_id=plan_id`、`content=全文`、`extra={plan_id,status,steps}`）。
+    - `db/dao.py::plan_record_exists`：按 `(session_id, plan_id)` 判重 —— 一次新的运行里内存
+      标记从零起步，**跨轮去重只能靠库里查**。
+    - `api/schemas.py::PlanInfo` 与 `frontend/src/api.ts` 同步加 `content`。
+- **关键决策**：
+  - **只在该方案首次生成时写记录**（用户点过：不是「每次更新都插一条」）。方案会被
+    `updatePlan` / `updatePlanSteps` 反复改，追加式落库会把聊天流刷成「方案已更新」的流水。
+  - 方案块与记录**同一份形状**：SSE 帧、`/plan` 接口、落库记录三者一致，前端一条渲染路径。
+  - 快捷动作**直接发送**而不是预填：这两条都是「无参数、点了就该发生」，多一次回车没有价值。
+- **验证**：
+  - 后端：`pytest` 全量 **1054 passed**（新增 2 例：方案首次写记录且同 plan_id 不重复、
+    删除方案不写第二条）；`ruff check` 改动文件干净。
+  - 前端：`npm --prefix frontend run build`（含 `vue-tsc`，模板类型也过）。
+  - **用真实应用出图验证**：本机 8000 被另一个项目占着、沙箱也连不上 Postgres，所以起了一个
+    **假后端**（只答 `/sessions`、`/sessions/{id}`、`/records`、`/workspace`、`/repo`）加一份
+    **临时 vite 配置**（代理指向假后端，跑在 5174；用完即删、未进版本库），让**真 App.vue +
+    真 style.css** 渲染出来截图。computed style 逐项核对：`用户气泡 rgb(59,91,219) / 白字`、
+    `AI 正文 rgba(0,0,0,0) 且边框 0px`、`待办块 rgb(244,246,250) + 左边框 2.67px rgb(59,91,219)`、
+    `方案链接左边框 accent 且展开态存在`、`rail 在最右（x=1236，窗口宽 1280）`、三栏合计无溢出。
+- **遗留**：
+  - **升级前已有的会话看不到方案链接**：那些方案只在 `plans` 表里、没有对应的 `plan` 记录，
+    所以聊天流里不会出现（刷新也不会）。开发阶段，新建会话即可；要兼容老会话得再写一次回填。
+  - 方案 Markdown 正文里的文件路径不可点（结构化步骤里的「涉及文件」可以点，跳代码面板）。
+  - 右栏现在只剩「代码」；第二批（仓库记忆 / PR / 日志）往 `panelTabs` 加项即可，模板不用动。
+  - Token 消耗面板仍待做（要先在 `_run_agent` 里把 `message-finish` 的 `usage` 累加落库，
+    加一列 JSONB + 迁移）。
+
 ### 2026-09-28
 
 #### 平台名不再写死：加 `platform_label()`，7 处运行期文案 + 4 处提示词清零

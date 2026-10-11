@@ -14,9 +14,15 @@ import sys
 from pathlib import Path
 
 from ai_coding_harness.config import Settings
-from ai_coding_harness.observability.context import get_trace_id
+from ai_coding_harness.observability.context import get_session_id, get_trace_id
 
-_FORMAT = "%(asctime)s [%(levelname)s] [%(trace_id)s] [%(agent)s] %(name)s: %(message)s"
+#: 三格上下文：trace_id（一次请求）、session_id（一个会话）、agent（执行主角）。
+#: session_id 是 2026-10-11 加的 —— 右栏「日志」标签按它筛「这个会话自己的日志」；
+#: 没有它的时候只有 ``public_id=`` 那几种行带会话信息（占全量约 3%）。
+_FORMAT = (
+    "%(asctime)s [%(levelname)s] [%(trace_id)s] [%(session_id)s] [%(agent)s] "
+    "%(name)s: %(message)s"
+)
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 # 接口日志：HTTP 层
@@ -52,15 +58,16 @@ _AGENT_UNSET = "-"
 
 
 class _TraceIdFilter(logging.Filter):
-    """把当前请求的 trace_id 注入日志记录，并给执行主角留一个占位。
+    """把当前上下文的 trace_id / session_id 注入日志记录，并给执行主角留一个占位。
 
     ``agent`` 由日志调用方用 ``extra={"agent": "planner"}`` 主动给出（见
     ``server.service`` 的运行日志）；没给的一律记为 ``-``，这样格式串里的
-    ``%(agent)s`` 永远不会缺键。
+    ``%(agent)s`` 永远不会缺键。``session_id`` 同理从 contextvar 取，没有上下文时是 ``-``。
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.trace_id = get_trace_id()
+        record.session_id = get_session_id()
         if not hasattr(record, "agent"):
             record.agent = _AGENT_UNSET
         return True

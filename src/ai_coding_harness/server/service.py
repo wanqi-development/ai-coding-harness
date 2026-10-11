@@ -115,6 +115,7 @@ def plan_payload(plan: Any) -> dict[str, Any]:
         "title": plan.title,
         "status": plan.status,
         "steps": steps,
+        "content": plan.content,
         "updated_at": plan.updated_at.isoformat(),
     }
 
@@ -266,6 +267,9 @@ class HarnessService:
         出口（进状态前、落日志前、下发前、直接执行返回前）各拦一道，词表在这里算一次，
         按会话取 —— 令牌是每会话一份，不能进模块级常量。此外入口先做一次**拒收**：
         消息里含凭据就整条不收，凭据连模型都不发（见 ``detect_credential``）。
+
+        会话这个日志维度**不在这里设** —— 设在 ``api/session_lookup.resolve_session``：
+        每个会话级请求都从那儿过，连 ``/workspace`` 触发的 provisioning 也算这个会话的日志。
         """
         terms = secret_terms(session.repo.token, self._settings.gitee_access_token)
         label = detect_credential(message, terms)
@@ -495,11 +499,14 @@ class HarnessService:
                         yield frame
                         if called in _PLAN_TOOLS:
                             # 方案刚被改过，重读一份最新快照推给前端（全量、幂等；同一状态推一次）。
-                            # ``latest`` 为 ``None`` 也要推（``plan: null``）：方案被删掉之后面板该
-                            # 回落或消失，不推的话前端会一直停在那份已经不存在的方案上。
+                            # 前端把它渲染成聊天里那条「方案」链接（就地展开全文），不再有独立面板；
+                            # ``latest`` 为 ``None`` 也照推（``plan: null``），前端据此知道方案没了。
                             latest = await self._plan_snapshot(session)
                             if latest != last_plan:
                                 last_plan = latest
+                                if latest is not None:
+                                    # 首次生成时落一条记录，之后同 plan_id 不再追加（见该函数）
+                                    await self._record_plan_once(session, latest)
                                 yield {"type": "plan", "plan": latest}
         except asyncio.CancelledError:
             # 用户点了「终止」：RunHub 把这一轮的 task 取消了。补一条记录（不补的话库里
@@ -607,6 +614,7 @@ class HarnessService:
         *,
         type: str,
         summary: str | None = None,
+        ref_id: int | None = None,
         content: str | None = None,
         extra: dict | list | None = None,
     ) -> None:
@@ -614,10 +622,43 @@ class HarnessService:
             async with self._db.session() as db:
                 await dao.add_record(
                     db, session_id=session.db_id, type=type,
-                    summary=summary, content=content, extra=extra,
+                    summary=summary, ref_id=ref_id, content=content, extra=extra,
                 )
         except Exception:
             logger.exception("写会话记录失败（不影响主流程）")
+
+    async def _record_plan_once(self, session: Session, plan: dict[str, Any]) -> None:
+        """把「方案已生成」写进聊天流（``type='plan'``），**同一份方案只写一条**。
+
+        方案落地后会被 ``updatePlan`` / ``updatePlanSteps`` 反复改；每次改都追加一条记录，
+        聊天流就会变成「方案已更新」的流水。所以按 ``plan_id`` 去重，判据放在库里
+        （``dao.plan_record_exists``）—— 一次新的运行里内存标记从零起步，只靠内存会重复写。
+
+        记录里存**方案全文**：前端那条链接点开就地展开，不必再补一次请求；刷新页面走
+        ``/records`` 拿到的也是同一份内容。
+        """
+        plan_id = int(plan["plan_id"])
+        try:
+            async with self._db.session() as db:
+                if await dao.plan_record_exists(
+                    db, session_id=session.db_id, plan_id=plan_id
+                ):
+                    return
+        except Exception:
+            logger.exception("查方案记录失败（不影响主流程）")
+            return
+        await self._record(
+            session,
+            type="plan",
+            summary=plan.get("title") or "实施计划",
+            ref_id=plan_id,
+            content=plan.get("content"),
+            extra={
+                "plan_id": plan_id,
+                "status": plan.get("status"),
+                "steps": plan.get("steps") or [],
+            },
+        )
 
     async def _record_interrupted(
         self,

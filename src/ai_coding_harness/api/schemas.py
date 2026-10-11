@@ -56,6 +56,58 @@ class SessionListItem(BaseModel):
     created_at: datetime
 
 
+class MemorySnapshot(BaseModel):
+    """仓库记忆（StoreBackend 上那份 Markdown）。
+
+    ``content`` 为 ``None`` ＝ 这个仓库**还没写过**记忆 —— 与「写过一个空文件」是两件事，
+    前端据此显示空态而不是一片空白。
+    """
+
+    path: str
+    content: str | None = None
+
+
+class LogLineItem(BaseModel):
+    """一行日志。``text`` 是原始整行（前端直接显示），``level`` 供着色（认不出就是空串）。"""
+
+    ts: str = ""
+    level: str = ""
+    #: 打这行的 logger 名（认不出就是空串）；也给前端一个按来源分辨的依据
+    logger: str = ""
+    text: str
+
+
+class LogPage(BaseModel):
+    """该会话的日志尾部。``total`` 是命中的总行数（可能大于 ``lines`` 的长度）。"""
+
+    total: int = 0
+    lines: list[LogLineItem] = Field(default_factory=list)
+
+
+class PullItem(BaseModel):
+    """一条 PR（平台差异已归一，见 ``tools/pr_client.pull_summary``）。
+
+    ``state`` 是**状态码**：``open`` / ``merged`` / ``closed`` / ``unknown`` —— 中文标签交给
+    前端，接口不掺展示口径。``unknown`` 是「平台回了个我们不认识的状态」，**不当成没开**。
+    """
+
+    number: str
+    title: str
+    state: str
+    url: str = ""
+    branch: str = ""
+    author: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class PullList(BaseModel):
+    """本仓库的 PR 列表。``open_count`` ＝ **未合并**的条数（主区顶部那个角标用它）。"""
+
+    open_count: int = 0
+    pulls: list[PullItem] = Field(default_factory=list)
+
+
 class RecordItem(BaseModel):
     id: int
     type: str
@@ -86,6 +138,9 @@ class PlanInfo(BaseModel):
     title: str | None = None
     status: str
     steps: list[PlanStepItem] = Field(default_factory=list)
+    #: 方案全文（Markdown）。聊天里那条「方案」链接点开就地展开的就是它 ——
+    #: 带上它之后，实时帧与刷新后读记录拿到的是同一份数据，前端不必再补一次请求。
+    content: str | None = None
     updated_at: datetime
 
 

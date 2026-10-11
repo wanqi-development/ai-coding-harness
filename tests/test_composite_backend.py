@@ -23,7 +23,11 @@ from langgraph.store.memory import InMemoryStore
 from ai_coding_harness.backends.composite import (
     HISTORY_PREFIX,
     LARGE_TOOL_RESULTS_PREFIX,
+    MEMORIES_NAMESPACE,
     build_composite_backend,
+    memory_path,
+    memory_store_key,
+    read_memory,
 )
 
 THREAD = "3da409ae-1111-2222-3333-444455556666"
@@ -33,11 +37,38 @@ LARGE = f"{LARGE_TOOL_RESULTS_PREFIX}{THREAD}/tool-1.txt"
 SECTION_1 = "## Summarized at 2026-09-25T01:00:00+00:00\n\nHuman: 一\n\n"
 SECTION_2 = "## Summarized at 2026-09-25T02:00:00+00:00\n\nHuman: 二\n\n"
 
+MEM_OWNER, MEM_REPO = "zzpfordevelopment", "wanqi-mall"
+MEMORY = "# 仓库记忆：zzpfordevelopment/wanqi-mall\n\n> 最后更新：2026-10-11 09:12\n"
+
 
 def _build(store: InMemoryStore):
     """假默认后端用另一个 namespace 的 StoreBackend —— 「落在默认后端上」即可断言到。"""
     sandbox_stand_in = StoreBackend(store=store, namespace=lambda rt: ("sandbox",))
     return build_composite_backend(sandbox_stand_in, store)
+
+
+class TestTheRepoMemoryIsReadableBack:
+    """右栏「记忆」标签怎么读仓库记忆 —— 这条是 2026-10-11 那个 bug 的回归。
+
+    当时的形状：``read_memory`` 拿 ``memory_path()``（**带** ``/memories`` 前缀）去 ``aget``，
+    而复合后端命中路由前缀后**先剥掉前缀**才交给子后端 —— 于是 store 里存的 key 是
+    ``/owner/repo.md``，按带前缀的 key 查永远是「没有记忆」，面板对已经有记忆的仓库显示
+    「还没写过」。当时的测试还把错误假设抄成了断言（两边用同一个表达式，必然相等）。
+    现在改成**经复合后端写、用 read_memory 读**，口径对不上就会红。
+    """
+
+    def test_it_reads_what_the_composite_wrote(self):
+        store = InMemoryStore()
+        backend = _build(store)
+
+        asyncio.run(backend.awrite(memory_path(MEM_OWNER, MEM_REPO), MEMORY))
+
+        assert memory_store_key(MEM_OWNER, MEM_REPO) == f"/{MEM_OWNER}/{MEM_REPO}.md"
+        assert store.get(MEMORIES_NAMESPACE, memory_store_key(MEM_OWNER, MEM_REPO)) is not None
+        assert asyncio.run(read_memory(store, MEM_OWNER, MEM_REPO)) == MEMORY
+
+    def test_a_repo_without_memory_reads_as_none(self):
+        assert asyncio.run(read_memory(InMemoryStore(), "nobody", "nothing")) is None
 
 
 class TestTheTwoOverflowPrefixesArePersistent:

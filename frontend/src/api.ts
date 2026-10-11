@@ -45,7 +45,59 @@ export interface PlanInfo {
   title: string | null
   status: string
   steps: PlanStep[]
+  /**
+   * 方案全文（Markdown）：聊天里那条「方案」链接点开就地展开的就是它。
+   *
+   * 后端把它同时放进 SSE 的 `plan` 帧与 `type='plan'` 的记录里，所以实时与刷新后
+   * 拿到的是同一份数据，前端不必再补一次请求。
+   */
+  content?: string | null
   updated_at: string
+}
+
+/**
+ * 仓库记忆（StoreBackend 上那份 Markdown）。
+ *
+ * `content` 为 null ＝ 这个仓库**还没写过**记忆 —— 与「写过一个空文件」是两件事，
+ * 面板据此显示空态而不是一片空白。
+ */
+export interface MemorySnapshot {
+  path: string
+  content: string | null
+}
+
+/** 一条 PR（平台差异后端已归一）。`state` 是状态码，中文标签由前端映射。 */
+export interface PullItem {
+  number: string
+  title: string
+  /** `open` / `merged` / `closed` / `unknown`（认不出的状态，**不当成没开**） */
+  state: string
+  url: string
+  branch: string
+  author: string
+  created_at: string
+  updated_at: string
+}
+
+export interface PullList {
+  /** 未合并的条数（面板顶部的「未合并 N」用它） */
+  open_count: number
+  pulls: PullItem[]
+}
+
+/** 一行日志：`text` 是原始整行，`level` 供着色（认不出就是空串）。 */
+export interface LogLineItem {
+  ts: string
+  level: string
+  /** 打这行的 logger 名（认不出就是空串） */
+  logger: string
+  text: string
+}
+
+export interface LogPage {
+  /** 命中的**总行数**（可能大于 `lines` 的长度 —— 面板只说最后 N 行） */
+  total: number
+  lines: LogLineItem[]
 }
 
 /** 一条待办：文本 + 状态（pending | in_progress | completed）。 */
@@ -117,6 +169,55 @@ export async function getPlan(id: string): Promise<PlanInfo | null> {
   const r = await fetch(`/sessions/${id}/plan`)
   if (!r.ok) throw new Error(`方案加载失败：${r.status}`)
   return r.json()
+}
+
+/**
+ * 该会话的仓库记忆全文（**只读**）。
+ *
+ * 记忆正文只在 coding / review 的收尾由主控写，文件头由平台每轮开工前按 PR 实况重算 ——
+ * 所以这里只有读，没有写。
+ */
+export async function getMemory(id: string): Promise<MemorySnapshot> {
+  const r = await fetch(`/sessions/${id}/memory`)
+  if (!r.ok) throw new Error(await errorDetail(r, `记忆加载失败：${r.status}`))
+  return r.json()
+}
+
+/**
+ * 本仓库的 PR 列表（右栏「PR」标签）。
+
+ * **查不到会抛错**（后端 502 + 原因），不是返回空列表 —— 「一个 PR 都没有」和「这次没查成」
+ * 在界面上必须是两句话，所以调用方要把错误单独显示，别当成空态。
+ */
+export async function getPulls(id: string): Promise<PullList> {
+  const r = await fetch(`/sessions/${id}/pulls`)
+  if (!r.ok) throw new Error(await errorDetail(r, `PR 查询失败：${r.status}`))
+  return r.json()
+}
+
+/**
+ * 该会话的日志尾部（按时间合并了接口日志与运行日志）。
+
+ * `level` 是**阈值**（给 `WARNING` 就是 WARNING 及以上），不是精确匹配。
+ */
+export async function getLogs(
+  id: string,
+  options: { limit?: number; level?: string; q?: string; withHttp?: boolean } = {},
+): Promise<LogPage> {
+  const q = new URLSearchParams()
+  if (options.limit) q.set('limit', String(options.limit))
+  if (options.level) q.set('level', options.level)
+  if (options.q) q.set('q', options.q)
+  if (options.withHttp) q.set('with_http', 'true')
+  const query = q.toString()
+  const r = await fetch(`/sessions/${id}/logs${query ? `?${query}` : ''}`)
+  if (!r.ok) throw new Error(await errorDetail(r, `日志加载失败：${r.status}`))
+  return r.json()
+}
+
+/** 下载这个会话的日志（整份 .txt 附件）。交给浏览器处理 `Content-Disposition`。 */
+export function logsDownloadUrl(id: string): string {
+  return `/sessions/${id}/logs/download`
 }
 
 /** 取错误响应里的 `detail`；不是 JSON 或没有该字段就退回兜底文案。 */

@@ -190,6 +190,11 @@ class RunHub:
                 yield seq, frame
             if await self._buffer.is_done(session_id):
                 return
+            # 持有者已经不在（进程被 kill / 重启）＝ 不会再有帧进来：直接收尾，别让**已经接上**
+            # 的订阅者也跟着空转（理由同 ``is_running``）
+            if not await self._lock.held(session_id):
+                logger.warning("本轮已无持有者，订阅收尾：%s", session_id)
+                return
             if local is not None and not local.done:
                 # 本进程的轮次：清事件 → 再查一次 → 等事件。
                 # 「查」在「清」之后、「等」在「查」之后：读完之后才追加的帧必然 set 过
@@ -210,7 +215,16 @@ class RunHub:
             return True
         if not await self._buffer.exists(session_id):
             return False
-        return not await self._buffer.is_done(session_id)
+        if await self._buffer.is_done(session_id):
+            return False
+        # 缓冲还在、也没打 done，但**运行权不在了** ＝ 持有那一轮的进程已经死了（被 kill /
+        # 重启）：不会再有人推进它，答案就是「没在跑」。只看缓冲会永远返回 True —— 实测撞到
+        # 过一次：只剩 ``seq``（TTL 还有 29 分钟），界面一直显示「正在接续本轮」，
+        # 订阅循环空转到 TTL 到期才自愈。
+        if not await self._lock.held(session_id):
+            logger.warning("本轮已无持有者（进程重启或被杀），按未在跑处理：%s", session_id)
+            return False
+        return True
 
     async def cancel(self, session_id: str) -> bool:
         """终止并丢弃某会话的运行（会话被删时、用户点「终止」时调用）。

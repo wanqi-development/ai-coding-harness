@@ -3,22 +3,38 @@
 }
 
 :root {
-  /* 页面三层底：主区最浅、侧栏/计划面板压深一档，气泡再深一档 */
-  --page-bg: #eef4fe;
-  --panel-bg: #e9f0fd;
-  --bubble: #eaecf1;
-  --border: #e5e5e5;
-  --text: #1a1a1a;
-  --text-muted: #8a8a8a;
-  --accent: #4d6bfe;
-  --accent-hover: #3f5ae0;
-  --hover: rgba(0, 0, 0, 0.05);
-  /* 待办块：全页唯一的暖色点，和冷调底子分开 */
-  --todos: #fbdae5;
-  --todos-border: rgba(0, 0, 0, 0.07);
-  --todos-text: #3f3a44;
-  --todo-mark: #c2456b;
+  /* 页面三层底：主区最浅、侧栏/面板压深一档、卡片（气泡）纯白。
+     **色相统一**：灰全部取偏蓝的那一族 —— 中性灰压在蓝底上会发脏（2026-10-06 改版）。 */
+  --page-bg: #f7f9fc;
+  --panel-bg: #eef2f9;
+  --surface: #ffffff;
+  --bubble: #ffffff;
+  --border: #dde3ee;
+  --text: #16202e;
+  --text-muted: #667085;
+  --accent: #3b5bdb;
+  --accent-hover: #3250c4;
+  --accent-soft: rgba(59, 91, 219, 0.1);
+  --hover: rgba(59, 91, 219, 0.07);
+  /* 危险色（终止按钮 / 必填标记）：原来只写了 `var(--danger, #d64545)` 兜底、**从没定义**
+     过 —— 改不动也没法统一，这次补上真令牌 */
+  --danger: #d64545;
+  --danger-hover: #bf3b3b;
+  /* 待办块：中性卡 + 左侧一条强调色，不再用整块粉色（那是全页唯一的暖色，跟冷调底子
+     是两套体系） */
+  --todos: #f4f6fa;
+  --todos-border: #e4e9f2;
+  --todos-text: #26303f;
+  --todo-mark: var(--accent);
+  --todo-ring: #c9d2e0;
   --code-bg: rgba(255, 255, 255, 0.62);
+  /* 圆角刻度：4 / 8 / 12 / 999 四档（原来有 7 种取值，同类元素各不相同） */
+  --r-xs: 4px;
+  --r-sm: 8px;
+  --r: 12px;
+  --r-pill: 999px;
+  /* 唯一的阴影：卡片从底上浮起来一点点，够区分层次就行 */
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
   /* 相邻块之间（正文气泡 / 待办块）的间距 */
   --part-gap: 16px;
   /* 对话列宽：跟窗口自适应 —— 大屏更宽，但留上界（一行太长反而不易读，代码块也不需要
@@ -132,7 +148,7 @@ body.resizing {
   font-size: 13px;
   color: var(--text-muted);
   padding: 8px 4px;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   cursor: pointer;
 }
 .rail-tab:hover {
@@ -142,7 +158,7 @@ body.resizing {
 .rail-icon {
   border: 1px solid var(--border);
   background: #fff;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   width: 26px;
   height: 26px;
   font-size: 14px;
@@ -165,7 +181,7 @@ body.resizing {
 .new-chat {
   border: 1px solid var(--border);
   background: #fff;
-  border-radius: 10px;
+  border-radius: var(--r);
   padding: 10px 12px;
   font-size: 14px;
   cursor: pointer;
@@ -190,7 +206,7 @@ body.resizing {
   justify-content: space-between;
   gap: 6px;
   padding: 9px 10px;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   font-size: 13px;
   cursor: pointer;
   color: var(--text);
@@ -221,7 +237,7 @@ body.resizing {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-muted);
   cursor: pointer;
 }
@@ -238,7 +254,7 @@ body.resizing {
   line-height: 1;
   cursor: pointer;
   padding: 2px 4px;
-  border-radius: 4px;
+  border-radius: var(--r-xs);
 }
 .session-btn:hover {
   background: rgba(0, 0, 0, 0.08);
@@ -299,7 +315,7 @@ body.resizing {
   width: min(520px, 100%);
   padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--r);
   font-size: 14px;
   outline: none;
 }
@@ -310,7 +326,7 @@ body.resizing {
   background: var(--accent);
   color: #fff;
   border: none;
-  border-radius: 10px;
+  border-radius: var(--r);
   padding: 10px 20px;
   font-size: 14px;
   cursor: pointer;
@@ -340,7 +356,7 @@ body.resizing {
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text-muted);
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   padding: 4px 14px;
   font-size: 12px;
   font-family: inherit;
@@ -367,7 +383,7 @@ body.resizing {
 /* 消息时间：气泡下方的灰色小字，跟着气泡同侧对齐 */
 .msg-time {
   margin-top: 4px;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.4;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
@@ -384,8 +400,11 @@ body.resizing {
   /* 只有纯文本的气泡需要保留换行；Markdown 渲染出的 HTML 里换行是标签间的缩进 */
   white-space: pre-wrap;
   font-weight: 500;
-  background: var(--bubble);
-  border-radius: 12px;
+  /* 用户消息实心强调色 + 白字：一屏里「谁说的」一眼分得开（原来两侧都是灰块，
+     只靠左右对齐区分）。右下角收小一点，像指向自己那一侧 */
+  background: var(--accent);
+  color: #fff;
+  border-radius: var(--r) var(--r) var(--r-xs) var(--r);
   padding: 8px 14px;
   /* 不限宽的话长消息会一路铺满整列，跟 AI 回复糊在一起；
      列宽变大之后再加个绝对上界，贴一大段日志不会变成 1400 宽的一行 */
@@ -397,16 +416,20 @@ body.resizing {
   margin-top: var(--part-gap);
 }
 .ai-part.text {
-  background: var(--bubble);
-  border-radius: 10px;
-  padding: 2px 14px;
+  /* 去气泡化（2026-10-06 改版）：AI 正文直接排在页面上，不再套一个灰块 —— 一屏全是
+     灰块是原来最「糊」的一处。只有代码块与待办成卡片，层次靠它们撑。 */
+  background: transparent;
+  border-radius: 0;
+  padding: 2px 0;
 }
 .ai-part.todos {
   margin: 0;
-  padding: 5px 14px;
+  padding: 6px 14px;
   background: var(--todos);
   border: 1px solid var(--todos-border);
-  border-radius: 10px;
+  /* 左侧一条强调色：一眼看出「这是当前状态」，比整块粉色克制得多 */
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--r) var(--r) 0;
   list-style: none;
   color: var(--todos-text);
 }
@@ -450,7 +473,7 @@ body.resizing {
   padding: 0 2px;
   border: 0;
   background: transparent;
-  color: #8a7f88;
+  color: var(--text-muted);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
@@ -472,8 +495,8 @@ body.resizing {
   width: 13px;
   height: 13px;
   margin-top: 5px;
-  /* 圈口用暖灰而不是原来的冷灰 #b9c4d6 —— 冷灰压在粉底上会发青 */
-  border: 1.5px solid #c9b6be;
+  /* 圈口用偏蓝的浅灰（与底色同族）：粉底时代用的暖灰在现在的冷调上会发脏 */
+  border: 1.5px solid var(--todo-ring);
   border-radius: 50%;
 }
 .ai-part.todos li.in_progress .todo-mark {
@@ -526,10 +549,10 @@ body.resizing {
   line-height: 1.4;
 }
 .markdown h1 {
-  font-size: 19px;
+  font-size: 20px;
 }
 .markdown h2 {
-  font-size: 17px;
+  font-size: 16px;
 }
 .markdown h3 {
   font-size: 15px;
@@ -550,7 +573,7 @@ body.resizing {
   font-size: var(--code-size);
   /* 半透明而不是写死灰：气泡底色一深，冷灰会显脏 */
   background: rgba(0, 0, 0, 0.055);
-  border-radius: 4px;
+  border-radius: var(--r-xs);
   padding: 1px 5px;
 }
 /* 代码块：顶部一行放语言名与复制按钮 */
@@ -567,12 +590,12 @@ body.resizing {
   background: var(--code-bg);
   border: 1px solid var(--todos-border);
   border-bottom: none;
-  border-radius: 8px 8px 0 0;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
   color: var(--text-muted);
 }
 .markdown .code-lang {
   font-family: 'Cascadia Mono', Consolas, 'Courier New', monospace;
-  font-size: 11px;
+  font-size: 12px;
 }
 .markdown .code-copy {
   flex-shrink: 0;
@@ -580,11 +603,11 @@ body.resizing {
   background: transparent;
   color: var(--text-muted);
   font-family: inherit;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
   cursor: pointer;
   padding: 3px 6px;
-  border-radius: 4px;
+  border-radius: var(--r-xs);
   /* 默认隐起来，否则满屏代码块全是按钮 */
   opacity: 0;
   transition: opacity 0.15s, background 0.15s, color 0.15s;
@@ -610,14 +633,14 @@ body.resizing {
 .markdown pre {
   background: var(--code-bg);
   border: 1px solid var(--todos-border);
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   padding: 12px 14px;
   margin: 0;
   overflow-x: auto;
 }
 .markdown .code-block pre {
   border-top: none;
-  border-radius: 0 0 8px 8px;
+  border-radius: 0 0 var(--r-sm) var(--r-sm);
 }
 /* 权重压过 hljs 主题的 pre code.hljs —— 它晚于本文件加载，同权重会被它盖掉 */
 .markdown pre code.hljs {
@@ -673,6 +696,41 @@ body.resizing {
 }
 
 /* 输入区 */
+/* 快捷动作：贴在输入框上方，默认只剩一个「快捷 ▸」开关（常驻会抢输入的注意力） */
+.quickbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: var(--chat-max);
+  margin: 0 auto;
+  padding: 0 var(--chat-pad) 8px;
+  width: 100%;
+}
+.quick-toggle,
+.quick-act {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.quick-act {
+  color: var(--text);
+}
+.quick-toggle:hover:not(:disabled),
+.quick-act:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.quick-toggle:disabled,
+.quick-act:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .composer {
   border-top: 1px solid var(--border);
   padding: 14px var(--chat-pad) 20px;
@@ -687,7 +745,7 @@ body.resizing {
   flex: 1;
   resize: none;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--r);
   padding: 12px 14px;
   font-size: 15px;
   font-family: inherit;
@@ -781,7 +839,7 @@ body.resizing {
   border: 1px solid var(--border);
   background: transparent;
   color: inherit;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   padding: 3px 10px;
   font-size: 12px;
   cursor: pointer;
@@ -798,7 +856,9 @@ body.resizing {
   border-left: 1px solid var(--border);
   background: var(--panel-bg);
   display: flex;
-  flex-direction: row;
+  /* row-reverse：竖排标签条贴**窗口最右边缘**，内容在它左边（2026-10-06 改）。
+     只换方向、不动 DOM 顺序，省得动 App.vue 的模板结构。 */
+  flex-direction: row-reverse;
   overflow: hidden;
 }
 /* 收起 = 收内容，标签条留着（点标签就展开到那一个） */
@@ -823,7 +883,8 @@ body.resizing {
   align-items: center;
   gap: 8px;
   padding: 10px 0;
-  border-right: 1px solid var(--border);
+  /* 标签条在最右边缘：分隔线因此落在它的**左边**（原来是 border-right） */
+  border-left: 1px solid var(--border);
   user-select: none;
 }
 .panel-tab {
@@ -836,7 +897,7 @@ body.resizing {
   font-size: 13px;
   color: var(--text-muted);
   padding: 10px 4px;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   cursor: pointer;
 }
 /* 竖排只加在文字上：写在按钮上会让 flex 的主轴跟着旋转，色点的位置就不可控了 */
@@ -865,7 +926,7 @@ body.resizing {
   justify-content: center;
   border: 1px solid var(--border);
   background: #fff;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   font-size: 16px;
   line-height: 1;
   color: var(--text-muted);
@@ -909,38 +970,85 @@ body.resizing {
   background: #d64545;
 }
 
-.plan-title {
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.4;
-  word-break: break-word;
+/* ---- 聊天流里的「方案」链接（原右侧计划面板已取消，2026-10-06）---- */
+.plan-link {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--r) var(--r) 0;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 0;
+  overflow: hidden;
 }
-
-.plan-meta {
+.plan-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
-  font-size: 12px;
-  color: var(--text-muted);
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
 }
-.plan-status {
+.plan-head:hover {
+  background: var(--hover);
+}
+.plan-icon {
+  flex: none;
+}
+.plan-anchor {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plan-badge {
+  flex: none;
   padding: 1px 8px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   border: 1px solid var(--border);
   background: #fff;
+  font-size: 12px;
 }
-.plan-status.executing {
+.plan-badge.executing {
   color: var(--accent);
   border-color: var(--accent);
 }
-.plan-status.done {
+.plan-badge.done {
   color: #1a9e5c;
   border-color: #1a9e5c;
 }
-.plan-status.failed {
-  color: #d64545;
-  border-color: #d64545;
+.plan-badge.failed {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.plan-caret {
+  flex: none;
+  margin-left: auto;
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 5px solid var(--text-muted);
+  transition: transform 0.15s;
+}
+.plan-caret.open {
+  transform: rotate(90deg);
+}
+.plan-body {
+  padding: 4px 12px 12px;
+  border-top: 1px solid var(--border);
+}
+.plan-content {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
 }
 
 .plan-steps {
@@ -952,14 +1060,14 @@ body.resizing {
 }
 .plan-step.running {
   background: rgba(77, 107, 254, 0.07);
-  border-radius: 8px;
+  border-radius: var(--r-sm);
 }
 .step-row {
   display: flex;
   align-items: flex-start;
   gap: 8px;
   padding: 7px 8px;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   font-size: 13px;
   line-height: 1.45;
   cursor: pointer;
@@ -1053,9 +1161,9 @@ body.resizing {
 .step-file {
   background: #fff;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--r-xs);
   padding: 1px 5px;
-  font-size: 11px;
+  font-size: 12px;
   word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   color: var(--text);
@@ -1088,6 +1196,290 @@ body.resizing {
    写死在这里反而会和用户拖出来的宽度打架 */
 
 /* ---------------- 右侧栏「代码」标签 ---------------- */
+/* ---------------- 右侧栏「日志」标签 ---------------- */
+.log-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  flex: 1;
+}
+.log-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.log-level {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+}
+.log-reload,
+.log-download {
+  flex: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  text-decoration: none;
+}
+.log-reload:hover:not(:disabled),
+.log-download:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.log-reload:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.log-meta {
+  flex: none;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+/* 搜索行 + 「含 HTTP 请求行」开关 */
+.log-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.log-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+}
+.log-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.log-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.log-toggle-hint {
+  color: var(--text-muted);
+  opacity: 0.8;
+}
+/* 日志正文：等宽、可滚动、一行一行照原样显示 */
+.log-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  font-family: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.log-row {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-muted);
+}
+/* 级别着色：INFO 保持灰（日志本来就是信息流），只有警告以上才给颜色 */
+.log-row.warning {
+  color: #a8700d;
+}
+.log-row.error,
+.log-row.critical {
+  color: var(--danger);
+}
+.log-row.debug {
+  opacity: 0.75;
+}
+
+/* ---------------- 右侧栏「PR」标签 ---------------- */
+.pr-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  flex: 1;
+}
+.pr-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: none;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.pr-counts b {
+  color: var(--accent);
+}
+.pr-reload {
+  flex: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.pr-reload:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.pr-reload:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.pr-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pr-item {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--surface);
+  padding: 8px 10px;
+}
+/* 未合并的给一条强调色：面板第一眼要看到还开着的 */
+.pr-item.open {
+  border-left-color: var(--accent);
+}
+.pr-item.merged {
+  border-left-color: #1a9e5c;
+}
+.pr-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.pr-badge {
+  flex: none;
+  font-size: 12px;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.pr-badge.open {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.pr-badge.merged {
+  color: #1a9e5c;
+  border-color: #1a9e5c;
+}
+.pr-title {
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pr-title:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.pr-meta {
+  display: flex;
+  gap: 8px;
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.pr-branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'Cascadia Mono', Consolas, monospace;
+}
+
+/* ---------------- 右侧栏「记忆」标签 ---------------- */
+.memory-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  flex: 1;
+}
+.memory-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+/* 路径长（/memories/<owner>/<repo>.md）：省略号收尾，完整值在 title 里 */
+.memory-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.memory-reload {
+  flex: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.memory-reload:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.memory-reload:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* 正文撑满剩下高度，滚动发生在这一层（与代码面板同一条做法） */
+.memory-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.7;
+}
 .repo-panel {
   display: flex;
   flex-direction: column;
@@ -1108,7 +1500,7 @@ body.resizing {
   font-size: 13px;
   padding: 4px 6px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-xs);
   background: #fff;
   color: var(--text);
 }
@@ -1117,7 +1509,7 @@ body.resizing {
   font-size: 13px;
   padding: 4px 10px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-xs);
   background: #fff;
   color: var(--text);
   cursor: pointer;
@@ -1169,7 +1561,7 @@ body.resizing {
   color: inherit;
   font-size: 13px;
   padding: 1px 4px;
-  border-radius: 4px;
+  border-radius: var(--r-xs);
   cursor: pointer;
   max-width: 140px;
   overflow: hidden;
@@ -1200,7 +1592,7 @@ body.resizing {
   border: none;
   background: transparent;
   padding: 3px 6px;
-  border-radius: 6px;
+  border-radius: var(--r-xs);
   cursor: pointer;
   font-size: 13px;
   color: var(--text);
@@ -1244,7 +1636,7 @@ body.resizing {
   color: var(--text-muted);
   cursor: pointer;
   padding: 2px 4px;
-  border-radius: 4px;
+  border-radius: var(--r-xs);
 }
 .repo-back:hover {
   background: var(--hover);
@@ -1279,7 +1671,7 @@ body.resizing {
   margin: 0;
   background: var(--code-bg);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   padding: 8px 10px;
   overflow: auto;
   font-size: var(--code-size);

@@ -12,6 +12,7 @@ import uuid
 from fastapi import HTTPException, Request
 
 from ai_coding_harness.db import dao
+from ai_coding_harness.observability.context import set_session_id
 from ai_coding_harness.session.manager import Session
 
 
@@ -20,7 +21,13 @@ async def resolve_session(request: Request, session_id: str) -> Session:
 
     内存注册表（``app.state.sessions``）只存本进程创建的会话，后端重启后会空；库里的
     会话仍可用 —— 这里据库里的行组装描述，工作区到真正要用时再按需重连/重建。
+
+    **这里也是「会话」这个日志维度的唯一设置点**：每个会话级请求都从这里过，所以它下面
+    的所有日志（含 ``/workspace`` 触发的 provisioning）都带上会话 id；``RunHub`` 起的那一轮
+    跑在 ``create_task`` 里，创建时会把当前上下文复制过去，于是那一轮的日志也带着它。
+    请求各自在自己的 task 里跑，所以这个 set 不会串到别的请求上。
     """
+    set_session_id(session_id)
     cached: Session | None = request.app.state.sessions.get(session_id)
     if cached is not None:
         return cached

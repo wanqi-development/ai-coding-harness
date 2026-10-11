@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Protocol
 
 import httpx
@@ -63,6 +64,60 @@ class PrClient(Protocol):
     async def find_open_pull(self, *, head: str, base: str) -> dict | None: ...
 
     async def close_pull(self, *, number: int) -> dict: ...
+
+
+#: 归一后的 PR 状态码。**平台差异只在这里消化一次**：Gitee 把合并态写在 ``state=merged``
+#: 上，GitHub 的 ``state`` 只认 open/closed、合并态要看 ``merged_at``。
+PULL_OPEN = "open"
+PULL_MERGED = "merged"
+PULL_CLOSED = "closed"
+#: 认不出的取值（平台将来新增的状态）——**不猜**：猜错会把「未知」说成「已合并」。
+PULL_UNKNOWN = "unknown"
+
+
+def pull_state(pull: Mapping[str, Any]) -> str:
+    """一条 PR 的状态码：``open`` / ``merged`` / ``closed`` / ``unknown``。
+
+    ``agent/memory_reconcile`` 判「有没有未合入的 PR」用的是**同一套判定**（那边把它翻成
+    中文标签显示在记忆里）。改这里必须同时看那边 —— 两处判定不一致，就会出现「面板说还
+    开着、闸门说没有」这种自相矛盾，而那正是最难查的一类 bug。
+    """
+    if pull.get("merged_at"):
+        return PULL_MERGED
+    state = str(pull.get("state") or "").strip().lower()
+    if state == "merged":
+        return PULL_MERGED
+    if state == "open":
+        return PULL_OPEN
+    if state in ("closed", "rejected"):
+        return PULL_CLOSED
+    return PULL_UNKNOWN
+
+
+def pull_summary(pull: Mapping[str, Any]) -> dict[str, str]:
+    """一条 PR 归一成界面要的那几个字段（编号 / 标题 / 状态码 / 链接 / 分支 / 作者 / 时间）。
+
+    放在客户端旁边而不是路由里：平台差异（``head.ref``、``user.login`` 与 ``user.name``、
+    ``html_url``）到此为止，路由与前端都不碰原始响应形状。认不出的字段给空串，不给 ``None``
+    —— 前端少一层判空。
+    """
+    head = pull.get("head")
+    user = pull.get("user")
+    number = str(pull.get("number") or "").strip()
+    return {
+        "number": number,
+        "title": str(pull.get("title") or "").strip() or f"PR #{number}",
+        "state": pull_state(pull),
+        "url": str(pull.get("html_url") or "").strip(),
+        "branch": str(head.get("ref") or "").strip() if isinstance(head, Mapping) else "",
+        "author": (
+            str(user.get("login") or user.get("name") or "").strip()
+            if isinstance(user, Mapping)
+            else ""
+        ),
+        "created_at": str(pull.get("created_at") or "").strip(),
+        "updated_at": str(pull.get("updated_at") or "").strip(),
+    }
 
 
 async def pulls_or_raise(
