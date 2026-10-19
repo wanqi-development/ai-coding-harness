@@ -44,6 +44,8 @@ _FORM_TOOLS: dict[str, tuple[str, ...]] = {
         "get_pr_info",
         "storePlan",
         "getPlan",
+        # 只要判「它还在不在、还能不能实施」时用这个：不拉一万字的正文（2026-10-13 加）
+        "planExists",
         "updatePlan",
         "updatePlanSteps",
         "deletePlan",
@@ -63,14 +65,19 @@ _FORM_TOOLS: dict[str, tuple[str, ...]] = {
         "comment_pr",
         "close_pr",
         "get_unexecuted_plan",
+        # 已知 plan_id 时先判存在性再派 coder：一次只回布尔的查询，比拉全文便宜
+        #（2026-10-13 用户口径）
+        "planExists",
         "save_repo_memory",
     ),
 }
 
 #: 需要 ``build_plan_tools`` 那口池子的工具名：出方案轮要 ``storePlan``，编码轮要
-#: ``get_unexecuted_plan``（只读查询）。池子整口建出来，再按 ``wanted`` 挑 —— 表里写什么
-#: 才能拿到什么。
-_PLAN_TOOL_NAMES: frozenset[str] = frozenset({"storePlan", "get_unexecuted_plan"})
+#: ``get_unexecuted_plan`` 与 ``planExists``（两个都是只读查询）。池子整口建出来，再按
+#: ``wanted`` 挑 —— 表里写什么才能拿到什么。
+_PLAN_TOOL_NAMES: frozenset[str] = frozenset(
+    {"storePlan", "get_unexecuted_plan", "planExists"}
+)
 
 
 def _by_name(tools: list[BaseTool], name: str) -> list[BaseTool]:

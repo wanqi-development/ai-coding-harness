@@ -19,11 +19,2650 @@
 | api/ HTTP 接口 | ✅ 完成 |
 | safety/ 安全 | ✅ 完成（全局底线 + 按智能体的工具 / 目录边界） |
 | observability/ 可观测 | ✅ 完成 |
-| tests/ 测试 | ✅ 完成（692 条） |
+| tests/ 测试 | ✅ 完成（1546 条；1533 过 / 13 条既有失败） |
 
 ## 修改记录
 
+### 2026-10-19
+
+#### 委派闸门从循环守卫里拆出来
+
+- **动机**：`LoopGuardMiddleware` 只管「同一工具同参数反复调用」这一件事；当天加进去的
+  `task` 前置检查是**执行前置条件**，判据、开关、失败方式都不一样
+  （`LOOP_GUARD_REPEATS=0` 关不掉它）。继续放一起，名字与职责就对不上了。
+- **改动**：
+  - 新增 `agent/middleware/delegation_gate.py::DelegationGateMiddleware`：主控专用。
+    本轮没有**成功执行过** `write_todos` 时，`task` 不执行，回一条
+    `ToolMessage(status="error")` 说明先写清单；`write_todos` 的成功记账也由它自己做
+    （仍落在 `TurnState` 上，与循环计数共用同一份本轮状态）。
+  - `LoopGuardMiddleware` 还原成纯刹车：只数重复、先劝后停，不再关心 `task`。
+  - `agent/graph.py` 的装配顺序改为 `Boundary → Memory → DelegationGate → LoopGuard → …`：
+    被闸门拦下的 `task` 不占重复额度，模型补完清单后第一次派发仍是第 1 次。
+  - 子智能体不挂这一层（它们没有 `task` 可调），`subagents.py` 不变。
+  - 测试拆成 `tests/test_loop_guard.py`（22 条）与 `tests/test_delegation_gate.py`（9 条）；
+    新增「`Command` 返回值算成功」「一张清单允许本轮多次派发」「被拒的 `task` 不占额度」
+    三个用例，另在 `test_profiles.py` 钉住子智能体不挂闸门。
+- **验证**：定向 109 passed；全量 `pytest` **1533 passed / 13 failed**（与改动前同一批
+  既有失败：`test_prompts` 10 条、`test_boundary` 3 条）；`ruff check` 改动的 7 个文件全清。
+- **遗留**：无。
+
+#### 主控调用 `task` 前强制 `write_todos`
+
+- **动机**：主智能体通过 `task` 派子智能体时经常忘记先调用 `write_todos`，于是这一轮
+  没有用户可见的任务清单，进度也无处落。用户要求在 `awrap_tool_call` 里拦。
+- **改动**：
+  - `TurnState` 新增按角色分账的 `_successful_tools` / `mark_tool_success()` /
+    `has_successful_tool()`；只认工具**成功返回**，失败或只发起调用不算。
+  - `LoopGuardMiddleware.awrap_tool_call()` 在主控调用 `task` 时检查本轮是否已有成功
+    的 `write_todos`；没有就返回 `ToolMessage(status="error")`，说明必须先写清单，
+    `task` 不执行。被拦的 `task` 不进入循环计数，补完清单后第一次 `task` 仍是第 1 次。
+    （同日稍后拆到 `DelegationGateMiddleware`，见上一条。）
+  - 闸门只针对 `MAIN_AGENT`；子智能体不挂这道限制。`LOOP_GUARD_REPEATS=0` 只关循环
+    计数，不关这道任务闸门。
+- **验证**：`tests/test_loop_guard.py` **27 passed**（覆盖拒绝、成功放行、失败的
+  `write_todos` 不放行、子智能体不拦、循环守卫关闭时仍拦）。
+
+#### 历史会话少了几轮：records 改成分页取最近 20 条
+
+- **动机**：当前 wanqi-mall 会话 `cb4c905c` 实际有 **207 条** session_records，但
+  `GET /sessions/{id}/records` 默认 `limit=200`，DAO 又按时间**正序** `LIMIT 200`
+  —— 被截掉的是**最新的 7 条**，所以界面看起来像最近几轮丢失；token 聚合复用同一
+  查询，也会少算这几条。用户 2026-10-19 口径：首屏只取最近 20 条，向上滚动再翻页，
+  页面加载也应该更快。
+- **改动**：
+  - 新增 `dao.list_records_page(..., before_id, limit=20)`，按 `id < before_id` 取
+    更早一页，多取一条判断 `has_more`，返回按时间正序的条目 + `next_before_id`。
+  - `GET /sessions/{id}/records` 默认返回 `RecordPage {items, has_more, next_before_id}`，
+    默认 20 条；`before_id` 是继续向前翻的游标。
+  - 前端首屏只请求 20 条；消息区滚到顶部（`scrollTop <= 80`）自动加载更早 20 条，
+    保留滚动位置；顶部也保留「加载更早的 20 条」按钮作为兜底。
+  - `list_records` / `list_records_with_detail` 继续保留“最近 N 条再翻回正序”的口径，
+    token 聚合不再从最老的 200 条开始。
+- **验证**：同一会话 `list_records_page(limit=20)` 返回 20 条、`has_more=True`、
+  `next_before_id=596`，首条 596 / 末条 615；`list_records_with_detail(limit=500)`
+  返回 207 条，最后一条是 id=614。
+
+#### 意图澄清改成「qa 固定协议 + 前端弹窗 + 一次性 pending」
+
+- **动机**：低置信度澄清不能只让 qa 自由写一段追问——用户很难稳定回答“第一个/第二个”，
+  后端也无法确定用户选的是哪个意图。改成弹窗选项后，选项点击是确定性映射；用户关掉弹窗
+  自由输入时，才重新走意图识别。qa 仍然可以自由写问题、label 和 description，只是输出
+  必须包在固定协议里。
+- **改动**：
+  - 新增 `clarification.py`：qa 输出 `<CLARIFY>` + JSON（`question` + 2~3 个
+    `{intent,label,description}`），解析器校验意图白名单、选项数量、重复项。
+  - `clarification_block` 改为强制上面的格式；qa 仍可读只读上下文、自由措辞。
+  - 新增表 `clarifications`（迁移 `a1b2c3d4e5f6`）：每会话最多一条 pending，保存
+    原始用户消息、问题、候选；**任何新的用户消息先删除它**，结构化选择则消费。
+  - 新增 SSE `clarification` 帧与 `GET /sessions/{id}/clarification`（刷新恢复弹窗）。
+  - `POST /chat/{id}` 请求增加 `clarification_id` / `choice`：选项走确定性映射并跳过
+    JEV/大模型；`other` 或普通消息清 pending 后走正常判定。
+  - 前端新增 `ClarificationDialog.vue`：候选按钮 + “其他”；关掉后回到输入框。
+  - 选择候选时用原始用户消息执行对应形态，不拿“第一个”作为任务内容。
+- **关键决策**：pending 是**一次性状态**，不靠“新任务”语义判断；只有明确 choice 才消费，
+  其他任何消息都作废。qa 不直接执行/改文件/建方案。
+- **验证**：
+  - `tests/test_clarification.py` + `tests/test_intent_middleware.py`：**22 passed**；
+  - 全量：**1528 passed / 13 failed**（仍是既有 `prompts.py` 10 条 + `boundary.py` 3 条）；
+  - 前端 `npm.cmd --prefix frontend run build`：通过（`vue-tsc` + vite）。
+
+#### 按角色分两档：qa/analysis 与主控 orchestrate 稳态 70%，plan/planner/coder/reviewer 爆发 40%
+
+- **动机**：120K 绝对上限对读文件密集的 plan / planner / coder / reviewer 太小，日志里出现过
+  `CONTEXT_PRETRIM` 313 次、`CONTEXT_SUMMARY` 只有 2 次的极端比例：每步都在裁，
+  但 checkpoint 仍是完整历史，压不下去。qa / analysis 通常不会一次读大量文件，
+  不该和代码类角色共用同一条线。
+- **改动**：
+  - `config.context_steady_trigger_fraction`（默认 **0.70**）与
+    `config.context_burst_trigger_fraction`（默认 **0.40**）；`CONTEXT_SUMMARY_TRIGGER_TOKENS`
+    降级为“窗口解析不出来时”的兜底线，不再作为大窗口模型的固定小上限。
+  - `summarization.resolve_context_mode`：主控按 `form` 选（qa/analysis/orchestrate 稳态，
+    plan/review 爆发），子智能体按角色选（planner/coder/reviewer 爆发）。主控与三个
+    子智能体上下文隔离，主控 orchestrate 只收 `task` 的交接结果，不需要跟子智能体一起爆发。
+  - 主控装配把 `profile.form` 传给 `build_summarization`。
+  - `CONTEXT_SUMMARY` / `CONTEXT_PRETRIM` 的触发线文字带上「稳态 / 爆发」，便于按模式
+    统计压缩与裁剪数量。
+  - 更新 `.env.example`、README、AGENTS 与测试；稳态/爆发各钉一条触发比例，角色映射
+    也单独钉住。
+- **关键决策**：先只做角色分档，不接动态增长判定；下一轮再根据实际日志决定是否引入
+  “读文件次数 / 增长速率”的动态切换。
+- **验证**：
+  - 定向（`tests/test_summarization.py` + `tests/test_context_calibration.py`）：
+    **52 passed**；`ruff check` 干净。
+  - 全量：**1514 passed / 13 failed**（仍是既有 `prompts.py` 10 条 + `boundary.py`
+    3 条）；验证口径是同一会话里 `CONTEXT_PRETRIM` 与 `CONTEXT_SUMMARY` 的出现比例，
+    以及两种模式的触发线日志。
+- **遗留**：爆发档目前仍是“先裁剪、剪完低于线就不摘要”，如果实际日志里仍然频繁
+  pretrim，再决定是否改成“每轮一次免压 pretrim，第二次越线强制摘要”。
+
+#### 压缩保留清单 + 工作笔记 KEEP：裁剪从「只保当前步骤」改成「保模型点名的结果」
+
+- **动机**：reviewer 连续被 `LoopGuardMiddleware` 中止的根因，是旧版应急裁剪只保当前
+  步骤 —— 刚读过的关键文件在下一步就被换成占位符，模型只能反复重读同一批文件。用户口径：
+  临近压缩线时先提醒模型总结自己读到的东西，并点名下一轮仍需要的工具返回；不再按
+  「最后一条 `HumanMessage` 之后全部保留」切（子智能体整轮可能有一百多条工具返回，
+  那样等于没裁）。
+- **改动**：
+  - 摘要提示词新增 `SUMMARY_MUST_KEEP`（插在默认提示词的 `<messages>` 之前）：逐字保留
+    用户显式约束 / 纠正（含密钥时打码）、精确标识符、当前目标 / plan / PR / 分支 /
+    commit、未完成事项、已确认 / 已否决决策与原因、失败与风险、工具名 + 目标 +
+    `tool_call_id` 指针；明确完整文件 / diff / 日志可丢，长度 800~1200 字。
+  - `context_pretrim_notice_ratio`（默认 **0.9**）进入运行期设置「上下文压缩配置」：
+    到压缩线的提醒线（默认 90%）注入 `PRETRIM_NOTICE`，让模型在正常回复里写 `<working-note>` 和
+    `KEEP:` 清单；同一轮、同一智能体只提醒一次。
+  - `pretrim_tool_results(..., keep_items=...)`：保留**当前步骤 + KEEP 点名的工具返回**，
+    支持 `tool_call_id`、`工具名:目标`、纯路径 / 命令；总额约 **20k tokens**，最近优先。
+    子智能体那条任务 `HumanMessage` 只作为轮次边界，不会被当成「整轮全部保留」。
+  - `keep_items_from_messages()` 只扫描当前轮最近的 AI 消息；旧轮次的 KEEP 不会被误用。
+  - 提醒轮如果已经过压缩线，先不裁剪直接调一次模型，给它写笔记的机会；真实溢出再回落
+    压缩。日志标签：`CONTEXT_PRETRIM_NOTICE` / `CONTEXT_PRETRIM`。
+- **关键决策**：不额外调用模型做「工具选择器」；提醒发生在 90%，不是到线才提醒；
+  KEEP 只影响本次请求，不改 checkpoint / 业务库 / `tool_call_id` 配对。
+- **验证**：
+  - 定向（`tests/test_context_trim.py` + `tests/test_summarization.py`）：**56 passed**；
+  - 全量：**1509 passed / 13 failed**（仍是既有 `prompts.py` 10 条 + `boundary.py` 3 条）；
+  - `ruff check` 本次改动文件干净。
+- **遗留**：摘要调用目前绕过了 `ModelRedactionMiddleware`，密钥打码只靠提示词约束；
+  下一步可在摘要输出上补代码级脱敏。真机还要看 reviewer 是否不再重复读同一批文件。
+
+#### 低置信度转 qa 澄清（阈值 0.55，数据支持）
+
+- **动机**：JEV / 大模型判得很虚时，直接按猜出来的形态干活风险高。用户口径：置信度低
+  就转 qa，让 qa 先判断意图、按可能性排序后向用户追问；不新建“澄清智能体”。
+- **阈值依据（200 条实测，JEV 163 条有 confidence）**：
+  - `< 0.55`：16 条，原判定只对 **43.8%**；
+  - `>= 0.55`：147 条，准确率 **91.2%**；
+  - 对照：0.50 会问 11 条（36.4% 正确），0.60 会问 23 条（52.2% 正确）。
+  - 0.55 落在“低置信准确率明显塌陷、追问量约 10%”的拐点上，所以取 0.55（不是拍脑袋）。
+- **改动**：
+  - `config.intent_clarify_confidence` 默认 **0.55**（0=关闭），并加进
+    `RUNTIME_SETTINGS` 的「意图识别」组（设置页可调）。
+  - `IntentDecision` 增加 `candidates` / `needs_clarification`；JEV 把
+    `ChoiceAnswer.probabilities` 前 3 名带出来。
+  - 大模型分类提示词改成四行：**意图 / 置信度 / 候选 / 理由**；`parse_reply`
+    兼容旧两行格式，新增置信度与候选解析。
+  - `service`：`active_task_override` 之后才做低置信判断（明确“继续/修复”优先，不追问）；
+    命中后转 `qa` + `SOURCE_CLARIFY`，把 `confidence/candidates` 经
+    `configurable.clarification` 传给中间件。
+  - `IntentMiddleware` 最后注入「本轮先澄清意图」块：先只读了解上下文，列出 2~3 个按
+    可能性排序的候选（各一句理由），最后只问一个问题；**不要执行/改文件/建方案**。
+  - qa 的“任务”是**提示词澄清模式**，没有把 `write_todos` 还给 qa（qa 仍然没有待办树）。
+  - `eval_intent.py` 增加 `--normal-only`（只跑现有判定）与 clarify 模拟统计；
+    `run --out` + `policy` 继续用于固定轴离线调策略。
+  - 新增/更新测试：`should_clarify`、`clarification_decision`、四行解析、JEV 候选、
+    澄清块注入、阈值默认值。
+- **验证**：
+  - 真实 LLM 探针：四行输出可解析为 `analysis / 0.78 / qa 0.20, review 0.02`；
+  - 真实 JEV 探针：候选能带出来（如 `qa 0.64 / analysis 0.16 / plan 0.12`）；
+    但同一低置信样本两次跑出 0.21 / 0.57 —— **置信度本身不稳定**，0.55 是策略旋钮，
+    不是校准保证；
+  - 定向（意图判定/中间件/路由/设置）：**209 passed**；
+  - 全量：**1499 passed / 13 failed**（仍是 `prompts.py` 10 条 + `boundary.py` 3 条既有失败）；
+  - `ruff check` 干净。
+- **遗留**：阈值是在 200 条上定的，样本再多要复核；JEV 的 confidence 会跨次抖动
+  （同一句 0.21 / 0.57），大模型自报置信度也未校准 —— 想更稳可以看 top1-top2 的 margin
+  或跑两次取一致；qa 是否真的按“排序追问”执行、追问率是否可接受，需要真机跑几轮看。
+
+#### 意图路由：active_intent 进入策略表 + 固定轴评测
+
+- **动机**：200 条评测里短追问/继续类错误集中在 `rework/review → coding` —— 根因是
+  `suggest_intent()` 只收到 `previous_intent`，看不到会话里更早的未完成任务；同时路由轴
+  每次跑都会抖动，盲调策略分不清「模型判错」还是「策略判错」。
+- **改动**：
+  - `suggest_intent(..., active_intent=...)`：短追问分两类 —— 选择题/确认（「b」「确认事实」
+    「这个」）跟紧邻的上一轮；动作型（「继续」「修复」「实施」「执行」「开始」）跟未完成任务；
+    长消息默认按未完成任务。
+  - plan 上 `wants=change` + `target=execution/code` → coding（实施/执行方案不是改方案对象）。
+  - 长句「也不对，你应该先查记忆、再派 coder 执行」若 `wants=change`，按新指令走，
+    不因「不对」被当成单纯纠正。
+  - 裸「为什么/根因/原理」→ analysis；明确的「有什么/是什么/有哪些」→ qa（即使 router 判成
+    decide）；PR 已合并/已关闭的收尾不再要求 `target=pr_status/memory`，直接 analysis。
+  - `service.py` / `eval_intent.py` 都传 `active_intent`。
+  - `eval_intent.py` 新增 `run --out`（保存逐样本轴/建议）与 `policy`（用固定轴离线重算策略，
+    不调模型）；`policy` 与 `run` 一样剔除 sync。
+  - 新增 6 条策略测试。
+- **关键决策**：不再靠 prompt few-shot 硬拉 —— 实测加示例后路由轴反而漂得更多
+  （同一批 `coding→plan` 从 0 变 7），已回退到原来的单示例；先固定轴调确定性策略，
+  再端到端复测。
+- **验证**：
+  - 端到端 200 条（多次）：85.6% / 88.1% / 88.9% / 91.0% / **89.7%**（最后一次 174/194，
+    4 条解析失败、2 条 sync 跳过）；
+  - 固定轴离线：一次 dump **173/189 = 91.5%**，另一次 174/194 = 89.7% —— 策略本身没问题，
+    差异全部来自路由轴抖动；
+  - 定向意图测试：**148 passed**；`ruff check` 干净。
+- **遗留**：路由轴稳定性（4~9 条解析失败 / 同批样本漂移）与 qa/plan/analysis 标注边界
+  （如「有哪些未完成的工作」按口径应 plan）仍是主要瓶颈；影子路由**不切线上**，
+  下一步应做 hybrid gating（只在继续/短追问等价值区间采用路由建议）或先复核标注。
+
+#### 思考与正文按到达顺序交错（前端）
+
+- **动机**：用户要的是「思考（浅色）→ 正文 → 思考 → 正文」的流式交错；之前思考单独存在
+  `Message.reasoning` 里，固定渲染在正文上方的一个可折叠块中，两套顺序无法交错。
+- **改动**：
+  - `Part` 新增 `{ kind: 'reasoning', agent, text }`；删掉 `Message.reasoning`、
+    折叠状态与顶部思考块。
+  - `attachStream` 的 100ms 缓冲改为**一条有序队列**：text / reasoning 按到达顺序入队，
+    连续同一角色的思考合并；flush 按队列顺序写入 `parts`，不会被重排。
+  - 渲染改 `flowEntries(m)`：连续 text 仍合成一个气泡（保留 Markdown 分组与封口优化），
+    思考段原地插入；待办 / 方案仍固定在底部。
+  - 样式：`--text-muted` 浅色、13px、`pre-wrap`、左侧细线；每段一个「思考过程」小标签，
+    子智能体带角色；始终展开。
+- **关键决策**：思考不落库、刷新即消失（沿用现有口径）；子智能体思考也交错展示（带角色）；
+  **跑完隐藏思考、只留正文并 Markdown 化**（`flowEntries` 在 `m.at` 后跳过 reasoning，
+  但不切断正文分组，前后正文仍合成一个 Markdown 气泡）；不做折叠。
+- **验证**：`npm.cmd --prefix frontend run build`（vue-tsc + vite）通过。
+- **遗留**：真机看一眼交错顺序；历史消息仍只有正文。
+
+#### 修复：ReasoningChatOpenAI 丢工具调用（正文为空的真因）
+
+- **现象**：接入思考后，模型实际要调两个 `execute`，应用里却是「空正文 + 0 工具」，
+  看起来像模型只思考不干活。
+- **根因**：父类 `_convert_delta_to_message_chunk` 只在 `role == "assistant"` **或
+  `default_class == AIMessageChunk`（精确相等）** 时才解析 `tool_call_chunks`。
+  我们返回 `ReasoningAIMessageChunk` 后，`_stream` 把 `default_chunk_class` 设成了这个子类；
+  后续 tool-call chunk 的 `role` 是 `None`，于是走最后的兜底分支 —— 正文保留、
+  工具调用被静默丢掉（模型没有停，是调用丢了）。
+- **改动**：`_convert_chunk_to_generation_chunk` 在调用父类前，给缺少 `role` 的 delta 补
+  `role="assistant"`，让父类走带 `tool_call_chunks` 的分支。
+- **验证**：
+  - A/B（同 payload、同工具）：旧 `ChatOpenAI` 返回 2 个 `execute`；修复前新类 0 个；
+    修复后新类返回 2/1 个，且思考正文仍在；
+  - 新增 2 条回归测试（无 role 的 tool-call chunk、思考与工具调用合并）；
+  - 全量 `pytest -q`：**1488 passed / 9 failed**（仍是那 9 条既有失败）；
+  - `ruff check` 干净。
+- **遗留**：当前后端进程仍加载旧代码，需重启后再发一轮确认界面上的正文与工具调用。
+
+#### 思考正文：ReasoningChatOpenAI 补回 reasoning_content
+
+- **动机**：前端「思考过程」块一直空着。查下来不是网关不给：原始 SSE 的
+  `delta.reasoning_content` 有文本，但 LangChain 的 `ChatOpenAI` 只面向官方 OpenAI 规范，
+  模块 docstring 明写第三方字段（`reasoning_content` / `reasoning_details`）**不提取、不保留**；
+  `_convert_delta_to_message_chunk` 只搬 `content` / `function_call` / `tool_calls`。
+  `init_chat_model(provider="openai")` 造出来的就是 `ChatOpenAI`，不是工厂的问题。
+- **改动**：
+  - 新增 `agent/chat_model.py`：
+    - `ReasoningChatOpenAI` 覆写 `_convert_chunk_to_generation_chunk`：从原始 chunk 的
+      `choices[0].delta.reasoning_content` 取文本，累加进 `additional_kwargs`，并把消息换成
+      `ReasoningAIMessageChunk`；
+    - `ReasoningAIMessageChunk` 覆写 `content_blocks`，把这段文本还原成 reasoning 块。
+      **只补 `additional_kwargs` 不够**：OpenAI 的 provider translator 只产出 text / tool_call。
+  - `llm._model_from` 改用 `ReasoningChatOpenAI` 直接构造（主模型与兜底共用）；classifier
+    仍是普通 `ChatOpenAI`（关思考）。
+  - `pyproject.toml` 钉 `langchain-openai>=1.3.2,<1.4`（覆写的是私有钩子）。
+  - 新增 `tests/test_chat_model.py` 6 条：reasoning 块、流式合并、无思考不加空块、
+    已有块不重复、`build_model` 用子类、v3 事件里出现 `reasoning-delta`。
+- **关键决策**：
+  ① 不用 `ChatDeepSeek` 等专用包：只覆盖一家，Kimi / GLM / 自建网关仍没有；
+  ② 不改 `response_metadata["model_provider"]` 去绕开 OpenAI translator —— 会破坏压缩中间件里
+     「上一轮自报用量」的 provider 匹配；
+  ③ 只补流式：主智能体走流式；摘要 / 分类的 `ainvoke` 不展示思考。非流式要补时再加
+     `ReasoningAIMessage`，两处共用同一套 reasoning 块逻辑。
+- **验证**：
+  - 定向（chat_model + llm + 流式用量 + 压缩）：**76 passed**；
+  - 全量 `pytest -q`：**1486 passed / 9 failed**（仍是那 9 条既有失败）；
+  - `ruff check` 干净；
+  - v3 事件层实测出现 `content-block-delta` → `reasoning-delta`，文本正确。
+  - **真机探针**（2026-10-19，PG / 后端起来后）：`deepseek-v4-pro` 返回思考正文
+    **122 字**、正文 `425`、用量 `96/40`（其中思考 38 tokens）；同一份流里
+    `content-block-delta` 的 `reasoning-delta` 正确；`V3Translator` 产出
+    `{"type": "reasoning", "content": "...", "agent": "main"}`。
+- **遗留**：等下一次真实会话在界面上确认思考块；非流式响应仍不带思考（见模块注释）。
+
+### 2026-10-18
+
+#### 意图识别的模型构造独立出来
+
+- **动机**：`build_classifier_model` 之前与主智能体共用 `init_chat_model` 工厂。意图识别那一行
+  有自己的开关（思考 / `max_tokens` / 不挂工具），通用工厂的默认值会混进来；非法字段（如
+  `stream`）还会被塞进 `model_kwargs` 并给出警告。
+- **改动**：`agent/llm.py::build_classifier_model` 改为直接用 `ChatOpenAI(...)` 构造，不再经过
+  `init_chat_model`；主智能体那条路不变。思考**关掉**（`extra_body` 用实测有效的
+  `chat_template_kwargs.enable_thinking=False`，不走 `reasoning_effort`），温度按
+  `temperature_for(cfg.model, 0)` —— 常规模型就是 0，kimi 系仍按 1（它只收 1）。
+- **验证**：新增守卫用例——把 `init_chat_model` 换成会抛错的桩，classifier 仍能建出来；
+  `test_llm_config.py + test_model_config.py + test_stream_usage.py`：**165 passed**；
+  全量 `pytest -q`：**1480 passed / 9 failed**（仍是那 9 条既有失败）；
+  `ruff check` 干净。
+- **遗留**：无。
+
+#### 上下文估算的在线校准（CONTEXT_CALIBRATION）
+
+- **动机**：字符估算的固定系数（中文 1.6、其余 3.8）在不同 tokenizer 上偏差不同 —— 实测
+  deepseek-v4-pro 低估约 5%，deepseek-flash 低估约 28%~32%。剪裁/压缩的绝对阈值与
+  「剪完能不能免压」都吃这把尺子，差 30% 时 120k 的线实际约 154k 才触发。
+- **改动**：
+  - 新增 `agent/context_calibration.py`：
+    - `CalibrationStore`：按 `(base_url, model)` 记 EMA 系数（α=0.3，样本与系数都夹在
+      0.5~3.0）；估算 <1000 tokens 的请求不记（固定开销占主导）；首样本、每 10 个样本、
+      系数变化 ≥5% 时留一条 `CONTEXT_CALIBRATION`。
+    - `CalibratedTokenCounter`：先调 `context_token_counter` 拿原始估算，再乘当前系数；
+      `record(response, estimated)` 从 `usage_metadata.input_tokens` 取真值。没有样本时
+      系数为 1.0，行为与校准前完全一致。
+  - `build_summarization` 的 `token_counter` 换成上述计数器（每个角色一份，账本共享）。
+  - `HarnessSummarizationMiddleware` 在三条真正发请求的路径上记样本：正常调用、只有
+    上一轮自报值过线而跳过压缩、应急裁剪后免压；压缩路径用**压缩后**的消息估算记样本。
+  - 兜底模型答的响应不记到主导模型账上（`response_metadata.model_name` 不匹配就跳过，
+    并提示一次「可能是兜底或网关别名」）。
+  - 新增 `tests/test_context_calibration.py`（13 条）；`test_the_counter_is_ours` 改成
+    断言「没有样本时与原字符估算逐字一致」。
+- **关键决策**：
+  ① 不用上游 `use_usage_metadata_scaling`：它拿「上一条 AI 消息的 total_tokens / 估算」
+     当比例，而我们的应急裁剪会改写历史消息，剪过的历史与那笔真值对不上，系数会被放大；
+     这里只认「刚发出去的那一份」。
+  ② 记录时把**校准后的估算反推成原始估算**再算比例，避免把同一个系数乘两次。
+  ③ 按模型而不是按角色：tokenizer 是模型属性；角色只写进日志。
+  ④ 系数只存进程内，重启后重新学（通常几次调用就收敛）；没有真值就退回 1.0，
+     不因为「没样本」而让压缩失效。
+- **验证**：
+  - 定向（校准 + 压缩 + 剪裁 + 流式用量）：**65 passed**；
+  - 全量 `pytest -q`：**1478 passed / 9 failed**；9 条仍是 `prompts.py` 6 条 +
+    `safety/policy.py` 3 条既有失败，本次未新增；
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - 真实网关上还没看到系数收敛（本机 PostgreSQL 未启动，后端没跑）；下次启动后看
+    `CONTEXT_CALIBRATION` 的 `ratio` 与 `CONTEXT_PRETRIM` 的估算差是否缩小。
+
+#### 流式响应的 token 用量（stream_usage）
+
+- **动机**：日志里大量「LLM 调用完成：（无用量信息）」，压缩的「上一轮自报值」触发与在线
+  校准都拿不到真值。根因不是供应商不给：LangChain 的 `ChatOpenAI` 只在默认 `api.openai.com`
+  时自动打开 `stream_usage`，本项目全走自定义 `base_url`，流式请求根本不发
+  `stream_options.include_usage`；同一个 kimi 调用一次有、一次没有，就是流式/非流式路径的差别。
+- **改动**：
+  - `agent/llm.py::_model_from`：构造模型时显式 `stream_usage=True`（主模型与兜底共用这一处）。
+  - 新增 `agent/middleware/stream_usage.py`：网关以 400/422 拒绝 `stream_options` 时，按
+    `base_url` 记住并**重试一次**不带该字段的模型副本；同一地址后续直接降级，不再先撞一次。
+    缓存是进程内模块级集合，重启后重试一次（网关升级支持就自动恢复）。
+  - 主控与三个子智能体都挂（`agent/graph.py` / `agent/subagents.py`），位置在**兜底中间件
+    内侧**、整条链最内层。
+  - `tests/test_stream_usage.py` 新增 6 条：工厂开关、拒绝后重试并记住、下次直接降级、
+    无关 400 不吞、422 同样识别、无地址不重试、降级后仍失败就抛。
+  - `tests/test_model_fallback.py` 的装配断言同步：兜底由「最内层」改为「倒数第二层」，
+    最内层是流式用量开关。
+- **关键决策**：
+  ① 默认打开、失败自动降级，不新增配置项、不动数据库 —— 这一步只解决「拿得到用量」；
+  ② 重试放在兜底内侧：网关不认字段不是「主导模型挂了」，不能让 `FallbackMiddleware`
+     记成主导故障而切模型；
+  ③ 只对 400/422 且报错文本点名 `stream_options` / `include_usage` / `stream_usage` 的
+     错误降级，别的错误原样抛；取不到 `base_url` 时不重试；
+  ④ 降级只影响 usage 采集，估算与压缩判据不变 —— 没有用量的模型仍按字符估算工作。
+- **验证**：
+  - `tests/test_stream_usage.py + test_llm_config.py + test_model_fallback.py`：**62 passed**；
+  - 全量 `pytest -q`：**1465 passed / 9 failed**；9 条仍是 `prompts.py` 6 条文案 +
+    `safety/policy.py` 3 条未同步（工作区既有改动），本次未新增失败；
+  - `ruff check` 本次改动文件干净。
+- **遗留**：
+  - 本机 PostgreSQL（127.0.0.1:5432）当时未启动，没能跑真实网关探针；后端起来后看日志
+    应不再出现「（无用量信息）」，若某家网关拒绝字段会出现一条 `STREAM_USAGE` 告警并自动降级。
+  - 「在线校准」（用真值给估算乘系数）是下一步，等这一步拿到稳定用量后再做。
+
+### 2026-10-17
+
+#### 会话 active task + 路由 JSON 重试（200 条 router-only 90.5%）
+
+- **动机**：短追问（“继续吧”“B”“确认事实”）只看 `previous_intent` 不够 —— 上一轮可能是
+  analysis/qa，但真正未完成的是更早的 coding/rework。另：200 条里有 7~8 条路由回复不是合法
+  JSON，直接丢弃太浪费。
+- **改动**：
+  - `service` 增加会话级 `_active_tasks`：记录最近一次**可执行**意图（coding/rework/plan/review）；
+    analysis/qa 不覆盖它。进程重启后从最近 10 条 assistant 记录的 `extra.intent` 回溯。
+  - `intent.active_task_override()`：只在显式“继续/修正/短追问/短选择”时沿用 active task；
+    上一轮是 plan 而用户说“修复/实施/执行”时落到 coding；正常问句不碰。
+  - 系统提示新增“当前未完成任务：…”；普通判定、handoff 重判、影子路由都带上。
+  - PR 已合并/已关闭后的 analysis 收尾、关闭/删除方案时清空 active task。
+  - `intent_router.route()` 对解析失败**重试一次**（只对失败路径，正常路径不多付调用）；
+    重试仍失败才返回 None。
+  - `eval_intent.py` 新增 `--ids`（迭代错例）、`--router-only`（只跑路由），
+    `enrich` 补 `active_intent`。
+- **评测（200 条，全部标注 + 两轮对话）**：
+  - 现有判定：**88.0%**（未重跑全量，沿用上一轮）
+  - 路由 router-only：**90.5%**（172/190；8 条解析失败、2 条 sync 跳过）
+  - 路由相对 v3 的 89.5% 再 +1.0；相对现有判定 +2.5。
+  - 硬错例子集（17 条）：normal / router 都从 7/17 提到 8/17；解析失败 3→2。
+- **关键决策**：
+  ① active task 只记**可执行**意图，analysis/qa 不覆盖；避免一次解释轮把 coding 任务冲掉；
+  ② 只有显式继续/短追问才兜底，正常问句仍交给 JEV/LLM；
+  ③ JSON 重试只在解析失败时发生，不让正常路径多付一次调用；
+  ④ 路由仍**不切换形态**，继续影子模式（领先 2.5 点但仍有 8 条解析失败）。
+- **验证**：
+  - 意图 + 路由 + 中间件 + 记忆闸门定向：**184 passed**；
+  - 全量 `pytest -q`：**1459 passed / 9 failed**；9 条仍是 `prompts.py` 6 条文案 +
+    `safety/policy.py` 3 条未同步（工作区既有改动）；
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - active task 仍只有 intent、没有 target/PR/plan_id；“继续吧”在上一轮 plan、更早 coding
+    的样本里仍会有歧义，需要真正的 task 对象与完成状态；
+  - 8 条 JSON 解析失败说明重试还不够，下一步可加更严格的输出约束或第二次修复提示；
+  - 200 条样本量仍小，扩到 300~500 条人工复核后再决定是否切换路由。
+
+#### 路由策略 v3：短追问继承上一轮、实施方案归 coding、只观察归 analysis
+
+- **动机**：200 条完整评测里，剩余错例集中在短追问（“B”“确认事实”“修复吧”）、
+  “按方案实施/开始实施”和“只想知道判定结果/不要做”。这些不是词表问题，而是
+  **短句语义 + 上一轮上下文** 的策略问题。
+- **改动**（`server/intent_router.py`）：
+  - 明确“实施方案”命令（`开始实施 / 按方案实施 / 执行这个方案 / 按这个方案做`）归 coding；
+    若上一轮已是 rework/coding，则沿用上一轮（“开始实施”在 PR 返工里仍是 rework）。
+  - 短追问（≤8 字，“B / 确认事实 / 修复吧”）在 `target=plan` 漂移时，默认沿用上一轮可执行
+    意图；其中“修复/实施/执行/做/改”在上一轮是 plan 时归 coding（实施/修复代码，不是改方案文本）。
+  - “只想知道 / 只看 / 判定结果 / 不要做”在 target=execution 时归 analysis；疑问句
+    （是不是/能不能/是否/吗/呢）不按 change 处理。
+  - “如何初始化/怎么启动/方法/步骤”这类 general 问题归 analysis；“短信模板有什么建议”
+    这类 general + decide 归 qa。
+  - 修掉 `_CONTINUE_MARKERS` 的误命中：“不是”不再命中“是不是”（后者是疑问句）。
+  - `eval_intent.py` 新增 `--ids`（只跑指定错例）与 `--router-only`（只跑路由，节省一半调用）。
+- **完整评测（200 条，两轮对话 + 全部标注）**：
+  - 现有判定：**88.0%**
+  - 路由 v3（router-only）：**89.5%**（171/191；7 条 JSON 解析失败、2 条 sync 跳过）
+  - 路由首次小幅反超 1.5 个百分点；但样本只有 200 条、仍有 7 条解析失败，**继续影子模式**，
+    不切形态。
+- **验证**：
+  - `pytest tests/test_intent_router.py tests/test_intent_detection.py`：**124 passed**；
+  - 全量 `pytest -q`：**1450 passed / 9 failed**；9 条仍是 `prompts.py` 6 条文案 +
+    `safety/policy.py` 3 条未同步（工作区既有改动）；
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - 短追问仍受“上一轮 intent 与用户期望不一致”影响（例如“继续吧”上一轮是 analysis、
+    用户却想继续 coding），需要 active task 状态而不是只看一条 previous_intent；
+  - 7 条路由 JSON 解析失败可加重试/更宽松解析；
+  - 路由器只在 AI/人工混合标注的 200 条上领先 1.5 点，扩大样本后再决定切换。
+
+#### 意图上下文改“最近两轮对话” + 语义口径收口（200 条完整评测）
+
+- **动机**（用户口径）：只看当前消息 + 上一轮回复不够 —— 有一条“继续把”的上一轮 AI
+  回复是“账户余额不足（429）”，少一轮上下文根本判断不出这是未完成的编码轮。要求改为
+  **最近两轮对话 + 本轮问题**：用户消息全文，助手消息首尾各留一段。
+- **改动**：
+  - `dao.recent_dialogue`：按时间正序取最近 4 条 user/assistant 记录；`service._dialogue`
+    把用户消息保留全文、助手消息用 `head_tail_excerpt`（前 200 / 后 300 字）截断，
+    传给普通判定、`handoffTask` 重判与影子路由。
+  - `intent._user_prompt` / `intent_router._user_prompt` 都优先渲染“最近两轮对话”；
+    老的 `history` / `previous_reply` 仍保留作兼容。
+  - 语义口径写进 `_INTENT_SPECS` / `_BOUNDARY` / 路由提示词：
+    * **analysis**：解释功能、解释用户疑问、刷新仓库记忆、**PR 已合并/已关闭之后的收尾动作**
+      （更新记忆、同步、清理）；不是“刚提交/待合并”的 PR；
+    * **qa**：只对**已有数据**做问答（已具备哪些功能、有哪些 PR、文件/提交/记忆里写了什么）；
+    * **plan**：计划、方案、任务完成度**一律**归 plan；
+    * 用户说「继续 / 接着 / 修正 / 纠正 / 重来 / 再试一次」→ 按未完成轮次沿用上一轮可执行意图。
+  - `suggest_intent` 增加显式的 continuation/correction 标记、PR 合并/关闭标记；
+    `target=plan` 一律 plan；`general + decide` 归 plan。
+  - `eval_intent.py` 的 `enrich` 改为补最近两轮 `dialogue`（用户全文、助手首尾截断），
+    同时保留 `previous_intent` / `previous_reply`；`format` 统一缩进 JSON 数组。
+  - `docs/intent-eval.jsonl` 已补齐 200/200 条标注：其中“继续把”（之前因余额不足看不出）
+    按“继续=未完成轮次”标成 coding；另外三条查看提交/记忆原文标 qa、新增收货地址标 coding。
+- **完整评测结果**（200 条人工/AI 混合标注，含两轮对话）：
+  - 关键字口径：**38.0%**
+  - 现有判定：**88.0%**
+  - 影子路由：**88.0%**（169/192；6 条 JSON 解析失败、2 条 sync 跳过）
+  - 结论：两轮对话把现有判定从 83.3% 抬到 88.0%；路由器目前**持平而不是反超**，
+    所以继续影子模式，不切形态。
+  - 剩余错例集中在短追问（“B”“确认事实”“继续吧”“修复吧”）、“按方案实施”被看成 plan、
+    “你作为主智能体不应该自己写 code”这类反馈被看成 change；属于策略表/短句语义问题。
+- **验证**：
+  - 意图 + 路由 + 中间件 + 记忆闸门定向：**167 passed**；
+  - 全量 `pytest -q`：**1442 passed / 9 failed**；9 条仍是 `prompts.py` 6 条文案 +
+    `safety/policy.py` 3 条未同步（工作区既有改动）；
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - 路由器与现有判定持平，暂不切换；下一步优先处理短追问与“实施方案”这两类错例；
+  - 6 条 JSON 解析失败可以加重试/更宽松的解析；
+  - JEV 置信度阈值与 active task 状态仍未做。
+
+#### 影子路由器 v2：lookup/analyze 拆轴 + 首轮真实评测（84 条）
+
+- **动机**：按计划跑第 1、2 步。先导出 200 条真实用户消息、预标 84 条，跑关键字 / 现有判定 /
+  影子路由三路；首轮错例显示 `qa` 与 `analysis` 被一个 `explain` 混在一起，“按方案实施”
+  被路由当成 `plan`。这两处是**轴的问题**，不是某句话的词表问题。
+- **改动**：
+  - `intent_router.py` 的 `wants` 从 `change / explain / decide / unknown` 拆成
+    `change / lookup / analyze / decide / unknown`：查看/列举/是什么是 `lookup`（qa 倾向），
+    为什么/根因/怎么跑通是 `analyze`（analysis 倾向）。
+  - 路由提示词补三条总则：`target=plan` 只表示方案对象本身，实施/执行方案归 `code`；
+    “对助手上一轮行为的反馈/批评”归 `meta_question + execution`；最后给了一个明确的 JSON 示例。
+  - `suggest_intent()` 按新轴重写：new_task + lookup + code → qa；+ analyze → analysis；
+    follow_up/meta_question + plan + lookup/decide → plan；+ analyze → analysis；
+    status 更新带 `previous_intent` 时优先沿用上一轮可执行意图。
+  - `scripts/eval_intent.py` 修了三处独立脚本问题：`extra` 在 `SessionRecordDetail` 而不是
+    `SessionRecord`；Windows 下 psycopg 异步要 `SelectorEventLoop`；模型连接在库里，脚本要
+    先 `apply_model_endpoints` 只读载入。新增 `enrich` 子命令给已有标注补上一轮
+    `previous_intent` / `previous_reply`，以及 `run --limit`、`format`（把 JSONL 统一成
+    缩进 JSON 数组，读取端两种都认）。
+  - 影子路由模型：优先「意图识别（大模型）」那一行；没配就借一条已配置的 agent 行
+    （qa → analysis → coding → plan → review），保证原型能跑。
+- **首轮结果**（84 条 AI 预标，**待人工复核**）：
+  - 关键字口径：**52.4%**
+  - 现有判定：**83.3%**
+  - 影子路由：**86.2%**（80 条可评；3 条 JSON 解析失败、1 条 sync 跳过）
+  - 主要剩余错例：两条“为什么不派 coder / 上一轮不是 rework 吗”被 policy 判 analysis
+    （产品语义可改）；“开始实施 / 修复吧”仍偶尔把 target 看成 pr_change/plan；
+    “你作为主智能体不应该自己写 code”这类反馈被看成 change；sync 的“代码拉取到本地”
+    不在关键字表里。
+- **关键决策**：
+  ① 路由器仍**不切换形态**，只记录；这轮结果只说明“轴 + 策略表”方向可行，样本还是 AI 预标；
+  ② 先修轴与提示词，不回到逐句加关键词；
+  ③ 真实评测文件继续 gitignore，示例文件进库。
+- **验证**：
+  - `pytest tests/test_intent_router.py`：**15 passed**；
+  - `pytest tests/test_intent_detection.py`：**94 passed**；
+  - 全量 `pytest -q`：**1435 passed / 9 failed**；9 条仍是 `prompts.py` 的 6 条文案 +
+    `safety/policy.py` 3 条未同步（工作区既有改动）。
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - 人工复核 84 条 AI 预标（尤其两条 meta-question 的“解释 vs 继续”口径），再扩大样本；
+  - 根据错例继续调策略表：status 更新延续上一轮、反馈类 meta_question、sync 口令；
+  - 路由结果稳定优于现有判定后才切形态；JEV 置信度阈值仍未做。
+
+#### 意图评测与影子路由器：先量再改，不直接切形态
+
+- **动机**（用户口径）：上一轮的关键词/提示词整改像打补丁，只能解决单个说法。确认先做
+  第 1、2 步：建真实评测集与基线；加一个只记录、不改变线上形态的影子路由器。
+- **改动**：
+  - 新增 `server/intent_router.py`：把一句话拆成 `speech_act` / `wants` / `target` /
+    `continuation` 四个正交轴，模型只输出 JSON；`parse_router_reply` 容错代码围栏与
+    前后解释，`suggest_intent` 是一版**集中式策略表**（轴 → 建议意图）。
+  - `service.py`：`INTENT_ROUTER_SHADOW=true` 时在独立 task 里跑一次影子路由，只记
+    `INTENT_ROUTER normal=… source=… axes=… suggested=…`；**不采用建议、不改变 intent**，
+    失败只记日志。默认关闭，打开后多一次分类模型调用但不占本轮首字节。
+  - `config.py` / `.env.example`：`INTENT_ROUTER_SHADOW`（默认 false）与
+    `INTENT_ROUTER_TIMEOUT_SECONDS`（默认 5s）。
+  - 新增 `scripts/eval_intent.py`：
+    - `collect` 从业务库只读导出最近用户消息（`expected` 留空待人工标）；
+    - `run` 跑关键词 / 现有判定 / 影子路由三路，输出准确率、混淆矩阵与最多 20 条错例；
+    - 不写库、不改线上行为。
+  - 新增 `docs/intent-eval.md` 与 `docs/intent-eval.example.jsonl`；真实样本
+    `docs/intent-eval.jsonl` 默认进 `.gitignore`，避免把用户消息/代码片段提交到公开仓库。
+  - `tests/test_intent_router.py`：解析、轴 → 意图策略、假模型端到端路由。
+- **关键决策**：
+  ① 影子层只观测，不参与判定；评测证明更准之前不切形态；
+  ② 策略表只依赖轴，不依赖具体措辞，新说法落在同样的轴上就能复用；
+  ③ 真实评测文件不进库，示例文件进库；
+  ④ 评测脚本只读业务库，`run` 完全不碰库。
+- **验证**：
+  - `pytest tests/test_intent_router.py`：**14 passed**。
+  - 意图 + 中间件 + 记忆闸门定向：**159 passed**。
+  - `scripts/eval_intent.py run docs/intent-eval.example.jsonl`（关闭模型，仅关键字口径）
+    可正常输出 60% 基线与混淆矩阵。
+  - 全量 `pytest -q`：**1434 passed / 9 failed**；9 条均为工作区里的既有改动 ——
+    6 条 `prompts.py` 文案测试，另 3 条是 `safety/policy.py` 20:07 改成
+    orchestrate 隐藏 `edit_file/write_file`、analysis 隐藏 `write_todos` 后
+    `tests/test_boundary.py` 还没同步（不是本次评测/路由改动引入）。
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - 需要跑 `collect` 并人工标注一批真实样本，确认路由器的轴判得稳，再决定是否切形态；
+  - JEV 置信度/差距阈值仍未做；
+  - `policy.py` 与 `prompts.py` 的既有改动要各自收口，测试才能全绿。
+
+#### 意图判定第一批准确率整改：默认 coding、追问不再误落 analysis、带上“上一轮判定”
+
+- **动机**（用户口径）：确认先做「对齐默认值 / 收窄为什么 / 把上一轮意图喂给判定器」。
+  实测「你为什么不派 coder 执行」被 JEV 判成 analysis，于是拿到只读形态、真的没有
+  `task`；而「上一轮，你的意图不是 rework 吗」这类追问又缺少上一轮判定的锚点。
+- **改动**：
+  - `DEFAULT_INTENT` 从 `qa` 改回 `coding`，与注释、README 和测试口径一致；判不出来时
+    按「用户多半是要干活」处理。
+  - `analysis` 规则新增排除词 `为什么不 / 为什么没 / 为什么没有 / 怎么没`：追问上一轮动作
+    不再因为裸的「为什么」掉进 analysis；「为什么这里会超时」这类真正的排查问题仍保留。
+  - `_BOUNDARY` 增加一条“对上一轮动作的追问”判据：先看上一轮意图与回复，判断用户是
+    要继续/纠正动作还是只要解释，**不要仅因为出现「为什么」就判 analysis**。
+  - 判定上下文新增 `previous_intent`：`service._last_intent()` 从最近一条 assistant
+    记录的 `extra.intent` 读取，`detect_intent` 同时传给 JEV 与大模型两条路
+    （`_user_prompt` 里显示“上一轮判定：…”），重判/`handoffTask` 也带上。
+  - 顺手修正瀑布分支：`force_llm=True` 现在真的跳过 JEV；`mode=jev` 但 JEV 没配齐时
+    直接落关键字口径、不再借用大模型；`force_llm` 但没有可用模型时来源标 `fallback`。
+    删除 JEV 异常分支里的调试 `print` 与未使用的 `llm` 导入。
+- **关键决策**：
+  ① `previous_intent` 只作上下文，不硬编码成当前意图 —— 纯解释类追问仍可判 analysis；
+  ② 仅排除“为什么不/为什么没”这类元问题，不把「为什么」整体拿掉，避免误伤真正的排查；
+  ③ 默认值与瀑布分支的修正属于“判得准”的前提，和提示词整改一起做。
+- **验证**：
+  - `pytest tests/test_intent_detection.py`：**94 passed**。
+  - `pytest tests/test_memory_gate.py tests/test_intent_detection.py`：**135 passed**。
+  - 全量 `pytest -q`：**1423 passed / 6 failed**；6 条全部是工作区里 `prompts.py` 的既有
+    文案改动（`MAIN_AGENT_PROMPT` / `TODO_PROMPT` / analysis 提示词），与本轮意图整改无关。
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - JEV 置信度/差距阈值与真实评测集尚未做；下一步按计划补“低置信度不静默定案 + 混淆矩阵”。
+  - `prompts.py` 的 6 条既有失败等提示词那批改动收口后再对齐。
+
+#### 每轮注入“本轮能力”：形态 / 有无 task / 可派子智能体
+
+- **动机**（用户口径）：rework 轮里模型沿用了上一轮 analysis 的“我是只读形态、没有 task”
+  结论，明明 `form=orchestrate` 且工具列表里有 `task`，却没有派 coder；最新一条
+  「你为什么不派 coder 执行」又被 JEV 判成 analysis，模型于是继续说没有 task。需要把
+  **当前这一轮真实能力**写进系统提示，并明确“上一轮的结论不适用于本轮”。
+- **改动**（`agent/middleware/context_inject.py`）：
+  - 新增 `capability_block()`：注入“意图 / 形态 / `task` 有没有 / 可派哪些子智能体”，
+    并加一句“上一轮如果说过没有 task、只读或不能改代码，那是上一轮的形态，不适用于本轮”。
+  - `task` 是否存在**以本次模型调用实际绑定的 `request.tools` 为准**，不按意图猜；
+    子智能体名单取自 `profile_for(intent).subagents`。
+  - `IntentMiddleware` 的注入顺序变成：原系统提示 → 当前时间 → 意图指令 → 本轮能力
+    （能力块放最后，压过历史里上一轮的自我描述）。
+  - 测试补两条：rework + 三从时写“有 task / planner / coder / reviewer”；
+    analysis 时写“没有 task / 可派子智能体：无”。
+- **关键决策**：
+  ① 只做能力注入，不改意图判据（用户口径：先只做 1）；
+  ② 能力以实际工具列表为准，装配与提示不一致时模型看到的是真实情况；
+  ③ 不把“上一轮意图”写死成当前意图，避免把追问强行拉回旧形态。
+- **验证**：
+  - `pytest tests/test_intent_middleware.py`：**10 passed**。
+  - `ruff check` 改动文件干净。
+- **遗留**：JEV / 大模型的意图判据尚未调整；`DEFAULT_INTENT` 当前实际值是 `qa`，
+  与注释/测试里的 `coding` 不一致，属于既有未完成改动，后续一起收。
+
+#### 思考内容上界面：主控与子智能体都展示，只走 SSE、不落库
+
+- **动机**（用户口径）：把模型的思考内容展示到界面上，与正文从样式上区分开；**数据库不存**；
+  任务结束时正文一次性 Markdown 化。子智能体的思考先加上，用来判断它到底有没有价值。
+- **改动**：
+  - `stream.py`：`reasoning-delta` 不再丢弃，改为下发瞬时事件
+    `{"type": "reasoning", "content": …, "agent": "main|coder|…"}`；主控与子智能体都发，
+    中间件内部调用（摘要等）继续丢弃。**不写入 `StreamParts`**，所以不会进 `parts`。
+  - `server/service.py`：reasoning 先过 `redact()` 再发 SSE；**不累加进 `text`**、不进
+    `extra.parts`、不进业务记录。重连时靠 RunHub 的临时帧缓冲重放，服务器进程/Redis TTL
+    过后自然消失。
+  - 前端 `api.ts` / `App.vue` / `style.css`：新增 `reasoning` 事件与按角色分段的思考块
+    （主控 / planner / coder / reviewer），灰色弱化背景 + 左侧细边框，和正文明确区分；
+    运行中默认展开，任务结束后默认收起，可手动展开；标题旁标“仅本次运行可见，不保存”。
+  - 正文渲染：流式期间按纯文本显示（`white-space: pre-wrap`，不解析 Markdown）；任务
+    结束（`m.at` 落上）后，每个连续正文组拼回完整字符串，**一次性** `renderMarkdown`，
+    避免半截列表 / 表格 / 代码围栏逐帧闪烁。
+  - 测试：`test_stream_v3.py` 覆盖主控 / 子智能体 / 内部 reasoning；`test_plan_events.py`
+    覆盖 SSE 下发顺序与角色；`test_redaction.py` 覆盖思考内容脱敏且不落记录。
+- **关键决策**：
+  ① 子智能体思考也展示（用户要先看效果），前端按角色分段而不是混成一段；
+  ② 思考只在前端与临时帧缓冲里，**不写 PostgreSQL**；刷新后历史记录里没有；
+  ③ 正文 Markdown 延迟到任务结束一次性渲染，牺牲一点“边流边排版”的观感，换稳定输出；
+  ④ 推理内容同样走脱敏，不能因为换了通道就漏凭据。
+- **验证**：
+  - 定向 `pytest tests/test_stream_v3.py tests/test_plan_events.py tests/test_redaction.py`：
+    **145 passed**。
+  - 全量 `pytest -q`：**1415 passed / 9 failed**；9 条均为本轮之前工作区里的未提交改动
+    （6 条 intent 口径 + 3 条 `TODO_PROMPT` / analysis 提示词测试），与本轮思考展示无关。
+  - `npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过。
+  - `ruff check` 改动文件干净。
+- **遗留**：
+  - 真机看一轮：子智能体的思考是否真的有用、长度是否吵；若噪音大，下一步加“只看主控”
+    或按角色折叠的开关。
+  - 未提供 reasoning 的模型（部分 OpenAI 兼容网关）这一块自然为空，不做占位。
+  - 刷新发生在运行中时，临时缓冲里已产生的思考会重放；更早被 TTL 清掉的部分不会补。
+  - RunHub 的帧缓冲上限仍是 2000 帧，思考分片会多占帧；真机若发现长思考把早期正文挤出
+    重连窗口，再把 reasoning 改成按 100ms / 200 字合并下发。
+
+#### 删除常规剪裁：只在压缩线做一次应急裁剪
+
+- **动机**（用户口径）：「常规剪裁可以不要。」上一版虽然把「压缩前应急裁剪」放进了压缩
+  中间件，但平时的 40k / keep 12 剪裁仍是一个独立中间件；用户要的是**只在到达压缩线时
+  剪一次**，不要平时那层。
+- **改动**：
+  - 删除 `HarnessContextTrimMiddleware`、`build_context_trim`、`context_trim_roles`；
+    `agent/graph.py` / `agent/subagents.py` / `session/manager.py` 不再接收、也不再挂
+    `context_trim`，运行时栈里只剩压缩中间件。
+  - `agent/middleware/context_trim.py` 退成纯函数模块：保留 `pretrim_tool_results`、
+    `context_token_counter`、占位符与计数器；不再依赖 `ContextEditingMiddleware` /
+    `ClearToolUsesEdit`。
+  - `config.py` 删除 `context_trim_trigger_tokens` / `context_trim_keep` /
+    `context_trim_roles`；`.env.example` 对应的三个键标成已作废。保留
+    `CONTEXT_TRIM_TOOL_RESULTS`（应急裁剪总开关）与 `CONTEXT_TRIM_CLEAR_INPUTS`。
+  - 测试删掉常规剪裁那一批，保留应急裁剪与计数器/占位符测试；装配测试改为断言
+    「没有独立剪裁中间件」。
+  - README / AGENTS.md / docs 同步为「平时不剪，只在压缩线剪」。
+- **关键决策**：
+  ① 完全按用户口径删掉常规剪裁，不把它并进压缩中间件保留 40k 阈值；
+  ② 应急裁剪仍跟随 `CONTEXT_TRIM_TOOL_RESULTS`，关掉就退回上游「到线直接压」；
+  ③ 40k～120k 之间不再剪，历史工具结果会随每次调用重发 —— 这是换取简单结构的代价，
+     真机如果发现 token 成本/延迟明显上升，再考虑恢复一个单阈值剪裁。
+- **验证**：
+  - 定向 `pytest tests/test_context_trim.py tests/test_summarization.py tests/test_app_settings.py`：
+    **63 passed**。
+  - 全量 `pytest -q`：**1413 passed / 7 failed**；7 条仍是本轮之前就存在的 intent / analysis
+    提示词测试（同上一条的既有失败），本轮相关测试全绿。
+  - `ruff check` 改动文件全干净；`scripts/check_prompts.py` 0 冲突。
+- **遗留**：
+  - 真机观察一轮：40k～120k 区间的输入 token 与延迟变化、`CONTEXT_PRETRIM` 的免压率。
+  - 若成本不可接受，最小回退是把「常规剪裁」作为一个**可选**的单阈值开关加回同一个压缩
+    中间件，而不是恢复独立中间件。
+
+#### 压缩节点优先应急裁剪工具返回：剪完不到线就不摘要
+
+- **动机**（用户口径）：「到达上下文压缩的节点时，优先进行工具裁剪；如果裁剪后已经达不到压缩的
+  范围，那就不进行压缩；如果达到了，那就继续压缩。」现状是 `context_trim` 已经在压缩外侧，但
+  它保留最近 `CONTEXT_TRIM_KEEP=12` 条，最近 12 条工具返回自己就可能把上下文顶过压缩线；而且
+  上游判断还会看最后一条 AIMessage 的 `usage_metadata.total_tokens`（上一轮的真值），剪完仍可能
+  被旧值强制压缩。
+- **改动**：
+  - `agent/middleware/context_trim.py` 新增 `pretrim_tool_results()`：只在压缩线处调用，保留
+    **末尾连续的 ToolMessage**（当前这一步，含并行调用的多条），其余工具返回换成带身份占位符；
+    不删消息、不改 `tool_call_id`、不动状态。`keep_recent` 默认 0（逃生门，当前不开放配置）。
+  - `agent/summarization.py` 重构 `HarnessSummarizationMiddleware.awrap_model_call`：复刻上游
+    前半段（取有效消息 → 计数 → 截断工具入参），到压缩线后先做应急裁剪；用与压缩同口径的
+    计数器复算，**低于线则直接调用模型、本轮不摘要**，仍高于才走上游压缩。新增
+    `_should_summarize_estimate()`（副本里清掉最后一条 AIMessage 的 `usage_metadata`，只按
+    估算值判断，避免上一轮自报值强制压缩）；免压路径捕获 `ContextOverflowError`，真实溢出
+    时回退到压缩。新增 `CONTEXT_PRETRIM` 日志（剪几条 / 剪前剪后 / 免压还是继续压）。
+  - `build_summarization` 把 `pretrim` 跟随 `CONTEXT_TRIM_TOOL_RESULTS`、把
+    `pretrim_clear_inputs` 跟随 `CONTEXT_TRIM_CLEAR_INPUTS` 传入。
+  - 文档：`README.md`、`.env.example`、`docs/config-page-design.md` 各补一句行为说明。
+- **关键决策**：
+  ① 应急裁剪只保**当前步骤**、不再保最近 N 条 —— 目标是最大化「免压」概率；占位符带身份，
+     配合 2026-10-16 的「你已经读过它」口径降低重读。
+  ② 仍超线时**从预剪前那份历史开始压缩**：摘要与 `/conversation_history` 保留更多原文，
+     不把预剪占位符带进摘要；预剪只承担「能否免压」这一次判断。
+  ③ 跟随 `CONTEXT_TRIM_TOOL_RESULTS` 总开关：关掉工具裁剪就退回上游原来的「到线直接压」。
+  ④ 供应商自报 token 只用来触发「到压缩节点」，剪完后按估算值决定；估算偏小导致真实调用
+     溢出时，回退压缩兜底。
+- **验证**：
+  - 定向 `pytest tests/test_context_trim.py tests/test_summarization.py`：**60 passed**
+    （新增 14 条：应急裁剪 8 条 + 压缩前裁剪 6 条）。
+  - 全量 `pytest -q`：**1427 passed / 7 failed**；7 条均为本轮之前就存在的未提交改动所致
+    —— 6 条 `tests/test_intent_detection.py`（2026-10-16 条目已记录的 JEV / 关键字口径冲突），
+    1 条 `tests/test_prompts.py::TestQaHasNoTodoList::test_analysis_keeps_the_list`
+    （未提交的 `prompts.py` 已把 analysis 的 `TODO_PROMPT` 摘掉，测试仍按旧口径要求它）。
+    本轮改动的剪裁 / 压缩相关测试全绿。
+  - `ruff check` 改动文件（含测试）全干净。
+- **遗留**：
+  - 真机观察一轮：`CONTEXT_PRETRIM` 的免压率、以及「只保当前步骤」是否让模型重读变多；
+    若重读上升，把 `PRETRIM_KEEP_RECENT_TOOL_RESULTS` 调到 1~2 再量。
+  - 摘要 offload 仍从正常剪裁后的消息出发（老工具结果可能是占位符）——这是本次之前就存在的
+    交互，本次没有把「原文另存一份给 offload」一起做；要做需在压缩路径保留原始内容映射。
+
+### 2026-10-16
+
+#### 借鉴 codebase-analyzer：analysis 形态新增 code-tracing-analysis skill 与三条取证纪律
+
+- **动机**：用户给了外部 skill（github.com/AthenDrakomin-hub/agent-skills 的 `codebase-analyzer`，
+  SCOPE → ROUTE → EFFECT → BREAK → SHIP）让看有什么可借鉴。对照后方法论有一半与本项目重合
+  （只读边界、检索纪律、边取证边下结论、repo-bootstrap-analysis 的结构摸底），但四样是本项目缺的、
+  且正对着踩过的坑：① 证据分级与激活轴（「实现存在 ≠ 已装配 ≠ 当前选中 ≠ 线上在跑」）；② 效果主张的
+  分支门（调用表达式只证明「发起了调用」）；③ 否定式收口门（不勾「我已确认」，查正文里可观察的缺失）；
+  ④ 上下文检查点（与 2026-10-16 剪裁整改同一根因的另一解法 —— 模型在对话里自己发明过一次
+  `/ai_coding/tmp/auth-evidence.md`，但没进提示词）。
+- **改动**：
+  - 新增 `sandbox/skills/code-tracing-analysis/`（SKILL.md + references/claim-ledger.md /
+    closure-card.md / final-audit.md）：方法论中文版、证据权限表、激活轴、责任闭合卡、callee 分支门、
+    否定式收口门、PARTIAL/BLOCKED 与检查点口径；重方法论放 references 按需读。
+  - `agent/prompts.py::_ROLE_ANALYSIS` 分析工作法加三条：证据状态四档 + 激活轴（第 4 步）、效果主张
+    分支门（第 5 步）、检查点写 `/ai_coding/tmp/evidence-ledger.md`（第 7 步）；成篇顺序改成
+    「范围与证据状态 → 直接答案 → 最短主链 → 未知与验证动作」（第 8 步）；并加一句流程 / 行为类问题
+    指向新 skill。系统提示词只承担这几句，闭合卡与审计清单在 skill 里按需读，不每轮付 token。
+- **关键决策**：
+  - **不借的**：它「不做诊断 / 不出方案」的边界（本项目 analysis 要做可行性、喂方案）；「每条答案都带
+    证据矩阵大表」（聊天区太吵，只借首屏顺序）；「不得自设步数上限」（与平台 recursion_limit 冲突，
+    改成检查点 + PARTIAL）。
+  - 原第 5 步「区分已证实与待验证」并进新第 4 步的四档，避免两套口径；「已证实」字样保留
+    （tests/test_profiles.py 钉着）。
+- **验证**：
+  - `scripts/check_prompts.py` 冲突扫描 **0 条**；改动文件 `ruff check` 干净。
+  - 全量 pytest **1414 过 / 6 败**：败的 6 条全是 `tests/test_intent_detection.py` 的既有失败
+    （上一会话未提交的 `server/intent.py` 改动与老测试口径冲突，与本轮无关，按约定不顺带修）；
+    本轮一度改坏 `tests/test_profiles.py::test_analysis_form_is_the_one_readonly_form_that_writes_the_memory`
+    （删掉了它钉的「已证实」措辞），已在同轮补回并复跑通过。
+  - 行为面未验证：skill 是**建会话时**推入沙箱、提示词要**重启后端**才生效。
+- **遗留**：
+  - 6 条 intent 既有失败等 JEV 整改那份方案落地时一起收。
+  - 模型是否真读新 skill、填闭合卡，要在下一轮 analysis 里观察；不读的话把「首屏顺序」提一句进
+    `_READONLY_RETRIEVAL` 硬规则。
+
+#### 代码块横向滚动条不再掉出屏幕：pre 加高度上限
+
+- **动机**：上一节把超宽气泡封顶后，长代码行改在 `pre` 内横向滚；但横向滚动条画在容器底边，
+  代码块一高（几十行）它就掉到屏幕外 —— 想往右拖得先把页面滚到块底。用户口径：「可以让
+  滚动条一直保持在界面内嘛」，选了「加高度上限」这条路。
+- **改动**（只动 `frontend/src/style.css`）：`.markdown pre` 由 `overflow-x: auto` 改为
+  `max-height: min(60vh, 560px); overflow: auto` —— 代码块变成自包含滚动窗，横向滚动条贴在
+  这个窗的可见底边（滚动条画在容器边、不画在内容底），块最高半屏多，读它时底边基本在屏内。
+- **关键决策**：
+  - **`60vh` 与 `560px` 取小**：矮窗口按视口比例收，高窗口不让块高到一屏装不下。
+  - **只封顶不缩**：`max-height` 不产生多余纵向滚动条，短代码块外观与原来完全一致。
+  - **先例**：`.msg-change-diff` 早就是 `max-height: 320px; overflow: auto`，同款语义。
+- **验证**：
+  - 真实浏览器复测（窗口 898px 高，上限 = 539）：会话里最高的代码块（98 行、内容 2219px）
+    被压成 523px 的窗，`scrollHeight 2219 > clientHeight 523`（块内纵向滚生效）、
+    `scrollWidth 1482 > clientWidth 655`（横向滚仍在），滚到视口中央时块底 662 < 898，
+    横向滚动条在屏内；短块 `clientHeight == scrollHeight`，不受影响。
+  - `npm --prefix frontend run build`（含 `vue-tsc`）通过。
+- **遗留**：
+  - 高代码块从此是「块内纵向滚 + 页面纵向滚」两层滚动；若以后嫌烦，删掉 `max-height` 与
+    `overflow` 两行即回退到上一节的状态。
+
+#### 对话区横向溢出：给 .msg 的直接子块补横向封顶
+
+- **动机**：含长代码行的 AI 回复会比其他消息宽出一截（实测最新一条气泡 1498px，而列内容宽
+  只有 949px），并把 `.messages` 撑出 221px 的横向滚动条 —— 整个对话区能左右拖，观感就是
+  「最新那条特别宽」。60 条历史里 4 条中招（973 / 972 / 1455 / 1498）。
+- **改动**（只动 `frontend/src/style.css`）：`.msg` 规则之后新增 `.msg > * { max-width: 100% }`，
+  把气泡与其余直接子块（`.msg-changes` / `.msg-usage` / `.msg-time`）一起封顶到列宽；顺手把
+  `.bubble` 上那句「min-width:auto 会撑破整列」的注释改准 —— 纵向 flex 里它只卡主轴，横向
+  从来不归它管。
+- **关键决策**：
+  - **根因是交叉轴定宽，不是 pre 缺滚动**：`.msg` 是 `flex-direction: column` +
+    `align-items: flex-start`，子项按 fit-content 定宽、下限是 min-content；`pre` 是
+    `white-space: pre`，min-content 等于最长那一行，一旦超过列宽气泡就跟着长出去。所以修法是
+    **封顶**而不是再加滚动 —— `pre` 本来就有 `overflow-x: auto`，style.css 里「把滚动交回 pre」
+    那段注释说的就是这套设计，只是此前气泡被撑开、这个滚动条从来没用上。
+  - **为什么用户气泡从不出事**：`.msg.user .bubble` 早有 `max-width: min(85%, 860px)`、
+    `.msg-changes` 也早有 `max-width: 100%` —— 同一个坑此前踩过两次、各补一处；这次用
+    `.msg > *` 一次兜住所有直接子块，防以后新增子块重犯。
+  - **只封顶不拉伸**：短消息仍按内容贴合，只有超宽的被压回列宽；超宽代码块变成块内横向滚动
+    （实测最长行 1482px → `pre` 的 `scrollWidth 1482 / clientWidth 948`）。
+- **验证**：
+  - 真实浏览器（用户正在用的标签页，窗口 1707px）复测：超宽气泡从 4 条降到 0，最大气泡 =
+    列内容宽 949；`.messages` 的 `scrollWidth == clientWidth`（1423），页面 `scrollWidth ==
+    clientWidth`（1707），横向滚动条消失。
+  - `npm --prefix frontend run build`（含 `vue-tsc`）通过。
+  - 前端无测试套件；CSS-only 改动，未跑全量 pytest。
+- **遗留**：
+  - 超宽代码块现在靠块内横向滚动看全；若以后嫌「滚着看」难受可再考虑软换行
+    （`white-space: pre-wrap`），但那会让代码行的列对齐失真，默认不做。
+
+#### 那轮 analysis 触顶的真因是「重读」：占位符带身份 ＋ 分析边取证边下结论 ＋ keep 6→12
+
+- **动机**（用户口径：「问题的本质不是这个，是大模型读到的工具信息都是剪裁过的，导致需要
+  重新读」，并给了两条办法：抬高剪裁保留的条数、分析时逐步下结论）。复核日志后确认这个判断
+  成立，而且机制比「keep 太小」更具体一层 —— 本节下面那条把这轮定性成「步数用完」，那只是
+  **症状**：烧掉步数的是重读，而重读是剪裁的副作用。三个环节：
+  ① **占位符不带身份**：当时那句是「（此处原本是一次工具返回的内容，为省上下文已裁剪；
+  需要时重新读一次 / 重新跑一次即可。）」—— 不说剪掉的是哪个工具、哪个文件，还**明写
+  「重新读一次」**，模型分不清「我读过、结论已经有了」与「我没读」，只能防御性重取；
+  ② **`keep=6` 太窄**：一轮 126 次工具调用只留得住最后 6 条原文；
+  ③ **分析工作法把结论放在最后一步**（「先摆假设 → 逐条取证 → …… → 第 5 步才成篇写结论」），
+  等于要求它把全部证据一直揣在上下文里 —— 而**工具返回会被裁、AI 消息不会**，结论没有及时
+  落到自己的话里，材料一被裁就只能重读。
+- **实测量到的重读规模**（trace `07fa6a67b1c2`）：`read_file` 44 次只覆盖 **14 个文件**
+  （`AuthServiceImpl.java` 8 次、`AuthContextInterceptor.java` 7 次、`AuthController.java` 6 次）；
+  `execute` 82 次里 dump 出 **160 个** `=====X=====` 段落标记、**去重只有 42 个**（核心那几个
+  文件各被 dump 6~7 次）；开头 23:22:27–23:22:52 读过的那批，结尾 23:26:27–23:26:35 **又从头
+  读了一遍**。空转刹车一次都没出手（「同样参数调用过 N 次」那行 0 次）：重读带的是**不同的
+  `offset` / `limit`**，而守卫的键是「工具名 + 入参精确 JSON」，分页读取就这么绕过了它。
+- **改了什么**（三件是一套，缺一件都还会重读）：
+  - **① 占位符带身份、且不再劝重读**（`agent/middleware/context_trim.py`）：新增
+    `trimmed_placeholder(tool, target, chars)` 与 `_target_of()` / `_trim_facts()`，由
+    `HarnessContextTrimMiddleware._label_trimmed` 把上游填的无名占位符逐条换成
+    `〔已裁剪〕read_file → /…/AuthServiceImpl.java（原文 12,480 字）。你已经读过它：先用你
+    已经得出的结论往下走，只有确实缺关键细节时才重取。`。身份从**剪之前**那份按
+    `tool_call_id` 反查（工具返回本身已是占位符，而入参在发起它的那条 AI 消息上）；
+    `TRIM_PLACEHOLDER` 退化成「交给上游去填的那句 ＋ 认不出原主时的兜底」。
+  - **② 改的时机必须在调 handler 之前**：间谍 handler 截到的是副本，事后再改模型看不到 ——
+    所以那一层从 `handler(inner)` 改成 `handler(inner.override(messages=…))`。只换 content：
+    条数、顺序、`tool_call_id` 与工具名一概不动（与上游那次改写同一层面的安全保证），
+    孤儿 tool_call 认不出原主就留着无名那句，不硬编。
+  - **③ 原文大小用 `len()` 而不是 token 估算**：这一步每次模型调用都要对上百条重跑一遍，
+    为一句提示去扫全部原文不划算；字数只是给它一个「重取代价多大」的量级感。
+  - **④ `CONTEXT_TRIM_KEEP` 6 → 12**（`config.py` / `.env.example`）：抬高保留窗口。
+  - **⑤ 提示词那一半**（`agent/prompts.py`）：`_READONLY_RETRIEVAL`（qa 与 analysis 共用那段
+    检索纪律）加两条 —— **「读过就别重读」**（讲清占位符是省上下文的正常动作、不等于没读过；
+    确需重取要一次读全，并点名「别拿 `offset` / `limit` 反复翻同一个文件、别用 `execute` 把
+    同一批文件再 `cat` 一遍」这两个实测到的反模式）与**「结论要落在你自己的话里」**（工具返回
+    会被裁、AI 消息不会）；`_ROLE_ANALYSIS` 的「分析工作法」插入第 3 步**「边取证边下结论，
+    不要攒到最后」**，收尾那步改成「把小结论**串成整体**，不是重新去读一遍材料」。
+  - **⑥ 占位符里的路径按尾部截断**（`_shorten_path()`，`file_path` / `path` 两个键走它）：
+    对象封顶 120 字，而按头部截断（`_one_line` 那套）留下的正好是「沙箱里几十条一字不差的
+    仓库根」，反倒把文件名切掉 —— 烟测里就出现过 `…/AuthServiceImpl.jav…` 这种既认不出、
+    也没法拿去重取的半截路径。改成从尾部往前逐段收，收不下就断，前缀换成 `…/`。
+- **关键决策**：
+  ① **三件一起做**，因为它们打的是同一条因果链的三个环节：认得出剪掉的是什么（占位符）、
+  手上留得多一点（keep）、结论不依赖会被裁掉的材料（提示词）。只抬 keep 的话，保留窗口再宽
+  也总有老化的一刻，重读照旧发生。
+  ② **`keep` 只抬到 12、不按角色分档**：这一格是全角色共用的，coder 当初那 5.4M token 就是
+  历史工具结果反复重发出来的，抬 keep 对它是纯成本；分档要新增配置格，与「别再堆配置格」的
+  口径冲突（用户拍的也是 12）。下一轮拿新加的 `CONTEXT_TRIM` 那行日志量准了再决定要不要继续抬。
+  ③ **占位符变长是有意的取舍**：每条多 40~60 字（上百条 ≈ +4~6k token），换掉的是「一次
+  3k token 的重读」—— 止住两次重读就回本。
+  ④ **递归上限那两条遗留先不动**：重读消失后 200 步大概率够用；先量一轮再决定要不要改
+  「触顶收口」，免得把症状当病根治。
+  ⑤ **占位符变长换来的信息必须可用**：所以路径按**尾部**留（改动 ⑥）—— 认出「我读过哪个
+  文件」靠的是文件名与它上面那一两层目录，仓库根那一段几十条占位符一字不差，没有信息量。
+- **验证**：`pytest` **1420 passed**（新增 13 条 —— 剪裁 7 条：占位符带工具名 / 对象 / 字数、
+  不再出现「重新读一次」而改说「你已经读过它」、换占位符后条数与 `tool_call_id` 配对不变、
+  `_target_of` 压成一行且封顶、长路径留住文件名、单段超长路径一样封顶、端到端剪完仍看得见
+  文件名且不再带仓库根；提示词 6 条：占位符口径、结论落点、边取证边下结论、两个反模式
+  被点名、这几条不漂到 coder / planner / reviewer 那几份）；`python scripts/check_prompts.py`
+  **0 冲突**；`ruff check` 改动文件全干净。本次没有前端改动，未跑 `npm run build`。
+- **没验证的**：真机那一轮 —— 重读次数是否真的降下来、`keep=12` 把稳态上下文抬高了多久
+  （`CONTEXT_TRIM` 那行会直接给剪前剪后的数），以及这两行的估算值与供应商真值差多少。
+- **遗留**：空转刹车对「同一文件、不同 `offset` / `limit`」仍然是瞎的（`docs/backlog.md` 二·五，
+  已把优先级降下来）—— 这一批是从**诱因**那头断掉重读，守卫那道网还没补；提示词与占位符
+  都劝不住的时候，它才是最后一道。
+
+#### 剪裁 / 压缩各自记一条账（CONTEXT_TRIM / CONTEXT_SUMMARY）＋那次 analysis 报错的定性
+
+- **动机**（用户：「剪裁压缩的中间件日志要记录，发生时间，原来上下文长场后，剪裁或压缩后
+  上下文长度」「现在这个分析报错也查一下原因，再看一下剪裁+压缩是否真的生效了」）。两件事
+  其实是同一件：**这两层省下多少，原先在任何一处存量数据里都看不见** —— 剪裁只改「这一次
+  请求」（`request.override`），压缩也不改状态（上游只把逐出的原文写进
+  `/conversation_history/{thread_id}.md`、在私有字段里记一个事件），所以「压缩到底触发了没有、
+  省了多少」一直只能靠推断。这次要查的那轮报错正好把这件事顶到了台面上。
+- **那轮报错的定性**（会话 `cb4c905c`，2026-10-15 23:21:49–23:26:42，intent=analysis）：
+  **不是上下文炸了，是步数用完了** —— `GraphRecursionError: Recursion limit of 200 reached`
+  （`AGENT_RECURSION_LIMIT` 默认 200）。这一轮 **66 次模型调用、126 次工具调用**
+  （execute 82、read_file 44），模型一直在反复捞同一批认证相关的文件，直到超级步耗尽。
+  **44 次 read_file 只覆盖 14 个文件**：`AuthServiceImpl.java` 读了 8 次、
+  `AuthContextInterceptor.java` 7 次、`AuthController.java` 6 次。
+- **剪裁与压缩都确实在跑**（这轮日志就是证据，也正是上一批欠着的那条真机验证）：
+  ① **压缩触发过一次**：23:22:21 `摘要调用完成：输入 40019 / 输出 3617 tokens` —— 输入正好卡在
+  `CONTEXT_SUMMARY_INPUT_TOKENS=40000` 那个上限上，说明「摘要调用不许不裁」这条生效了
+  （上游工厂那一档是 `None` ＝完全不裁）；压完第一次模型调用输入 **38,521**，而上一轮
+  （19:0x 那次 6.9M token 的事故轮）末次输入是 **152,340** —— 继承下来的历史被压掉了四分之三。
+  之后整轮峰值只到 **76,565**，没再够到 120,000 那条线，所以只压了这一次。
+  ② **剪裁在生效**：输入曲线是**锯齿**而不是单调上涨（第 38 次 64,833 → 第 39 次 62,450、
+  第 42 次 67,053 → 第 43 次 63,325、第 50 次 75,213 → 第 51 次 71,857）—— 只有「老工具返回
+  被换成占位符」能让一次调用的输入比上一次更小。
+  ③ 后端进程 23:21:14 启动，晚于上一批改动的落盘时间（22:40 / 22:42），跑的确实是新代码。
+- **顺带查出的一条真问题**（记进 `docs/backlog.md` 二·五）：**空转刹车对分页读取是瞎的** ——
+  `LoopGuardMiddleware` 的键是「工具名 + 入参精确 JSON」，而模型反复读同一个文件时带的是
+  **不同的 `offset` / `limit`**，于是 8 次读同一个文件一次都没被数成重复（本轮日志里
+  「本轮已经用同样的参数调用过 N 次」那行出现 **0 次**）。200 步就是这么烧完的。
+- **改了什么**：
+  - **① 剪裁记账**（`agent/middleware/context_trim.py`）：`ContextEditingMiddleware` 换成子类
+    `HarnessContextTrimMiddleware`，覆写 `awrap_model_call`，用一层「间谍 handler」截下
+    **实际交给内层的那份消息**（上游把剪完的消息直接 `override` 给 handler，既不写回状态、
+    也不回传给我们），与进来那份各数一次，记成一行 INFO：`CONTEXT_TRIM 剪掉 5 条历史工具
+    返回：31200 → 4800 tokens（省 26400；触发线 40000、保留最近 6 条；消息 17 条不变，
+    耗时 12ms）`。**发生时间**由日志格式串的 `%(asctime)s` 带（不另写一份，免得两处时钟），
+    角色落进 `%(agent)s` 那一列（`build_context_trim(…, agent=)`，装配点按角色给）。
+  - **② 压缩记账**（`agent/summarization.py`）：`HarnessSummarizationMiddleware` 覆写
+    `awrap_model_call`，同一套间谍 handler。「压前」按 `_get_effective_messages` 取
+    （上一次压缩事件已经生效的那一份 —— 直接数 `request.messages` 会把早已逐出的原文再算一遍，
+    那个数没有意义）；token 数借上游自己的 `_count_tokens`（含系统提示与工具 schema，
+    与它判触发时同一个口径）。三种结局分行记：**压缩**（带摘要字数、逐出原文落盘路径、耗时）、
+    **只截断工具入参**（上游那份 `truncate_args_settings`）、**没动上下文＝一行都不记**。
+    触发线在构造时渲染成人话（`describe_trigger`：`窗口 991808×0.85=843036 或 120000 tokens`）。
+  - **③ 只在真动了手的时候才数 token**：这两层每次模型调用都跑，而计数要把全部历史
+    （压缩那边还要连工具 schema）序列化一遍，十几万 token 就是几十毫秒。判「动没动」都走
+    便宜办法 —— 剪裁数上游打在 `response_metadata` 上的 `cleared` 标记，压缩逐条比**对象身份**
+    （上游不改状态，没动手时交给内层的就是进来那一批对象）。
+  - **④ 接线**：`subagents.context_trim_factory` 从 `() -> 中间件` 改成 `(角色) -> 中间件 | None`
+    （角色名要进日志那一列），顺手补掉一个真漏：开关关掉时 `build_context_trim` 返回 `None`，
+    而旧代码会把这个 `None` 直接塞进子智能体的 middleware 列表。`session/manager.py` 主控那两份
+    传 `MAIN_AGENT`、子智能体传角色名；`agent/middleware/__init__.py` 导出新名字。
+- **关键决策**：
+  ① **两行的 token 口径故意不同**，各自与自己的触发线同口径（剪裁只数消息，因为
+  `ClearToolUsesEdit` 判触发就是 `count_tokens(messages)`；压缩含系统提示与工具 schema，
+  因为上游那边判触发就是这么算的）—— 每行都能直接对着自己的阈值调参，代价是**两行不能
+  横着比**，所以两处 docstring 都写明了。
+  ② **只记 INFO、不记「没动手」的 DEBUG**：压力曲线已经有一份更准的（`run_log` 每次调用记的
+  供应商真值 usage），再记一遍估算值只是噪声。
+  ③ **不覆写 `_acreate_summary` 去捞摘要统计**：那条路要在实例上存状态，而同一个压缩中间件
+  实例可能被同角色的并发子智能体共用（`memory_factory` 之所以是工厂就是这个原因）；改从上游
+  回传的 `_summarization_event` 里取（摘要那条消息与落盘路径都在里面），无状态，也不碰
+  `asyncio.gather` 的上下文传播。
+  ④ 用上游私有的 `_count_tokens` / `_get_effective_messages`：版本已在 `pyproject.toml` 钉住
+  （`deepagents>=0.6.11,<0.7`），换来的是「日志里的数 ＝ 它判触发时数的那个数」。
+  ⑤ 只实现异步版（与 `boundary.py` / `fallback.py` 同一约定）：服务端统一走 `astream_events`。
+- **验证**：`pytest` **1407 passed**（新增 9 条 —— 剪裁：「剪了要报出剪前剪后与省了多少 /
+  没剪一行都不记 / 不传角色名按 `main` 记」；压缩：「压缩要报出前后、条数、落盘路径 /
+  没动一行都不记 / 只截断入参是另一行 / 触发线渲染三条」）；`ruff check` 改动文件全干净；
+  `python scripts/check_prompts.py` 0 冲突。本次**没有前端改动**，未跑 `npm run build`。
+- **没验证的**：真机再跑一轮，看这两行的估算值与供应商真值差多少（计数器口径的校准）——
+  这轮之前没有这两行日志，差多少还只能靠上面那条锯齿曲线间接推。
+- **遗留**（都记进 `docs/backlog.md` 二·五）：① 空转刹车认不出「同一文件不同 offset/limit」；
+  ② `AGENT_RECURSION_LIMIT=200` 对「分析整个仓库」这类形态偏紧，而且**触顶是抛错、不是收口** ——
+  用户拿到的是一句报错而不是已经查到的结论，值得改成「快到上限就先出结论」。
+
+### 2026-10-15
+
+#### 压缩这条线的三条根因：自己构造那份中间件（排掉上游的）＋计数器换中英混合口径
+
+- **动机**（用户：「看一下压缩中间件的部分，有没有什么建议」）。上一批（本节下面那条）把
+  deepagents 的压缩工厂换了层壳、塞进中文计数器，但**只解决了计数口径**；把上游源码
+  （`deepagents` 0.6.11 / `langchain` 1.4.0）逐行读下来之后，发现真正的三个坑都在**上游工厂的
+  默认值**里，而且都没暴露成参数（签名只有 `summary_prompt` / `trim_tokens_to_summarize` /
+  `token_counter`）：
+  ① **trigger 只有窗口比例**（`compute_summarization_defaults`：带 profile 时 `("fraction", 0.85)`）。
+  窗口现在按模型查，`qwen3.8-max` 是 991808 → 比例线落在 **843k**，而那轮 6.9M token 的
+  **单次峰值只有 152k**，所以「换中文计数器」对大窗口那几行**近乎空转** —— 上一批那条
+  「压缩会在 ~108k 触发」的待验证项，只对解析到 128k 兜底值的行成立；
+  ② **`trim_tokens_to_summarize` 被工厂静默设成 `None`** —— 工厂默认 `None` 并**显式**传给类，
+  把类自己的 4000 覆盖掉，而 langchain 那边 `None` = 完全不裁：压缩触发那一刻会额外发一次
+  「输入 ≈ 被逐出的全部历史」的调用，用的还是主控那个贵模型；`awrap_model_call` 只对
+  **主调用**捕 `ContextOverflowError`，摘要调用自己溢出是往上抛的 —— **恰好在系统自救那一刻
+  把整轮带崩**（与上一批 kimi 温度 400 的失败形状同类）；
+  ③ **`keep=("fraction", 0.10)`**：1M 窗口下等于「压完还留 100k」，与 120k 的触发线只差一点，
+  压了等于没压。
+  另外量到一条**上一批自己的漏**：`CJK_CHARS_PER_TOKEN=1.6` 是**一个常量喂两种文本** ——
+  实测中文高估 2.48 倍、**读本项目源码高估 2.49 倍**（代码真实约 3.5~4 字符/token）。
+  这个上下文里绝大部分是代码，于是剪裁的绝对阈值（40000）折算成真 token 只有约 16k
+  ＝**剪得远比设计早**，而压缩的比例线折算下来只有 0.34×窗口＝**压得比设计早**，
+  两条线朝相反方向歪，且歪多少取决于当轮的中文/代码配比 —— 调参没有意义。
+- **改了什么**：
+  - **① 计数器换中英混合口径**（`middleware/context_trim.py`）：`cjk_token_counter` →
+    `context_token_counter`，新增 `effective_chars_per_token()` —— 按当轮中文占比在 1.6 与 3.8
+    之间折一个等效系数，仍委托上游 `count_tokens_approximately`，所以「每条消息固定开销 /
+    工具 schema / 图片按张计」那套账不必重写。实测：纯中文 1.6、纯 ASCII 代码 3.8、
+    中文注释多的源码 3.0（同一份文件原先按 1.6 估 2663，现在 1420）。
+  - **② 新增 `agent/summarization.py`**：`HarnessSummarizationMiddleware`（继承上游公开别名
+    `SummarizationMiddleware`）+ `build_summarization()` / `summarization_defaults()` /
+    `profile_window()`。trigger = **`[("fraction", 0.85), ("tokens", 120000)]`**（上游
+    `TriggerClause` 的 list 就是 OR 语义），keep = **`("tokens", 20000)`**，
+    `trim_tokens_to_summarize` = **40000**；`truncate_args_settings` 照抄上游默认值。
+    模型没有 `profile` 时退回**纯绝对值**那一档 —— 上游 `__init__` 见到 fraction 而拿不到
+    `max_input_tokens` 是直接 `ValueError`（不是忽略），漏这一档就是建 agent 当场崩。
+  - **③ 排掉上游那份、位置自己定**（`agent/graph.py`）：删掉上一批那层猴补壳，改成在
+    `HarnessProfile.excluded_middleware` 里加 `SummarizationMiddleware`（**按类精确匹配**，
+    所以我们的子类实例不会被误伤 —— 上游 `name` 属性也正是这么设计的：子类回落到
+    `type(self).__name__`）。我们那份挂在**剪裁的内侧、兜底的外侧**（主控与子智能体同序）：
+    上游把压缩挂在用户中间件外面，它数的是「还没剪的账」，两层高估叠在一起。
+  - **④ 接线**：`agent/subagents.py` 加 `summarization_for(role, model)`，顺手把「每角色建两次
+    模型实例」改成建一次（压缩要按**那个模型自己的窗口**算触发线，必须是同一个实例）；
+    `session/manager.py` 主控与子智能体各挂一份；`config.py` 新增 `CONTEXT_SUMMARY_*` 五个键
+    （**不上界面**，与 `CONTEXT_TRIM_*` 同属「调参」那档）。
+  - **⑤ 钉版本**：`pyproject.toml` 里 `deepagents` / `langchain` 从裸名字改成 `>=0.6.11,<0.7` /
+    `>=1.4.0,<2`。`requirements.txt` 早就钉了，但 `pip install -e ".[dev]"` 是按 **pyproject**
+    重装依赖的（AGENTS.md 记着这个坑）—— 我们既按类排掉上游中间件、又依赖 langchain 摘要层
+    的取值语义，不钉就是等着一次重装把它静默弄失效。
+  - **⑥ 顺手修两处过期注释**：`agent/llm.py` 那句「按窗口比例（80%）触发」（实际 85%）、
+    `session/manager.py` 那句「默认不含 main」（上一批已改成四个角色都给）；`config.py` 里
+    压缩口径那段注释按新取值重写。
+- **关键决策**：
+  ① **不用上游工厂、自己构造** —— 三个默认值都不暴露成参数，改壳只能覆盖 `token_counter` 与
+  `trim_tokens_to_summarize` 两格，`trigger` / `keep` 非得绕过工厂不可；而绕过工厂就必然要处理
+  「上游那份还在」，所以「排除 + 子类身份」是配套的，不是两件事。
+  ② **子类而不是实例** —— 排除按类精确匹配，直接构造上游那个类的实例会被自己排掉。
+  ③ **trigger 保留比例那条、只加上绝对那条**（OR）—— 绝对那条上游判它时会顺带看上一条
+  `AIMessage` 里供应商**自报**的 `usage_metadata.total_tokens`（真值），所以即便我们的估算偏了
+  真值也能触发；比例那条继续跟着窗口走，小窗口模型（128k）不必硬等 120k。
+  ④ **计数器用「折一个等效系数」而不是分段重写** —— 复用上游那套账，少一处会与上游漂移的
+  实现。工具 schema 不进比例（量级远小于历史消息），按折出来的系数一并计，是有意的取舍。
+  ⑤ **`CONTEXT_SUMMARY_*` 不上界面** —— 与 `CONTEXT_TRIM_*` 同档，`docs/config-page-design.md`
+  第九节写着「调参不上界面」，用户也说过别再堆配置格。
+- **验证**：`pytest` **1398 passed**（新增 `tests/test_summarization.py` **17 条**：绝对上限在 1M
+  窗口下确实能压下 152k 那个峰值 / 没 profile 时退回纯绝对值且**真的建得起来** / 摘要上限不是
+  `None` 且**对照钉住上游工厂给的就是 `None`** / 我们那份在按类排除下活下来而上游那份被排掉 /
+  主控与子智能体的挂载顺序都在剪裁内侧 / 不传就是不压。`tests/test_context_trim.py` 的计数器
+  三条改成「中文按 1.6、代码按 3.8、混合按比例、无文本退回 3.8」，并删掉已失效的
+  `test_the_summarization_factory_gets_our_counter`）；`ruff check` 改动文件全干净。
+  另外两处假模型跟着改真：`tests/test_profiles.py` 的 `_fake_model_for` 换成带 `role` 字段的
+  `GenericFakeChatModel` 子类、`tests/test_app_settings.py` 补一行 `build_summarization` 打桩 ——
+  子智能体装配现在会**真造**压缩中间件，而上游 `__init__` 第一件事就是 `model.with_retry()`，
+  `SimpleNamespace` / `None` 撑不到断言那一步。
+- **没验证的**：**真机那一轮**（沙箱禁网）—— 压缩到底在什么位置触发、压完省了多少、
+  `read_file` 次数有没有因为剪裁变早而上升，都要看日志里的「摘要调用完成」与 Token 面板。
+  本次**没有前端改动**，所以没跑 `npm run build`。
+- **遗留**（都记进 `docs/backlog.md` 的「二·五」）：① **摘要正文没过脱敏** ——
+  `_acreate_summary` 直接 `ainvoke`、不经 handler，绕过 `ModelRedactionMiddleware`，而压缩现在
+  **真的会触发了**，这条优先级比之前高；② 摘要用的是主控那个贵模型（要省钱得单开一行，
+  与「别堆配置格」冲突）；③ `truncate_args_settings`（上游那份，开着）与
+  `CONTEXT_TRIM_CLEAR_INPUTS`（我们那份，关着）是两套入参截断，口径要说清。
+
+#### 那次 analysis 轮的 6.9M token：四条整改（剪裁给主控 / 压缩用中文口径 / kimi 温度 / qwen 窗口）
+
+- **动机**（用户：「看一下最近的一次 analysis 任务，这个 token 量太大了吧」）。查下来的账：
+  会话 `4b9e01152dff` 18:53–19:09 那一轮 **54 次模型调用、103 次工具调用（read_file 53、grep 34）、
+  输入合计 6,895,459 tokens**，单次输入从 91k 一路涨到 152k；而且**最后是崩掉的**：
+  `MODEL_FALLBACK primary=qwen3.8-max fallback=kimi-k2.6 error=BadRequestError/400` → kimi 回
+  `invalid temperature: only 1 is allowed` → 整轮失败（记忆倒是写成功了）。四个原因：
+  ① 一个会话共用一个 thread，历史从不清理，这轮**第一次调用就带 91k**（前几轮 coding/rework 的残骸），
+  之后每加一条工具结果就要重发整份历史（O(n²)）；
+  ② **压缩从来没触发过** —— 上游 `count_tokens_approximately` 是英文口径（`chars_per_token=4.0`），
+  中文实测 ≈1.6 字/token，152k 在它眼里只有 ~55k，永远够不到 85%×128k 那条线；
+  ③ **剪裁只给了 coder**（`CONTEXT_TRIM_ROLES=coder` 默认），analysis 主控一条历史工具结果都不剪；
+  ④ 那 53 次 `read_file` 的整份文件原文全躺在上下文里。
+- **改了什么**：
+  - **① 剪裁给全部四个角色**（`config.context_trim_roles` 默认 `main,planner,coder,reviewer`）、
+    `.env.example` 同步。剪的只是**这一次请求**里的老工具结果，不动 checkpoint / 业务库，
+    最近 6 条照旧保留。
+  - **② 压缩换中文计数器**：`context_trim._count_tokens` 提成公开的 `cjk_token_counter`（多认一个
+    上游会传的 `tools=`），`agent/graph.py` 里**换掉 deepagents 的 `create_summarization_middleware`
+    工厂**给它塞 `token_counter` —— 上游 `create_deep_agent` 没暴露这个旋钮，而它内部三处构造
+    （主控 / 子智能体 / 通用子智能体）都走这个模块属性，换一次全覆盖；其余参数照传。
+  - **③ kimi 温度**：新增 `config.TEMPERATURE_HINTS` / `temperature_for()`（按**模型名**判，
+    与 `model_types` 同套路），在 `llm._model_from` 与 `build_classifier_model` 两处生效 ——
+    界面上的行没有温度这一格，而 kimi 系只收 1，以前这条信息写在 `.env` 的 `kimi_model` 里，
+    删掉 `.env` 那套时丢了（我的漏）：现在任何 kimi 行（含**兜底行**、含分类器）都不会再 400。
+  - **④ qwen 窗口刷进表**（用户点的那件事，我直接调了本机接口）：`POST /model-config/providers/qwen/models/refresh`
+    → 20 个模型带窗口，`qwen3.8-max = 991808`。顺带把窗口显示取整（`991808` → `969K`，
+    以前会显示 `968.6K` 那种假精度）。
+- **关键决策**：① 剪裁**默认全开**（四个角色）—— 只给 coder 的做法在当时是"先在一处观察"，
+  现在有了真机证据（主控形态也会通读仓库），观察期结束；② 压缩计数器**换工厂**而不是自己拼中间件
+  —— 上游的工厂还带「被挤出的历史 offload 到 `/conversation_history/`」「上下文溢出自动摘要重试」
+  这些行为，自己拼会丢；③ kimi 温度按**名字**判（不新增界面字段、不动库表 —— 用户刚要求过别再堆配置格）。
+- **验证**：`pytest` **1380 passed**（新增：压缩工厂确实拿我们的计数器 / 中文口径比上游估得多 /
+  kimi 行与分类器都是 1 / 剪裁名单默认四个角色）；`ruff check` 干净；
+  `npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过；真机核过 qwen 的刷新结果（上面那 20 行）。
+- **没验证的**：① 压缩**真的会在 ~108k 触发**这件事要下一轮真机跑（看日志里出现摘要调用）；
+  ② 剪裁对主控的实际影响（省了多少 token）也要下一轮真机看；③ 观感（没有浏览器）。
+- **遗留**：`qwen3.8-max` 在 dashscope 报的窗口是 991808（≈969K），而这一行的**兜底窗口**口径
+  （`fallback_context_window`，默认 128k）只在一行没配、模型也查不到时才用 —— 现在查得到了，
+  所以 analysis 那一行的压缩线会按 969K 算。
+
+#### 修「选完模型窗口不刷新」+ 删掉「内置候选」那份种子清单
+
+- **动机**（用户反馈）：「还是有问题，选了模型之后，上下文窗口没有跟着刷新，以 kimi k3 为例，
+  数据库中是 256K，那个种子清单删掉」。
+- **① 真 bug**：`ensureModels()` 命中缓存就 `return` 了，**从不去刷窗口回显** —— 于是
+  「选完模型去查后台」这一步只在**第一次**打开弹窗时发生（之后不管你换哪个模型都不动）。
+  现在缓存命中也会按当前选中的模型刷一次；点「刷新清单」之后也立刻刷。
+- **② 清单那一格改成现读库**：新加 `_models_payload_fresh`（读表），`GET /providers/{p}/models`
+  与刷新/手改两个接口都改用它 —— 内存那份镜像只在启动 / 刷新 / 手改时对齐，直接改库它不知道，
+  于是会出现「库里明明有 256K，界面看不到」（用户报过）。镜像仍留着给**同步**的
+  `resolve_window` 用（它读不了库）。顺手删掉已经没人用的 `_models_payload`。
+- **③ 删掉「内置候选」**（`default_models`）：`ProviderMeta` / `ProviderOption` / `ProviderUpsert` /
+  `dao.upsert_model_provider` / 种子文件里的那一列都去掉，`seed_provider_models`（把候选名灌进
+  模型详情表）一并删；「测试连接」拉不到时**不再拿内置候选顶上**，老实回 `ok=false` + 错误原文
+  （`source` 从 `builtin` 收成 `live` / `none`）；界面上候选只剩「刷新清单拉到的 + 表里已登记的
+  文本模型」两档，「提供商」栏那格文本框也撤了。**DB 列留着**（`model_providers.default_models`
+  改注释标废弃，不写迁移 —— 删列要动库，不值）。
+- **关键决策**：模型名**只有一个出处** —— 刷新清单拉到的那份（表 `provider_models`）。
+  那份静态候选会过期、又和实时清单重复，维护它没有收益（用户口径：删掉）。
+- **验证**：`pytest` **1376 passed**（改了几条钉内置候选的用例：拉失败 / 空清单都改成
+  `ok=false` + `source=none`；删掉种子里的候选断言）；`ruff check` 干净；
+  `npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过；真库核对：glm 17 个模型全带窗口
+  （glm-5.3 = 1M）、kimi 4 个（kimi-k3 = 1M、k2.6 = 256K）、**qwen 还是 0**（还没刷）。
+- **没验证的**：观感（没有浏览器）；qwen 那条路径要重启后端后点一次「刷新清单」才算验过。
+- **遗留**：`model_providers.default_models` 这一列还在库里（已废弃、不再读写）；
+  `POST /model-config/providers/reload` 与种子文件仍保留（新库初始化用）。
+
+#### 模型配置五点收口：修「统一模型显示成别人的」+ 窗口只回显真值 + 去「清除 key」+ 红星 + 弹窗不点外面关
+
+- **动机**（用户逐条）：「① 统一模型里边明明是 deepseek，外边显示的却是 glm；② 窗口什么时候会刷新？
+  保存之后外边还是显示 128K，这个 128K 从哪来，里边没数据，按道理选完模型就该查后台然后回显；
+  ③ 为什么会有一个清除 apikey 的操作，换了供应商下边的值不都应该清空嘛，key 内部显示一个缩略的
+  就行；④ 必填加个红色星，窗口里边不需要提示信息；⑤ 弹窗必须点 X 才能关，不能点一下其他地方
+  就没了，那我不得重新配置嘛」。
+- **改了什么**：
+  - **① 是真 bug**：`MODEL_AGENT_EFFECTIVE_ROLE["unified"]` 原来借 ``orchestrate`` 去算「生效值」——
+    优先级翻成「行优先」之后，它取到的是「编码主控」那一行的 glm。现在「统一模型」那一行
+    **看它自己**（`llm.effective_for` 给它一个 ``unified`` 特例，`source` 记 ``row``）。
+  - **② 窗口来源**：`llm._row_window` 返回 ``(窗口, 来源)``，来源四态
+    ``row`` / ``model`` / ``fallback`` / ``none``，并随 `effective.window_source` 下发；
+    **界面只回显 row / model 两种真值**，兜底值（我们保守取的 128k，不是厂商给的数）不再显示 ——
+    查不到就留空，要准确就点「刷新清单」（那是唯一把厂商窗口写进表的入口）或手填。
+  - **③** 撤掉「清除 key」按钮：换供应商时界面清空 + 保存送空串已经能把库里那把清掉；
+    key 那一格只把**缩略值**（`sk-…e2b7`）当占位符，不再写「留空＝不改（现在 …）」。
+  - **④** 必填只用一个红 `*`（模型名总是必填；JEV 那一行的 base_url / api_key 也必填），
+    模型名那格的长占位符与窗口那格的占位符都删掉（窗口只在填错格式时给一行红字）。
+  - **⑤** 两个弹窗（模型配置 / 提供商）都**取消「点遮罩关闭」**，只认 X 与 `Esc`。
+- **关键决策**：界面**不显示我们自己的兜底值** —— 它是"没数时的保守值"，显示出来读者只会以为
+  查到了；要区分「查到」与「没查到」就得把来源一起带出来（`window_source`）。
+- **验证**：`pytest` **1376 passed**（新增两条：「统一模型」那一行看自己 / 窗口来源三态）；
+  `ruff check` 干净；`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过。
+- **没验证的**：观感（没有浏览器）—— 红星、缩略 key、窗口留空、弹窗不点外面关，都只过了类型检查。
+- **遗留**：glm / qwen / kimi 那几家的窗口要**重启后端 + 点一次「刷新清单」**才会进表；
+  在那之前它们的窗口那一格是空的（以前显示的是 128K 兜底值）。
+
+#### 设置页第 4 栏「提供商」：目录本身在界面上就能改（口径 b）
+
+- **动机**（用户口径）：「改路径」这件事以前只有两条路 —— 手改库，或改 `config/model_providers.toml`
+  再 `POST /model-config/providers/reload` 对齐；而「清单路径」「鉴权头」这两格**只有真机试过
+  才知道怎么填**（GLM 要多一层 `/v1`、qwen 在另一个根下面、有的网关是 `x-api-key`）——
+  让用户手改库不对。用户选了 b：界面上能改目录行，种子退回「新库初始快照」。
+- **改了什么**：
+  - **后端**：`GET /model-config/providers`（**全量、含停用** —— 停用的家要看得见才能改回来）；
+    `PUT /model-config/providers/{p}`（整行覆盖，复用 `dao.upsert_model_provider`；键只收
+    `a-z 0-9 _ -` 且**不可改**：模型行 / agent 行都按它挂）；`ProviderOption` 补
+    `models_path` / `auth_header` / `auth_prefix` / `status` / `is_dynamic_model_list`；
+    新增入参 `ProviderUpsert`。`_provider_metas` 多一个 `only_enabled` 开关（下拉只要启用的、
+    编辑那一栏要全量）。
+  - **顺手修一处「改完即生效」是假的**：`_known_provider` / `_borrowed_key` 原本读的是
+    **启动时的** `Settings.providers` —— 在界面上改完 `models_path` 之后，「刷新清单」
+    「测试连接」还会拿着旧路径去请求（得重启才对）。现在都读**现读库**那份，写接口末尾再
+    刷一次内存那份（`apply_model_providers`），于是真的不用重启。
+  - **前端**：新增设置页第 4 栏「提供商」（`ProvidersPanel.vue`）：列表（显示名 · 键 ·
+    默认地址 · 清单路径 · 内置候选条数 · 停用标记）+「新增提供商」+ 编辑弹窗（8 格，含
+    鉴权头 / 前缀 / 分组 / 排序 / 内置候选 / 启停）。`viewState.ts` 的 `SettingsPanel` 加
+    `'providers'`（hash 支持 `#settings/providers`）。弹窗开着时按 `Esc` 只关弹窗
+    （捕获阶段拦一下，别再犯「连整页一起关掉」那个错）。
+- **关键决策**：① **不删除、只停用** —— `provider` 是外键目标，删一行会牵出「那些行怎么办」；
+  ② **整行覆盖**（与 DAO 现有语义一致），不留老值赖着的坑；③ 键不可改（新增时可填）；
+  ④ **无迁移** —— 表与列早就都在，这次只加接口与界面。
+- **验证**：`pytest` **1374 passed**（新增 4 条：全量含停用 / 整行覆盖+内存立刻跟上 /
+  新增与坏输入 400 / **改完路径后刷新立刻用新地址**）；`ruff check` 干净；
+  `npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过；真库只读跑了一遍
+  `GET /model-config/providers`（13 家全在，glm 已是 `/v1/models`、qwen 已是绝对地址）。
+- **没验证的**：界面观感（没有浏览器）—— 列表、弹窗那 8 格、停用标记都没看过渲染结果。
+- **遗留**：`custom` 那一行的默认地址是空的（选中它不会带出地址，一直如此，不是这次的改动）；
+  目录仍不支持删除（要下架就停用）。
+
+#### 窗口清单：认 qwen 原生那种嵌套返回，qwen 的清单地址可写绝对 URL
+
+- **动机**（用户实测反馈）：「openai 的是真的查不到，不过国内的都有的——glm 的 `/v1/models` 会返回
+  `context_length`；deepseek 返回 `context_window`；kimi 返回 `context_length`；qwen 有点特殊，
+  要调 `/api/v1/models`，里面是 `output → models → model_info → context_window`」。
+  对着库核了一遍：deepseek 的窗口**已经**拉到了（`source=probe`，两个模型各 1M）；
+  **kimi / qwen 那几行是种子行（`source=seed`），从来没点过「刷新清单」**；
+  glm 是 probe 过的但全 0 —— 说明我们请求的那个地址（`…/api/paas/v4/models`）没回窗口。
+  解析器那边确实缺一块：只认平铺的 `data[].<窗口键>`，读不到 qwen 埋在 `model_info` 里的值。
+- **改了什么**：
+  - `routes/model_config.py`：新增 `_model_items`（认 `data[]` 与 `output.models[]` 两种形状）、
+    `_name_of` / `_deep_window`（名字与窗口**任意层级**里找；同一层仍按 `_WINDOW_KEYS` 顺序，
+    保证可复现），`_positive_int`（有的网关把窗口回成字符串）；`parse_models` /
+    `parse_model_entries` 都改走这一套。
+  - `config/model_providers.toml`：qwen 的 `models_path` 写成绝对地址
+    `https://dashscope.aliyuncs.com/api/v1/models`（清单不在兼容入口那个根下面）。
+    `models_path` 一直支持绝对地址（`_fetch_models_payload` 里那句判断）。
+    glm 的 `models_path` 写成 `/v1/models`（用户给了完整地址
+    `https://open.bigmodel.cn/api/paas/v4/v1/models` —— **比默认多一层 `/v1`**，
+    默认那个 `…/api/paas/v4/models` 只回模型名、不带窗口，这正是 glm 那 11 行全 0 的原因）。
+- **关键决策**：**认得出就认，认不出不猜** —— 只认这两种已知形状，别的形状回空列表；
+  窗口在任意层级里找但顺序固定，免得「这次读到 1M、下次读到 128k」这种不可复现的行为。
+- **验证**：`pytest` **1370 passed**（新增四条：qwen 原生形状的名字+嵌套窗口+非文本落表、
+  字符串窗口、清单地址的拼接、种子文件里那两条实测路径）；`ruff check` 改动文件干净（全仓那 5 条既有告警在 `db/models.py` /
+  `observability/tracing.py`，没新增）；真库核对了 `provider_models` 里各家的 `source` 与
+  `context_window`（见上面的动机）。
+- **没验证的**：真实厂商返回（沙箱禁网）—— qwen / glm 的新路径要**重启后端**、把目录行同步过去
+  （改库或 `POST /model-config/providers/reload`）之后点一次「刷新清单」才算验过。
+
+#### 修：窗口那一格改成**回显当前生效值**、提示文字去重（不再写库）
+
+- **动机**（用户反馈）：「窗口大小去查询了嘛，为什么不回显？而且竟然提示了两次，输入框内一次、
+  下边一次」。查过原因有两层：① 我上一版把回显写成「只在输入框为空时显示」—— 一旦那一格有值
+  就什么都不显示了；② 提示确实重复（`placeholder="留空＝按模型查"` ＋ 下面一行
+  「留空＝按模型查（1M）」）。另外真库里 `provider_models` 931 行**只有 deepseek 的两个模型有窗口**
+  （glm / kimi / qwen / openai / typesafe 全是 0：厂商的清单接口不回窗口，实测如此），
+  所以「按模型查」对多数行本来就没值可查。
+- **改了什么**（纯前端）：窗口那一格现在**始终显示这一行当前会用的窗口**（后端 `effective.window`
+  已经解析好：行内手填 → 按模型查 → 兜底值），**不需要先点「刷新清单」**；整条提示文字删掉
+  （只留「认不出这个写法」那条错误），占位符缩成 `1M / 128K` 一个格式例子。
+  新增 `window_auto`：这一格**回显**时保存**不写库**（写下去会变成覆盖值，以后换模型就成脏数据），
+  手一改就变成「我要覆盖它」；清空 = 撤掉覆盖。「测试连接」读到的窗口也改成只回显不写库
+  （它取自清单里第一个带窗口的模型，未必是你选的那个）。打开弹窗时按新模型刷一次回显。
+- **关键决策**：那一格回答的是「**现在按多少算**」，不是「你填过什么」—— 所以要显示解析结果；
+  要不要把它**冻**成这一行的值，由「手有没有动过」决定，而不是由「格子有没有内容」决定。
+- **验证**：`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过；真库核对了两种行：
+  `deepseek` 那几行会显示 `1M`（表里有窗口），`glm / qwen / openai` 那几行会显示 `128K`
+  （查不到 → 后端保守兜底值，也正是压缩线现在用的值）。
+- **没验证的**：观感（没有浏览器）。
+- **顺带说明**：想让 glm / kimi / qwen 这些行显示真实窗口，只有两条路 —— 手填那一格，
+  或者等厂商的清单接口愿意回窗口（现在读不到，表里记 0）。
+
+#### 改口径：「统一模型」是**兜底**，不是总闸
+
+- **动机**（用户口径）：「统一模型并不是覆盖掉所有的行，只是覆盖没有填的部分」。
+  上一批的界面把「被统一模型覆盖」这件事显示出来了，用户看到自己的配置全被压掉 ——
+  口径本身就该是**只补空档**：配了的行按自己的走，没配的行才落到统一模型。
+- **改了什么**：`agent/llm._row_key_for` 的解析顺序从 `unified → 该行` 改成
+  **`该行 → unified`**（`resolve_model` / `effective_for` / `_config_for` 的文档同步）；
+  界面文案跟着改 —— 次行从「本行 X · 实际生效 Y（被「统一模型」覆盖）」变成
+  「`Y · 本行没配，走「统一模型」`」，「统一模型」那一行自己写「`X · 只兜底没配的行`」；
+  上一批加的「清空「统一模型」」那条警告与按钮**删掉**（不需要了）。
+  `AGENTS.md` / `README.md` / `docs/config-page-design.md` 里「填了就所有智能体都用它」的表述
+  一并改成兜底口径。**没有**动 `.env` 与其它任何东西。
+- **关键决策**：兜底而不是总闸 —— 「一处切换所有角色」那个用法要靠把各行清空才成立，
+  但用户真正要的是「配了的就按配的跑」，兜底不打扰已做的选择。
+- **验证**：`pytest` **1366 passed**（改了 `test_model_config.py` 的三条：
+  本行优先、没配的行落统一模型、生效值的 source）；`npm.cmd --prefix frontend run build`
+  （含 `vue-tsc`）通过；用真库核了一遍 —— 改之前五行全被 unified 压着，
+  改之后 `问答 → qwen3.8-max`、`方案 → gpt-5.6-luna`、`审查 → glm-5.3-flash`、
+  `编码主控 → glm-5.3`，只有没配的 `编码(coder)` 落到 `deepseek-flash`（统一模型）。
+- **没验证的**：观感（没有浏览器）。
+
+#### 修：列表只显示「生效值」，被「统一模型」覆盖的行看起来像没保存
+
+- **动机**（用户反馈）：「有一个很严重的 bug，里边配置了，外边还是显示默认的统一模型」。
+  查库确认**保存是成功的**（`qa` 那一行 2026-10-15 08:13 UTC 写进了 `qwen3.8-max`），
+  真正的原因是 `unified`（统一模型）那一行填了 deepseek-flash —— 它的语义就是**覆盖所有行**，
+  所以「问答」那一轮实际用的确实是 deepseek-flash。**界面没把这层说清楚**：上一批把列表改成
+  「只显示生效值」之后，`ModelEntry` 里那个 `configuredModel` prop 传了却没用上，
+  「我自己配了什么」一个字都不露 —— 看起来就像配置没生效。
+- **改了什么**（纯前端）：`ModelEntry` 的次行改成**两个都写** —— `本行 qwen3.8-max ·
+  实际生效 deepseek-flash（被「统一模型」覆盖）`；两者一致时只写一行。`unified` 那行的次行
+  写「`模型 · 覆盖所有行`」；「各智能体」那一栏顶上，只要统一模型填着就多一句
+  「现在「统一模型」（X）在覆盖下面所有行」＋一颗**「清空「统一模型」」按钮**（一键解除覆盖，
+  不用再去「全局」找那一行）。
+- **关键决策**：**没有**改解析优先级 —— 「填了就所有智能体都用它」是 2026-10-13 定的口径，
+  运行时行为也是它，这次只修「看不出来」。要改成「只兜底没配的行」是另一个决定，等用户拍。
+- **验证**：`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过；用真库快照核对了四种
+  组合的文案（本行＝生效 / 本行被统一模型覆盖 / 本行没配走统一模型 / 本行没配且没有统一模型）。
+- **没验证的**：观感（没有浏览器）。
+- **遗留**：`qa` 那一行**没有 api_key**（库里为空）—— 清空统一模型之后它会拿 dashscope 的地址
+  去请求但没有任何凭据；要用得先把 key 补上。
+
+#### 模型配置：干掉「出厂默认」、每行显示**生效值**、窗口按 K/M 显示、意图识别严格二选一
+
+- **动机**（用户逐条口径）：①「不需要出厂默认这个东西，干掉它」；②「取消窗口自动填 ——
+  指的是窗口大小那个吧，如果是的话依旧回填，只不过 1M/128K 这样子展示」；③「没模型名字的置空
+  没什么问题」；④「生效值，做；换供应商，旧 key 就清掉；编码组按角色显示」；⑤「意图识别的模型
+  配置确实有问题，应该是 JEV 和大模型二选一的，不用 .env 的凭据 —— 我在数据库里配了一个新的
+  供应商 typesafe，这个就是 JEV 的供应商，JEV 的配置和其他的大模型保持一样的格式，只不过
+  供应商不允许改」。这批的起点是上一轮那次只读设计评审（诊断表见对话）。
+- **改了什么**：
+  - **解析层去掉 `.env` 回落**（`agent/llm.py`）：`_config_for` 的第三档（`<供应商>_*` 那套
+    出厂默认）删掉，一行没配＝**当场报错**，文案指认「哪一行 + 去哪儿配」（`_unconfigured`）；
+    `resolve_window` 也去掉「家那格」，只留 `行内手填 → 按模型查 → 保守兜底值`；
+    `build_fallback` 只剩「兜底模型」那一行（`FALLBACK_PROVIDER` 作废）；
+    `build_classifier_model` 只剩「意图识别（大模型）」→ `unified`；
+    删掉 `_ROLE_MODEL_ATTR` / `_provider_attr` / `_FALLBACK_PROVIDERS` 与 `Settings` 上那六个
+    `*_model` / `classifier_model` 属性 —— 「谁用哪一行」只剩 `_AGENT_KEY` 一份映射。
+  - **生效值**（`llm.effective_for` + 快照里的 `effective`）：每行回「现在真的用谁」，
+    `source` 三态 `row` / `unified` / `unset`；`unified` 时界面上写清「被统一模型顶掉」。
+  - **行的元数据由后端下发**（`config.MODEL_AGENT_ROLES` / `MODEL_AGENT_SECTION` /
+    `MODEL_SECTIONS` / `CODING_GROUP` / `ROLE_LABELS` / `MODEL_AGENT_PROVIDER_LOCK`）：
+    前端不再硬编码行名，`coding_group` 直接给出「编码一主三从」的 4 个角色 → 落在哪一行、
+    是不是复用。
+  - **意图识别严格二选一**：新增 `jev` 那一行（供应商锁 `typesafe`），`apply_model_endpoints`
+    把它的 base_url / api_key / 模型名装进 `typesafe_*`；`server/intent.detect_intent` 里
+    `mode="jev"` 且这一侧不可用 → **直接落关键字口径，不借大模型**（`build_jev_decider` 也改成
+    「地址 + key 两样都要」才算可用）。
+  - **界面**（`SettingsPage.vue` / `ModelConfigDialog.vue` / `ModelEntry.vue` / 新增
+    `modelWindow.ts`）：列表一行两段（名字 + **生效值**）；去掉「已配置 / 出厂默认」chip 与
+    那些话术；窗口那一格按 `1M` / `128K` 显示与解析（进制 1024；查到的原值留着，文本没改过就按
+    原值存，免得 `195.3K` 这类来回换算失真）；**换供应商 = 保存时清掉旧 key**，另加「清除 key」；
+    「恢复默认」改名「清空这一行」；报错改成**就地显示在弹窗里**；按 `Esc` 只关弹窗（以前会把整页
+    连草稿一起关掉）；「编码」那一组按角色列 4 行（规划 / 评审标「复用」并指向同一行）。
+  - **`.env`**：把作废的键逐行注释掉（**值原样保留**）：`DEEPSEEK_*` / `KIMI_*` / `GPT_*` /
+    `QWEN_*` / `GLM_MODEL_NAME` / 五个 `*_CONTEXT_WINDOW` / `INTENT_MODEL|BASE_URL|API_KEY` /
+    `TYPESAFE_API_KEY|BASE_URL|MODEL_NAME`。**保留** `GLM_API_KEY` / `GLM_BASE_URL`（web 搜索在用）
+    与 `*_TIMEOUT_SECONDS` / `INTENT_*_ENABLED`。`.env.example` 逐条标注「已作废」。
+- **关键决策**：① 宁可**报错也不回落** —— 回落会让「界面上什么都没配」也能跑，用户看不出来自己在用
+  哪个模型；② 生效值**读内存那份**（启动 / 保存时从库里落的），所以直接改库要重启才反映到生效值
+  （提供商目录仍是每条请求现读库）；③ 窗口显示用 1024 进制 —— 各家报的 1048576 / 131072 都是
+  1024 的整数倍，按 1000 换算会显示成 `1048.6K` 读不出来；④ JEV 走 SDK、不建 `BaseChatModel`，
+  所以它的连接**不进 `agent_models`**，而是灌进 `typesafe_*`。
+- **验证**：`pytest` **1365 passed**（改动 8 个测试文件：`test_llm_config` 重写成「行 → 模型」、
+  `test_model_config` 的解析 / 窗口 / 兜底 / 接口几节、`test_model_fallback` 的 `_settings`、
+  `test_provider_models` 的窗口顺序、`test_token_usage` 与 `test_plan_events` 的桩件补行、
+  `test_intent_detection` 加「未显式给 `mode` 时按桩件推断」那一层 + 改写四关里那条）。
+  `ruff check` 改动文件干净（全仓既有告警未新增）；`npm.cmd --prefix frontend run build`
+  （含 `vue-tsc`）通过；真机读了一次库确认 `typesafe` 那家（显示名 JEV）与现有 8 行连接。
+- **没验证的**：界面的实际观感（没有浏览器）：两段式列表、编码组的四行、窗口 K/M 那一格、
+  弹窗里报错的位置 —— 都没看过渲染结果。
+- **遗留**：① 弹窗只做了「打开时聚焦第一格」，**没做焦点陷阱**（Tab 能跑到弹窗外）；
+  ② 直接改 `model_endpoints` 表要重启后端才会反映到「生效值」那一列；③ `typesafe` 那家目录行
+  的 `default_base_url` 是 `https://openrouter.ai/api`，与它的 `models_path`（`/models`）拼起来
+  拉不到清单 —— 「刷新清单」对 JEV 那一行大概会 409，需要时改目录行（或手填地址）。
+
+### 2026-10-14
+
+#### 新增 `docs/config-page-design.md`：把设置页的设计写成文档
+
+- **动机**（用户口径）：「讲配置页面的设计写成文档，放到 docs 下边」。
+- **改了什么**：新增 `docs/config-page-design.md`，八节 —— ① 左菜单三栏各自装什么；
+  ② 基本设置（界面 / 代码缓存配置 / 上下文窗口配置）；③ 模型配置（行是智能体、一主三从的归属、
+  一行只留名字+按钮+弹窗三类、测试连接的门槛、模型清单点了才刷）；④ 两处解析口径
+  （窗口的五级顺序、供应商反推、候选来源）；⑤ **每样东西存在哪 / 什么时候生效**（一张表）；
+  ⑥ 接口一览（9 个端点 + vite proxy 那条坑）；⑦ 几个刻意的决定与理由；⑧ 界面上**故意**没有的东西。
+  `AGENTS.md` 的「去哪儿看」里加了指向。
+- **验证**：文档里的每条结论都对着代码复核过（行名与映射取自 `config.MODEL_AGENT_ROWS` 与
+  `agent/llm._AGENT_KEY`；生效时机取自 `api/app.py` 的三个 `apply_*` 与 `session/manager.get_agent`；
+  接口表对着路由逐个核；窗口顺序是真机验过的那五级）。这次只加文档，没动代码。
+
+#### 「编码」一主三从拆开：主控与编码各一行，规划 / 评审复用「方案」「审查」
+
+- **动机**（用户口径）：「编码改四行，只不过计划和审查复用外部的，只有主控和编码需要配置」。
+  起因是上一批发现的**信息损失**：原来 `orchestrate` / `planner` / `coder` / `reviewer`
+  **四个角色全指向 `coding` 那一行**，而 `.env` 的默认是各用各的（主控/planner=GLM、coder=DeepSeek、
+  reviewer=Kimi）—— 一旦配了「编码」这一行，coder 的 DeepSeek 与 reviewer 的 Kimi 就都被顶掉了。
+- **改了什么**：
+  - `agent/llm._AGENT_KEY`：`orchestrate → coding`、`coder → coder`（新行）、
+    **`planner → plan`、`reviewer → review`**（复用已有的两行）。
+  - `config.MODEL_AGENT_ROWS`：`coding` 的中文名改成「**编码主控**」，新增一行「**编码**」（`coder`）。
+  - 界面：各智能体那一栏多出一行「编码主控 / 编码」，下面加一句事实说明
+    「编码这一组的规划、评审，分别复用「方案」「审查」两行」——**四个角色都有出处，只有两行要配**。
+- **关键决策**：复用而不是新增四行 —— planner / reviewer 的 `.env` 默认（glm / kimi）与
+  「方案」「审查」两行的默认本来就一致，复用它两个角色既能配、又不引入两份同义的行。
+- **验证**：`pytest` **1365 passed**（改了 `test_model_config.py` 里那两条钉映射与行名的断言）。
+  前端 build（含 `vue-tsc`）通过。
+  **真机验过三种状态**（`_probe_coding_roles.py`）：① 一行没配 → 四个角色各回 .env 默认
+  （主控/planner=glm-5.3、coder=deepseek-v4-pro、reviewer=kimi-k2.6）；② 只配「编码主控」与「编码」
+  两行 → 主控与 coder 跟着变，**planner / reviewer 不受影响**；③ 再改「审查」那一行 →
+  reviewer 跟着它变（复用关系成立）。
+- **没验证的**：界面上那一栏的观感（没有浏览器）。
+
+#### 模型弹窗三点收口：换供应商就清空、基本设置只留阈值、模型清单从页面撤掉
+
+- **动机**（用户三点）：① 「供应商一旦切换，那配置项全部清空」；② 「基本设置里，上下文窗口部分，
+  只留阈值的配置就可以了」；③ 「模型配置里，供应商的模型清单列表是不需要的」。
+- **改了什么**：
+  - **换供应商＝清空**（`pickProvider`）：模型名 / key / 窗口 / 刚拉到的实时清单 / 探测反馈全清 ——
+    它们都属于上一家，留着就是错的数据；地址换成**新那家的默认地址**（选中供应商的意义就在这儿），
+    那家没配地址就留空。
+  - **基本设置的「上下文窗口配置」只剩两条阈值**（告警线 / 危险线）：兜底窗口与五家供应商窗口
+    从 `RUNTIME_SETTINGS` 里撤掉（`.env` 那几格仍生效，只是不再上界面）。理由与这批的主题一致：
+    窗口是**模型**的属性 —— 按模型查（`provider_models`）→ 行内手填覆盖 → 兜底值。
+  - **页面上的「供应商的模型清单」整块撤掉**：它的用途（拿候选、看/改窗口）现在都在弹窗里 ——
+    弹窗第三类「模型 / 窗口大小」旁边多了个「**刷新清单**」按钮（点了才拉，拉完候选与窗口回显
+    都跟着更新）。顺手清掉只给它用的 `.model-*` 样式与 `toggleModels` / `saveModelWindow`。
+- **验证**：`pytest` **50 passed**（跑的是受影响的两个文件：`test_app_settings.py` 里那几条
+  跟着改成「阈值两条」，另加一条断言「上下文那一组正好两条」；`test_provider_models.py` 不动）；
+  前端 build（含 `vue-tsc`）通过；`rg` 确认 `.model-*` 与那几个函数已无引用。
+- **没验证的**：弹窗与列表的实际观感（没有浏览器）。
+- **仍等你拍的一件事**（上一批提的）：**编码那一组要不要拆成四行**（主控 / 规划 / 编码 / 评审）——
+  现在四个角色共用「编码」这一行，一旦配了它，coder 的 deepseek 与 reviewer 的 kimi 默认就都被顶掉。
+
+#### 模型弹窗：保存挪进弹窗、选完模型回显窗口；顺带答复「编码一主三从的模型怎么共用」
+
+- **动机**（用户三点）：① 「保存按钮要位于每个配置弹窗的内部」；② 「选择完模型后，对应的上下文长度
+  就要开始调用了，然后回显」；③ 问「编码智能体是一主三从，现在配置的编码智能体，主控和编码是共用
+  一个吗」。
+- **改了什么**：
+  - **保存进弹窗**：`ModelConfigDialog` 底部变成「恢复默认 | 关闭 | **保存**」，保存只提交**这一行**
+    改过的字段，成功后关掉弹窗（弹窗开着而没保存是两处状态，容易让人以为已经生效）。页面顶栏那个
+    保存按钮**只留给「基本设置」**（模型那一栏不再有页面级保存）。
+  - **意图识别那一关**（JEV / 大模型）是个下拉、没有弹窗可放保存按钮 → 改成**改完当场存**。
+  - **选完模型回显窗口**：模型名那一格失焦/选定后，让父组件确保这家的清单已拉过（没拉过才拉），
+    然后按模型名在清单里查窗口并**回显**：窗口输入框下面一行写「按模型查到 1048576」，
+    同时把它塞进占位符（`留空＝按模型查（1048576）`）。查不到就说「这个模型还没登记窗口：
+    去清单刷新一次，或手填」；手填过则写「这一行手填了，按它算」。**不自动填进输入框** ——
+    留空＝按模型查，填上＝覆盖，这两种语义要分得开。
+- **③ 的答复（现状与代价）**：`llm._AGENT_KEY` 里 `orchestrate`（主控）、`planner`、`coder`、
+  `reviewer` **四个角色都指向 `coding` 那一行** —— 所以**是共用一个**。而 `.env` 那套默认是
+  四个角色各用各的（主控/planner=glm、coder=**deepseek**、reviewer=**kimi**），于是：
+  **一行都没配时行为不变**；一旦在界面上配了「编码」这一行，四个角色全用它 ——
+  coder 不再用 deepseek、reviewer 不再用 kimi。这是这次改动里发现的**信息损失**，
+  要不要拆开（拆成主控 / 规划 / 编码 / 评审四行）等你点，见下。
+- **验证**：`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过；`pytest` **1365 passed**
+  （这两点是前端，后端没动）。
+- **没验证的**：弹窗与回显的实际观感（没有浏览器）。
+- **等你拍**：**编码那一组要不要拆成四行**（主控 / 规划 / 编码 / 评审）？
+  a（推荐）拆 —— 恢复「每个角色配各的」的可配性，动 `_AGENT_KEY` + 那几行登记 + 界面分组 + 测试；
+  b 保持一行，但在界面上写明「主控与三个子智能体共用这一行」。
+
+#### 回复最上面加「working… 计时」；模型配置页改成「一行一句 + 三类弹窗」
+
+- **动机**（用户口径）：① 「加一个执行时间计时，放在 AI 回复的最上面，就叫 working…；页面打开场景下
+  就直接计时，未打开场景下突然打开，从现在开始计时 + 从用户发的消息算，不需要很精确」；
+  ② 「模型设置页面要调整一下，现在信息太多太乱 —— 问答模型只显示模型名称和配置按钮，没配置就只显示
+  配置按钮；点配置弹窗，分三类展示：供应商 / base_url+apikey / 窗口大小」。
+- **改了什么**：
+  - **计时**：`Message` 多两格 —— `startedAt`（这一轮从什么时候开始跑的）与 `elapsedMs`（跑完冻结的
+    总时长）。自己发的那轮取发送时刻；**重新打开时正跑着的那轮取用户那条消息的时间**（于是显示的是
+    「这一轮已经跑了多久」，而不是「我看了多久」）。回复最上面一行：跑着是 `working… 12s`（秒针只在
+    有活在跑时开，跑完停掉），跑完冻结成 `用时 12s`；刷新回放时照实显示落库前后的那个数。
+  - **模型配置页**：列表里一行只留「名字 + 模型名（配过才有）+ 配置按钮」；点「配置」弹出
+    `ModelConfigDialog.vue`，**三类**：① 供应商（分组下拉）② base_url / api_key（+「测试连接」与它的
+    反馈）③ 模型 / 窗口大小。原来那个把六格摊在页面上的 `ModelRow.vue` 删掉（连同只给它用的
+    `.mrow*` / `.field-action` 样式），`.chip` 等通用件留着给弹窗用。
+    保存仍是页面顶栏那一个按钮（弹窗只改草稿、点「完成」关掉）—— 一个页面一套提交口径，
+    不让「改了但没保存」有两处来源。
+- **关键决策**：**不引任何东西**做计时（`setInterval` + 一个 `nowTick`），也不为弹窗引组件库 ——
+  复用既有的 `.field/.input/.btn/.chip` 与设计令牌。弹窗里 `模型` 与 `窗口大小` 合成第三类，
+  因为窗口本来就是**模型**的属性（与上一批「按模型查窗口」同一个口径）。
+- **验证**：`pytest` **1365 passed**（这两项是纯前端，后端没动）；`npm.cmd --prefix frontend run build`
+  （含 `vue-tsc`）通过；`rg` 确认 `ModelRow` 与 `.mrow*` 已无引用（模板与样式都清干净），
+  三个新/改组件的类名与 CSS 交叉核对无缺口。
+- **没验证的**：这两块的实际观感（没有浏览器）—— 请刷新看一眼：计时那一行是否够轻、
+  弹窗三类分组是否清楚、列表里「没配过」的行是否只剩按钮。
+
+#### 上下文窗口改成「按模型查」：新增供应商的模型详情表 + 刷新按钮
+
+- **动机**（用户口径）：「上下文长度本质上是和模型相关的，不是和供应商相关的，应该用模型去查对应的
+  上下文长度」；并给了表的形状：「不需要 model_context 表，而是**供应商的对应的模型详情表** ——
+  每个模型的名字、上下文长度、归属供应商、模型类型；界面上提供刷新按钮，**不主动刷新**」。
+  **这条是真的会出错**：同一家 `glm-5.3` 是 1M、`glm-4.6` 是 128k，按家取值时同一家里两个智能体
+  配不同模型会拿到同一个窗口 —— 压缩线被推到错的地方，请求早在真窗口之外就报错了。
+- **改了什么**：
+  - **新表 `provider_models`**（迁移 `f4a5b6c7d8e9`）：`provider`（外键 → `model_providers.provider`，
+    即**稳定键**）+ `model` 组成主键，另有 `model_type` / `context_window` / `source`
+    （`probe`/`manual`/`seed`）/ `status` / `updated_at`。迁移顺手把 `model_providers.default_models`
+    那串名字**逐条搬进新表**（类型按名字判、窗口未知记 0、来源 `seed`）——那列不动，但从此不再被读。
+  - **类型**（`model_types.py`）：`chat` + `embedding / rerank / image / video / audio / other`
+    （`other` 是我加的：OCR / 审核这类不该掉进 chat 里、出现在下拉中）。判据只能按名字
+    （`/models` 不回类型）—— 原来那套「非文本直接丢」的片段规则搬过来并按类型归好，
+    **顺手修了一个次序 bug**：`bge-reranker` 会先命中 `bge-` 被判成向量，所以重排要在向量之前判。
+  - **窗口解析改成**：① 那一行显式填的 → ② 按 **`(供应商, 模型)`** 查 → ③ 按**模型名**全局查
+    （治自建网关：地址对不上任何一家，但同名模型的窗口一样）→ ④ 家那格（`.env`，降级为兜底）
+    → ⑤ 兜底值。模型那份是**内存镜像**（`Settings.provider_models`），因为 `resolve_window` 是同步函数。
+  - **刷新按钮**（`POST /model-config/providers/{p}/models/refresh`）：拿这家的地址去调清单接口，
+    结果**逐条 upsert**（非文本也落表并标类型）；key **借用现有 agent 行的**（一行都没配就看
+    `.env` 里这家的凭据）——用户口径：借用 agent 的就行，不新增第二处凭据存放点。**点了才刷**。
+  - 另有 `GET .../models`（清单）与 `PUT .../models`（手填/手改窗口、类型、启停，记 `source=manual`）。
+    刷新**不删**本地多出来的行（可能是老模型或别处在用）；`context_window=0` **不覆盖**已有的非 0 值
+    （很多入口不回窗口，照写会把之前读到的抹掉）。
+  - **界面**：设置页「模型配置」末尾多一块「供应商的模型清单」——一家一行（模型数 + 「查看/刷新」），
+    展开是模型列表（名字 / 类型 / **窗口可直接手改**）；「模型」输入框的候选改成
+    「刚拉到的实时清单 → 这家已登记的文本模型 → 种子那串名字」。
+- **关键决策**：窗口的**权威顺序**把「行内显式」放在最前（专治特例），然后是模型表；供应商那格只做兜底，
+  这样 `.env` 旧配置行为不变（一行都没配时结果与以前逐字相同）。
+- **验证**：`pytest` **1365 passed**（新增 `tests/test_provider_models.py` 33 条：17 组名字→类型、
+  类型集合、六种窗口解析情形（含「禁用模型不算数」「自建网关按名查到」「行内覆盖最优先」）、
+  清单/刷新/手改/未知供应商/坏类型/无地址/拉不到 409 且不写半条、**空窗口不覆盖已有值**）。
+  `ruff` 干净；前端 build 通过。
+  **真机验过**（真拉两家 + 真库）：`deepseek` 读到 2 个模型且**入口真回了窗口**
+  （`deepseek-flash` / `deepseek-v4-pro` 都是 1048576，落表 `source=probe`）；
+  `glm` 读到 11 个模型、**入口不回窗口**（留「未知」并提示手填 —— 这正是那张表存在的理由）；
+  库 `provider_models` 里 deepseek 3 条（2 条 probe + 1 条 seed 保留）；窗口解析按角色复核：
+  plan/orchestrate(glm-5.3)=1048576、review(kimi-k2.6)=262144、qa(gpt-5.6-luna)=128000（模型表里
+  那条窗口是 0 → 退回家那格）。
+- **没验证的**：设置页那一块的实际观感（没有浏览器）。
+- **遗留**：① `model_providers.default_models` 那列留着没删（回滚要能回去），但已不再被读；
+  要不要彻底删列，等你说；② 模型清单只支持「刷新 / 手改」，没有删除与批量停用。
+
+#### 消息下挂「这一轮改了什么」：在**本地代码缓存**里算 PR 的 diff，可点开看单个文件
+
+- **动机**（用户口径）：六条里的 ② —— 「每次改动代码后，把带动的那部分（git diff 的文件列表）
+  放到 AI 的消息下边」，要能**点开看 diff**；并且「只针对改了代码的场景」。**只看已提交的**：
+  用户明确「展示的前提是代码写完并提了 PR，不存在未提交就该展示的场景」。
+- **改了什么**：
+  - **数据源是宿主机那份代码缓存**（`repo_cache`，代码面板用的同一份裸仓），**不碰沙箱**
+    （用户口径：「本地有缓存的代码，为什么不能本地执行 git diff」—— 对，就该这样；顺带的好处是
+    **沙箱被回收之后这些 diff 照样点得开**，而沙箱里算的方案做不到）。
+  - `repo_cache` 新增 `compare()`（`base...head` 的文件清单：`--numstat` 给增删行数 +
+    `--name-status` 给状态码，按路径并起来）与 `file_diff()`（单个文件的正文，路径先过
+    `clean_path`）；两支分支都过 `_resolve_ref`（挡住不存在的分支与 `-` 开头的参数注入）。
+    **三点式 `...` 而不是两点式**：PR 讲的是「相对共同祖先改了什么」，两点式会把 base 上
+    别人新提交的内容算进来。
+  - **base / head 取 `create_pr` 的入参**（`_pr_refs`：dict 与 JSON 字符串两种形状都认）——
+    那是**这一轮 PR 自己的声明**，既不用回头猜「最新那个 PR」，也不用多打一次平台接口。
+  - 收尾时算一次：本地还没缓存过这个仓库 → 整块不出现（一次 clone 可能很大，不该塞在对话收尾里）；
+    缺那两支分支（coder 刚推的）→ 先 `sync()` fetch 一次再算（顺带刷新代码面板）；
+    算不出来只记日志，**不影响本轮收尾**。文件数超过 200 只列前 200 并带上真实总数。
+  - 结果写进这一轮记录的 `extra["changes"]`（只存**文件清单**，不存 diff 正文 —— 历史记录不该被
+    几兆的 diff 撑大），并推一帧 `{"type":"changes"}`，紧挨在收尾那帧 `usage` 之前。
+  - **界面**：消息底部多一块（只有建成 PR 的轮次才有）—— 折叠时一行
+    `改动 3 个文件 · +42 −7`，点开是文件列表（一位状态码 A/M/D + 路径 + 增删行数），
+    **再点某个文件**才去拉它的 diff（`GET /sessions/{id}/repo/diff`，等宽、+/− 着色、
+    超过 20 万字符显式截断并说明）。刷新页面走记录的 `extra.changes` 回放，同一套渲染。
+- **关键决策**：
+  - **不落 diff 正文，只落清单**：正文按需拉（拉的时候顺带脱敏 + 上限），历史记录保持小。
+  - **脱敏口径与日志/记录一致**：会话令牌 + 该平台的兜底令牌 + 模型凭据（`secret_terms`）。
+  - **不展示未提交的改动**（用户明确的口径）；因此也不需要「轮次起点 HEAD」这种记账 ——
+    两边都由 PR 声明。
+- **验证**：`pytest` **1332 passed**（新增：`tests/test_turn_changes.py` 15 条 —— base/head 两种入参
+  形状与坏输入、本地无缓存则不出现、清单与状态、缺分支先 fetch 再重试一次、失败不影响收尾、
+  文件数上限、**建了 PR 才推那一帧且紧挨在收尾账之前**；
+  `tests/test_repo_cache.py::TestCompare` 5 条（真 git：文件清单与状态、同一支为空、
+  没同步过说人话、只看一个文件、`..` 路径被拒）；
+  `tests/test_repo_routes.py::TestDiffForAFile` 4 条（接口层：正例、缺分支 409、没缓存 409、
+  越界路径 409））。`ruff` 干净；前端 build（含 `vue-tsc`）通过。
+  **真机验过**（用你本机已有的 `wanqi-mall` 缓存，14 支分支逐支跟 master 比）：
+  已合入的分支都是 **0 个文件**（三点式语义正确），未合入的两支分别 **18 / 9 个文件**；
+  对 `README.md` 取 diff 也正常返回（`+### 3.4 用户登出黑名单降级验证…`）。
+- **没验证的**：这一块在聊天里的**实际观感**（没有浏览器）—— 请刷新后找个建过 PR 的轮次看看
+  那一行的位置与展开后的样子。
+
+#### 基本设置的运行期配置（代码缓存 / 上下文窗口）＋ 配置热生效（不再重启）
+
+- **动机**（用户口径）：「沙箱镜像加速地址不用了；代码缓存就两个 —— **默认分支**和**代码缓存路径**；
+  上下文窗口按你列的来；**热生效**，每次都创建一个新的 agent 就行，不缓存 agent」。
+- **改了什么**：
+  - **新表 `app_settings`**（迁移 `e3f4a5b6c7d8`，键值对）+ `GET/PUT /app-settings`。键与类型只认
+    `config.RUNTIME_SETTINGS` 那一张表（分组 / 中文名 / 类型 / 落到 `Settings` 哪个字段都在那儿），
+    认不出的键或转不动的值回 400、**不落半格**。新路由前缀同步加进了 `vite.config.ts` 的 proxy。
+  - **两类，按用户口径**：**代码缓存配置** = 代码缓存路径（`repo_view_dir`）+ 默认分支（Gitee / GitHub
+    各一格）；**上下文窗口配置** = 告警线 0.6 / 危险线 0.8 + 兜底窗口 + 五家供应商窗口。
+    界面：设置页「基本设置」里两组各一行一个输入框，改过的格子标「已改过」，顶栏「保存」写入。
+  - **热生效怎么做的（两半）**：① 值赋回**同一个 `Settings` 实例**（读那些字段的地方一行都不用改）；
+    ② **主智能体每轮现建、不缓存**（`session/manager.py::get_agent` 去掉了按形态的缓存，
+    `SessionRuntime` 不再持有 `agents`）—— 模型与窗口都是建实例时读的，缓存住就换不动。
+  - **顺手把「模型配置」也接上热生效**：`put/delete_model_config` 写完之后当场 `apply_model_endpoints`
+    刷新内存那份，并且那个函数改成**先清空再落**（否则「恢复默认」会在内存里留下幽灵连接）；
+    界面上那句「重启后端后生效」改成「已保存，下一轮生效」。
+  - **默认分支真的被用上了**：`repo_cache.default_branch()` 现在是「**设置页配了就用它** → 远程探测
+    → master」，并把 `GITEE_BASE_BRANCH`/`GITHUB_BASE_BRANCH` 的代码默认值与 `.env.example` 改成
+    **留空**（留空＝按远程探测，推荐）。你 `.env` 里现在是 `master`/`main`，与你自己两个仓库的默认
+    分支一致，所以行为不变；想让某个仓库跟随远程，把那一格清空即可。
+  - `resolve_window` 的兜底从写死的常量改成读 `settings.fallback_context_window`（填 0 仍退回常量：
+    窗口 0 会让压缩永不触发）。
+- **关键决策**：
+  - **不做镜像加速地址**（用户明确不用了），也没动沙箱资产推入那套。
+  - **不加 TTL 缓存**：值就在内存里，写入路径（PUT）自己刷新，启动时再读一次；直接改库时打开设置页
+    （GET）也会重新落一遍 —— 不需要「隔几秒回源」这种机制。
+  - **环图的告警线由服务端给**：`_turn_context` 把 `warn_ratio` / `alert_ratio` 一起发下来，
+    前端不再写死 0.6 / 0.8（阈值只有一个出处，改设置页立刻影响环图变色）。
+- **验证**：`pytest` **1308 passed**（新增 `tests/test_app_settings.py` 17 条：键表指向真实字段 /
+  只认三种类型 / 类型转换与非法值 / 落值 / 坏行不连坐 / GET 列全并标 source / PUT 当场生效且不动别的键 /
+  GET 会把库里的值重新落 / 认不出的键与坏值 400 且不落半格 / 空串是合法值 / 兜底窗口跟着设置 /
+  默认分支跟着设置 / **`SessionRuntime` 不再持有 agents** 与**两次调用两个实例**；
+  另改 `test_profiles.py` 那个「按形态缓存」的用例类为「每次现建」、并在 `test_model_config.py`
+  加 2 条「保存/恢复默认当场刷新内存」）。`ruff` 干净；前端 build（含 `vue-tsc`）通过。
+  **真库验过**（ASGI 直接打路由）：GET 回 11 格（两组）、`source` 全 `default`；
+  `PUT glm_context_window=262144` → 库里有行、`source=db`，**同一个进程里 `Settings` 当场就变成
+  262144**（没重启）；验完把探针写的那行删掉、值落回 1048576，库是干净的。
+- **没验证的**：设置页那一屏的实际观感（没有浏览器）—— 请刷新看看两组输入的排布与「已改过」标记。
+- **遗留**：① 「模型配置」现在是**下一轮**生效（正在跑的那一轮不换）—— 与 backlog 1.1 的「热切换」
+  基本等价，落地后再看要不要把 1.1 关掉；② 六条里的 ②（消息下挂 git diff 文件列表）还没做，下一步。
+
+#### 聊天区四件：token 动态推帧、末行标模型、上下文环图、刷新回到原页
+
+- **动机**（用户六条里的 3 / 4 / 5 / 6）：① token 消耗要**通过 SSE 动态返回**；② AI 回复最下边
+  要有**回答的模型**；⑤ 上下文使用情况改**饼图**、放在**发送框右边**；⑥ 刷新**回到原来那一页**
+  （刚才在设置页，刷新还在设置页）。剩下两条（基本配置扩项、消息下挂 git diff 文件列表）
+  按用户给的补充口径单独做，见文末。
+- **改了什么**：
+  - **动态推账（③）**：`server/service.py` 在 `message-finish` 与 `tool-finished` 两处各推一帧
+    `{"type":"usage"}`，`_live_usage()` 按 `_USAGE_FRAME_MIN_GAP`（0.5s）节流。前端那条分支本来就
+    在更新消息角标，界面不用改 —— 数字会跟着跑起来长。收尾那一帧仍在最后（权威值）。
+    **顺手修了一个真 bug**：`_turn_context` 的压缩次数是 `+=`，中间帧要多算几次就会重复累加
+    → 加了 `commit=False` 的只读路径（连 `_context_state` 里那一格都不建），收尾才落账。
+  - **末行标模型（④）**：`agent/llm.py` 新增 `resolve_model()`（与 `resolve_window` 同一套优先级：
+    unified → 该智能体那一行 → `.env`），`_turn_usage` 把它写进 `usage.model`（每帧都带），
+    前端把模型名放进消息**末行**（与时间同一行，形如 `glm-5.3 · 20:14`）。
+    **不受「显示用量」开关影响** —— 它是「谁答的」，不是账。
+  - **上下文环图（⑤）**：输入框上方那条 `ctxbar`（横条 + 一句常驻文字）**去掉**，改成发送框右边的
+    SVG 环图（`pathLength="100"` 让 dasharray 直接用百分比）；<60% 中性、≥60% 警告色、≥80% 危险色
+    （阈值与服务端算 `ratio` 的口径一致），原来那些文字挪进 `title`/`aria-label`，信息没丢。
+  - **刷新回到原页（⑥）**：新增 `frontend/src/viewState.ts` —— 「在哪一页」记在 URL hash 上
+    （`#settings/basic|look|models`，空 hash ＝ 聊天）。用 hash 不用 localStorage：不会发到服务端
+    （后端零改动）、刷新天然还原、还能贴给别人；**写用 `replaceState`**，否则在设置里点三个面板
+    要按三次返回才回聊天。当前栏位由 `App.vue` 持有（它负责写 hash），`SettingsPage` 改成收 prop + 发事件。
+- **关键决策**：
+  - **只推本轮累计**（用户口径）。会话累计仍在右栏 Token 面板，那里是聚合视图、数据源是各轮记录。
+  - **模型名标的是「解析值」**：真走了兜底这里不体现 —— 兜底是运行时的第二跳，账与调用都记在同一个
+    角色名下，实测的 v3 事件载荷里没有「这次是谁答的」这一格。schema 注释里写明了这一点。
+  - **不引路由库**：总共两页，一个 hash 够用。
+- **验证**：`pytest` **1289 passed**（新增 4 条：末行模型名按形态取、中间帧不写跨轮累计、
+  0.5s 节流、**跑动中确实推了中间帧**（至少 3 帧且最后一帧是收尾那帧）；另改了 3 条原来钉
+  帧序列的用例，改成「不看 usage 帧数量、只看它排在最后」）。`ruff` 干净；
+  `npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过。
+  **hash 逻辑拿真代码验过**（`tsc` 编译 `viewState.ts` 后用 node 跑）：9 个解析用例
+  （空 / `#` / `#settings` / 三栏 / 大小写 / 认不出的栏位 / 认不出的 hash）全对，
+  写回序列也验了「同值不重复写」与「回聊天清掉 hash」。
+- **没验证的**：环图与末行模型名的**实际观感**（这台机器没有浏览器）—— 请刷新看一眼：
+  环图在发送框右边是否对齐、60%/80% 换色是否符合直觉、模型名与时间同一行是否够轻。
+- **遗留**：六条里的 ①（基本配置扩项）与 ②（消息下挂 git diff）见下一条。
+
+#### 「测试连接」拉回来的清单只留文本模型
+
+- **动机**（用户口径）：「查询出来的模型只需要文本模型，不需要其他的类型，需要过滤一下」。
+- **改了什么**：`api/routes/model_config.py` 新增 `_NON_TEXT_MARKERS` + `is_text_model()`，
+  并把「解析 ``/models`` 返回」抽成 `parse_models()`（HTTP 那半仍在 `fetch_provider_models` 里）——
+  解析完就地滤掉图像 / 视频 / 语音 / 向量 / 重排 / OCR / 审核这些非文本模型。
+- **关键决策**：
+  - **只能按名字判**：OpenAI 兼容的 ``/models`` **只回名字、没有类型字段**（实测这台网关回 888 个
+    名字、一个类型字段都没有），所以用片段匹配而不是整词 —— 厂商命名基本是
+    ``<系列>-<版本>-<档位>``，片段才盖得住 ``gpt-image-2.5-sunburst`` / ``doubao-seedance-2-5`` /
+    ``text-embedding-3-small`` 这些写法。
+  - **宁可漏、不可误杀**：凡是「既是文本又是别的」的片段一律不进表 —— `seed`（`doubao-seed-2-1-pro`
+    是聊天模型）、`vl` / `vision` / `omni`（多模态**聊天**）、`flash` / `mini` / `lite`（只是档位）、
+    裸 `wan`（只认 `wanx` / `wan2`）。误杀文本模型比漏掉一个图像模型更难发现。
+  - **只筛拉回来的实时清单，不筛手写的 `default_models`** —— 那是人挑过的，写进去又看不见才叫怪。
+- **验证**：`pytest` **1285 passed**（新增：非文本 35 个名字必须被滤、文本 21 个名字必须留下、
+  两种返回形状 + 窗口取值、坏 payload 回空）；`ruff` 干净。
+  **真机验过**（用 `.env` 里那个网关的实时清单）：厂商回 **888** 个 → 留 **743** 个文本模型、
+  滤掉 **145** 个；按命中片段归类逐个看过，**没有一例误杀**：
+  `image` 39、`realtime` 17、`audio` 12、`tts` 11、`gpt-image` 11、`wanx` 9、`seedance` 9、
+  `video` 6、`seedream` 6、`kling` 6、`wan2` 5、`embedding` 4、`transcribe` 3、`sora` 2、
+  `dall-e` 2、`whisper` 1、`banana` 1、`seededit` 1。留下的头几个是
+  `gpt-6.1-sol` / `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` / `gpt-5.6-luna`。
+- **要你做的一件事**：**重启后端**（同上一批改动一起生效）。
+- **遗留**：网关把同一代模型的**日期快照**也全列出来了（`gpt-5.5-2026-04-23` 这种），现在会一起
+  留在候选里 —— 数量多但都是文本模型。要不要再收一道（只留不带日期后缀的别名 / 或每个系列只留最新
+  几个）？这属于口味问题，等你说。
+
+#### 目录改成「每条请求现读库」＋「测试连接」的门槛只认地址与 key
+
+- **动机**（用户两个问题）：① 「这个目录的作用是什么，不可以直接读库嘛」；② 「只要有 apikey 和
+  base_url，就可以支持测试连接的功能」。
+- **目录是干什么的**（回答①）：它就是界面上「提供商」那一栏 —— 下拉里有哪些家、选中带出哪个地址、
+  拉清单走哪个路径与鉴权头、拉不到时给哪几个候选名字、分组排序与启停。**它不参与运行时**：
+  不决定谁用哪个模型，也不影响任何 LLM 客户端。当初放进内存只有两个理由（启动时「表为空灌一次
+  种子」本来就得读写库；当时把「改完要重启」当成统一口径）—— 没有一条要求它必须缓存。**所以改成现读库。**
+- **改了什么**：
+  - `config.py`：把排序抽成模块级 `sort_provider_metas()`（启用项 + `ui_group → sort_order →
+    provider`），现读库那份与内置兜底那份共用同一个出处；`Settings.provider_metas()` 降级为
+    **兜底**（读库失败 / 根本没有种子文件的老环境）。
+  - `api/routes/model_config.py`：新增 `_provider_metas(settings, db)`，`GET/PUT/DELETE /model-config`
+    与 `POST /model-config/probe`、`/providers/reload` **全都现读库**。读库失败只告警并退回启动时
+    那份 —— 一个下拉框不该让整页打不开。
+  - `POST /probe` **不再看 `is_dynamic_model_list`**：只要发得起请求就发（拉不到是预期结果之一，
+    照旧回内置候选 + 错误原文）。
+  - 接口瘦身：`ProviderOption` 去掉 `is_dynamic_model_list` 与 `requires_key`（前者不再影响任何行为、
+    后者被「地址 + key」这条口径取代）；前端 `ModelRow.vue` 的「测试连接」**永远显示**，
+    缺 `base_url` 写「先填 base_url 再测」、缺 key 写「先填 api_key 再测」，两样齐了就置灰解除。
+  - 种子文件：把你在库里手填的两个地址同步回来（MiniMax / 小米 MiMo）—— 否则谁打一次 reload
+    就会把它们冲成空。`is_dynamic_model_list` 的注释改成「纯标注位」。
+- **关键决策**：
+  - **不改 `model_endpoints` 的生效时机**。「模型连接」那八行仍然启动时读进 `Settings.agent_models`
+    （它要影响正在跑的智能体，属于热切换，见 `docs/backlog.md` 1.1）；**只有目录改成现读**。
+    两者字段都在设置页里，所以界面上的差别是：改库后目录刷新即见，模型连接要重启。
+  - `is_dynamic_model_list` **保留**（表里那一列、种子里那几行都不动），但明确降级为标注位
+    「这家官方有没有 `/models`」；它的**唯一**作用是不再有作用 —— 想删列要单独给迁移，不值得
+    为它再动一次表结构。
+- **验证**：`pytest` **1227 passed**（新增 3 条：目录每条请求现读、坏目录退回兜底、探测不受开关
+  影响；另改了 4 条原来靠 `settings.providers` 喂数据的接口测试）；`ruff` 干净；
+  `npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过。
+  **真库上端到端验过**（ASGI 直打路由，**故意不跑启动装配**）：
+  ① 第一次请求就回 13 家（＝库里当前的行数，说明不靠启动缓存）；
+  ② `UPDATE model_providers SET display_name='★临时改的名字' WHERE provider='custom'` 之后
+  **下一个请求**就回新名字，进程没重启、页面没刷新（验完已还原）；
+  ③ 对小米（库里那行 `is_dynamic_model_list=false`）探测 —— 请求真的发出来了
+  （`base_url=https://api.xiaomimimo.com/v1`、`path=/models`、`Authorization: Bearer`），
+  结果 `ok=true / source=live`。
+- **要你做的一件事**：**重启后端**（这次改的是后端路由，vite 热更新不够）。前端刷新即可。
+- **发现一件事，需要你确认**：库里现在是 **13 行** —— 你删掉了 `anthropic`、`step`、
+  **`gpt`（自用网关）** 三行。那两行没有地址、删掉合理；但 `gpt` 那一行是 `.env` 里你正在用的
+  网关地址（删它不影响运行，出厂默认仍走 `.env`）。**种子文件里这三节我暂时没删** ——
+  一旦有人打 `POST /model-config/providers/reload`，它们会被重新插回库里。要不要我把这三节
+  也从种子文件里删掉（让文件与你现在的库一致）？你说一声就改。
+
+#### 提供商目录按用户给的清单补齐：16 家，地址/模型名都填上
+
+- **动机**（用户口径）：「各家提供商对应 OpenAI 的模型配置我已经写到 config 目录下另外一个文件中了，
+  你根据这个，填充一下提供商和默认的 url」—— 源文件是 `config/20261014161953.md`。
+- **改了什么**：`config/model_providers.toml` 重排成 16 家（国内 10 + 海外 5 + 逃生口 1），
+  `default_base_url` 与 `default_models` 按源文件填；`tests/test_model_config.py` 里钉种子内容
+  的那条断言跟着改成新事实，并新增一条「种子文件形状」检查（键唯一且合法、地址是干净的 https、
+  模型名无空白、**国内分组整组排在海外分组前面**）。
+- **关键决策**（都是「源文件没写就不编」的落地）：
+  - **没给地址的留空 + 标 `# TODO`**（Anthropic / MiniMax / 小米 MiMo / 阶跃星辰 / 科大讯飞星火），
+    界面照常出现这一项、模型候选也在，只是地址要用户自己填 —— 猜一个地址写进去，代价是用户点
+    「测试连接」拿到 404。
+  - **Qwen 是唯一一处「我补的地址」**：源文件只在正文里提到百炼平台、没给 base_url，这里填的是
+    百炼的 OpenAI 兼容入口 `https://dashscope.aliyuncs.com/compatible-mode/v1` 并**在文件里标了
+    「请核对」**。Kimi 同理由：地址沿用 `.env` 里正在用的那个。
+  - **`gpt` 与新增的 `openai` 是两个入口，不是重复**：`gpt` 是 `.env` 里那个自用网关
+    （实测 /models 能列出来，候选清单写的是实测见到的名字），`openai` 是官方直连
+    （`https://api.openai.com/v1`）。**同一个 key 拿错边会 401**，所以把显示名区分为
+    「GPT（自用网关）」与「OpenAI 官方」，而不是把原来那一项改指官方 —— 那会让你现在能用的
+    那一项变成一把打不开的钥匙。
+  - **`is_dynamic_model_list` 按源文件那条口径分**：文件说 OpenAI / Anthropic / Gemini / DeepSeek /
+    火山方舟这类**有 `/models`** 的给 `true`（界面给「测试连接」）；文件说「国内厂商模型名变化快、
+    规范不统一 → 本地维护」的那几家（混元 / MiniMax / MiMo / 阶跃 / 星火）给 `false`，
+    界面直接用候选清单、不给一个点了多半会失败的按钮。
+  - **Mistral 没建条目**：源文件自己写着「未取到最新模型名」，地址和模型都没有 —— 加了就是个空壳。
+- **验证**：`pytest` **1225 passed**（新增 1 条形状检查 + 改了 1 条内容断言）；
+  `ruff check tests/test_model_config.py` 干净。真库上跑了
+  `app.reload_model_providers`（幂等）：**表里 16 行**，分组与排序与文件一致
+  （国内 10/20/…/100 → 海外 110/120/…/150 → 无分组 900），`/model-config` 的同一段代码回出来的
+  顺序也一致。种子解析打印过一遍，地址与模型名逐条对上。
+- **要你做的一件事**：**重启后端**（或对着跑着的那份 `POST /model-config/providers/reload`）——
+  这次对齐的是库，正在跑的进程里的 `Settings.providers` 还是旧的。前端刷新即可。
+- **遗留**：① 5 家地址待补（文件里已标 TODO），补完再跑一次 reload 即可；
+  ② 你 `.env` 里在用的模型名（`deepseek-flash` / `gpt-5.6-luna` 等）**没有动** —— 那是运行时的
+  出厂默认，与「界面上可选的候选清单」是两回事；要跟着换新代模型名的话，改 `.env` 再重启。
+
+#### 设置改成工作台：左菜单三栏（基本设置 / 外观 / 模型配置）＋深色主题
+
+- **动机**（用户口径）：「设置里，基本设置、外观、模型配置，放在左侧，每个菜单单独展开，
+  像工作台的样子」。上一版虽然是整页，但只有模型配置一栏、全堆在一列里。
+- **改了什么**：
+  - **工作台骨架**：`SettingsPage.vue` 左菜单三项 + 右内容区（`--settings-max` 960 → 1120，
+    菜单 200 + 内容自适应）；<720px 菜单改成横向可滚的标签条，<640px 设置项上下堆叠。
+    菜单是数组驱动的，以后加一栏只加一行。**不引路由**，切换是页面内状态。
+  - **基本设置**（用户点名要的两项，**不做 JEV** —— 意图识别整块留在模型配置里）：
+    ① 默认打开的右栏标签（以前每次加载都回「代码」）；② 恢复默认布局（两个栏宽 + 收起状态
+    + 退出右栏全屏；只改 `usePanelWidth` 的状态，落盘照旧走它自己的 watcher，不写第二套口径）。
+  - **外观**：主题（浅色 / 深色 / 跟随系统）、代码字号（12–16，默认 14）、对话列宽
+    （紧凑 / 标准 / 宽，标准档就是原来那个 `clamp(760px, 60vw, 1400px)`），都是**改完立刻生效**。
+  - **偏好存在本机**：新增 `frontend/src/prefs.ts`（localStorage，容错读写真到一个 try/catch，
+    隐私模式下记不住也不白屏），`main.ts` 在挂载**之前**调 `initPrefs()` 落到 `<html>` 上，
+    免得先按默认画一帧再跳。`App.vue` 的初始右栏标签改成读这个偏好。
+  - **深色主题**：只换令牌、不换结构（组件里没有一处判断主题）。`style.css` 末尾加
+    `:root[data-theme='dark']` 覆盖全部颜色令牌 + `color-scheme: dark`（滚动条与原生控件跟着变深）
+    + 逐类覆盖 highlight.js 的 token 颜色（`markdown.ts` 引的 github.css 是浅色主题，
+    `.hljs` 有 `background:#fff`，不覆盖的话深色下会是一块白板）。
+- **关键决策**：
+  - **强调色拆成两个令牌**：`--accent` 专门当**文字/图标**（深底上要亮），`--accent-solid`
+    专门当**按钮底与用户气泡底**（够深，白字才够对比）。同一个颜色干两种活在深色下必然顾此失彼
+    （亮蓝当底 → 白字 2:1；深蓝当字 → 4:1 都不到）。浅色下两者同值，观感**逐字不变**。
+  - **顺手把写死的颜色收编成令牌**（深色下它们本来会变成刺眼的白块与看不见的深灰）：
+    `#fff` → `--surface`（8 处）、`#1a9e5c` → `--ok`、`#d64545` → `--danger`/`--danger-text`、
+    `#a8700d` → `--warn`、`#c8c8c8` → `--dot-idle`、`rgba(0,0,0,.055/.06)` → `--code-inline-bg`、
+    `rgba(0,0,0,.08)` → `--hover-strong`、`rgba(214,69,69,.07)` → `--danger-soft`。
+    这些令牌的**浅色取值与原字面量完全相同**，所以浅色页面一处没动。
+- **验证**：`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过。
+  **对比度按 WCAG 公式实算**（不是眼估）：深色下正文 13.5:1、次要文字 6.41:1、链接 6.79:1、
+  危险文字 8.02:1、成功 7.01:1、警告 8.19:1、白字落在实心按钮上 5.67:1；浅色下正文 16.4:1、
+  次要文字 4.97:1、链接 5.67:1 —— **全部 ≥ 4.5:1**。
+- **没验证的**：**深色下的实际观感没看**（这台机器没有浏览器、也看不了图片）：
+  三栏工作台在两个断点下的排布、深色下代码块与右栏各面板的配色、原生下拉/滚动条的深浅，
+  都要你刷新后扫一眼。理论上不该有「看不见的字」——所有颜色都走令牌了，但装饰性的
+  `plan-pulse` 光环仍是写死的 `rgba(77,107,254,…)`（深底下是一圈蓝光，读数不影响）。
+- **遗留**：左栏收起成竖标签时仍然没有设置入口（上一轮就记了，这次按范围没动）。
+
+#### 设置从弹窗改成整页，并删掉界面上的解释性文案
+
+- **动机**（用户反馈）：「设置页面要新开一页；把界面的多余的解释性语言先去掉；现在看着界面又小又乱」。
+  按 `zack-design-router` 路由到 `zack-redesign-audit`（改版流程）+ `zack-layout-and-rhythm`
+  （密度与留白）。诊断结论是**密度与层级**问题，不是审美问题：940px 弹窗里 8 行 × 6 个字段横排，
+  行内 padding 只有 8/10px，字号全压在 12px，再加上四段口径说明 —— 所有东西等权重，看不出结构。
+- **改了什么**：
+  - **整页**：`SettingsModal.vue` → `frontend/src/SettingsPage.vue`。顶部固定条（返回 / 设置 / 保存），
+    内容区居中 960 + gutter，滚动只发生在内容区；`App.vue` 用一个 `view` 开关切页，齿轮的
+    `title`/`aria-label` 从「模型配置」改回「设置」，`Esc` 也能返回（整页没有「点空白关掉」这条退路）。
+  - **切页用 `v-show` 藏聊天区**（`v-if` 会卸掉 DOM）：正在跑的流还在往 App 的状态里写，
+    卸了再挂回来只是徒增空引用风险。
+  - **字段重排**：一行六格 → **一格一个字段、一行两格**（960 容器里每格约 460），窗口那一格限宽
+    160（数字框占满一整格看着像坏了）。四个小节合成三个（各智能体 / 全局 / 意图识别）。
+  - **删解释性文案**（用户口径）：弹窗副标题、四个分节的说明小字、页脚「key 只以打码值回显」、
+    输入框里的「留空＝出厂默认」「留空＝128k」、「候选来自目录（可能过时）」、
+    「这家没有实时清单接口，可直接用下面的候选」。probe 结果也压成一行：
+    `已连接 · N 个模型 · 窗口 X 已填上` / `未拉到清单 · 内置候选 N 个` / `连不上 · <原文>`。
+  - **只留操作反馈**：报错与保存结果、按钮为什么置灰（`先填 api_key 再测`）、连不上的错误原文、
+    状态 chip、key 打码值；「JEV 未配置」缩短成一行。
+  - **字号收敛**：13（正文/输入/按钮）与 15（节标题）两级，12 只给字段标签、chip、打码值。
+  - **间距登记成令牌**：`:root` 加 `--s-1..--s-7`（4/8/12/16/24/32/40）与 `--settings-max`
+    /`--settings-gutter`；显示上「段与段 40、行与行 12」≈ 3.3 倍，结构分得开。
+  - 顺手清掉的死代码：`.modal-mask` / `.modal` / `.modal-head` / `.modal-sub` / `.modal-banner`
+    / `.modal-scroll` / `.modal-foot` / `.foot-hint` / `.section-head` / `.field-select`，
+    以及模板里从没有样式对应的 `mrow-configured`、`field-wide`。
+- **关键决策**：**做应用内整页（方案 A），不引 vue-router**。真路由要吃一个新依赖，而且后端目前
+  不托管前端产物，将来用 nginx 托管 `dist` 还得配 SPA fallback（否则刷新 `/settings` 404）——
+  收益只是地址栏可见，不值这个风险。范围只动这一屏：没碰左栏、右栏、聊天区、后端与依赖。
+- **验证**：`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过；`rg` 确认
+  `modal-` / `section-head` / `field-select` / `field-wide` / `SettingsModal` 在 `frontend/` 下
+  已无任何引用（样式与模板都对齐了）。改前把四个前端文件备份到仓库外，要退直接覆盖回去。
+- **没验证的**：**1440 / 1024 / 390 三个宽度的实际观感没看** —— 这台机器没有浏览器、也看不了图片，
+  布局是按 `--settings-max: 960` 与两个断点（640 单列）推的。请你刷新看一眼，哪一格还挤就说，
+  我按断点调。同时**后端没重启**（本轮只动前端，vite 热更新即可）。
+- **遗留**：左栏收起成竖标签时**没有设置入口**（齿轮只在展开态的品牌行里）—— 这是老问题，
+  这次没顺手改，要的话下次把齿轮也放进收起态的竖标签条。
+
+#### 提供商目录改放表：`config/model_providers.toml` 只做种子，界面按目录分组、按需拉清单
+
+- **动机**（用户三个口径）：① 提供商目录**放表**（不是代码常量）；② 那份「内置候选模型清单」
+  由用户手填、平台只给格式；③ 模型清单**只在点「测试连接」时拉**，不轮询、保存时也不拉。
+  实测依据：`api.deepseek.com/models` 不带 key 回 `401`，而 api_key 只能由厂商签发给用户 ——
+  平台不可能替用户拿到 ⇒ 必须有「拉不到时给你一份候选」这条退路，否则没填清单的用户只能手打模型名。
+- **改了什么**：
+  - **新表** `model_providers`（迁移 `d2e3f4a5b6c7`）＋**种子文件** `config/model_providers.toml`
+    （6 家：deepseek / kimi / glm / gpt / qwen / custom；字段＝显示名 / 默认地址 / 分组 / 排序 /
+    启停 / 拉不拉实时清单 / 拉的路径与鉴权头 / 内置候选）。`default_models` 已按 `.env` 里**正在用**
+    的模型名先垫上，用户按需增删。
+  - `config.py`：`ProviderMeta`、`load_provider_seed()`（白名单字段、坏节跳过）、
+    `provider_meta_of` / `provider_metas_of`（表行 → 目录项）、`Settings.providers`；
+    `provider_catalog()` → **`provider_metas()`**，并在**后端**排序（`ui_group` → `sort_order` →
+    `provider`）—— 下拉的分组顺序只有一个出处。
+  - `db/dao.py`：`list_model_providers` / `count_model_providers` / `upsert_model_provider`
+    （整行覆盖）/ `seed_model_providers`。
+  - `api/app.py`：`apply_model_providers`（启动时读表；**表为空才灌一次种子**）＋
+    `reload_model_providers`（按种子文件对齐：同名行覆盖、表里多出来的行不动）。
+  - `api/routes/model_config.py`：新增 `POST /model-config/providers/reload`；
+    `fetch_provider_models` 按目录行带 `models_path` / `auth_header` / `auth_prefix`（有的网关是
+    `/v1/models`、有的用 `x-api-key`）；快照的 `providers` 多带 `ui_group` / `sort_order` /
+    `is_dynamic_model_list` / `requires_key` / `default_models`；`/probe` 三条退路并用 `source` 标明。
+  - **前端**：`ModelRow.vue` 下拉按 `ui_group` 画 `optgroup`（无分组的「自定义」**排在最后** ——
+    它是逃生口，不该占默认位置）；这家的目录行说没有实时清单、或要 key 而 key 没填时，
+    「测试连接」置灰并写明原因；模型候选**优先用实时清单**，否则用内置候选并标注「可能过时」。
+    `SettingsModal.vue` 把选中的提供商一起发给 `/probe`，并按 `source` 说人话（没真连上就不写「连上了」）。
+  - **顺手修的**：上一轮把 `ModelProvider` 的类定义插进了 `AgentSession` 中间，等于把会话表的
+    `last_active_at` / `expires_at` / `repository` 三格切给了提供商表。已挪到 `ModelEndpoint` 之后。
+- **关键决策**：
+  - **表为空才灌种子**：库里非空就以库为准（用户在库里的改动不该被下次启动顶掉），要重新对齐走
+    reload 接口；这是「种子文件」与「配置源」的分界。
+  - **键仍然是智能体**：提供商表只管「界面怎么挑、去哪拉清单」，**不决定谁用哪个模型** ——
+    避免出现两套配置轴互相打架。
+  - **拉不到 ≠ 报错了事**：连不上时 `ok=false` + 错误原文照回，同时把内置候选一起给出去；
+    「能不能连上」和「有没有名字可选」是两件事。
+- **验证**：`pytest` **1224 passed**（新增 17 条：种子解析 / 白名单 / 表优先于种子 / 停用项不出现在
+  目录 / 排序 / 表行→目录项 / 启动「空表灌种子」与「非空不灌」/ probe 按目录行取路径与鉴权头 /
+  三条退路 / reload 与种子缺失回 400）。`ruff check` 本次改动文件干净（`models.py` 只剩既有的
+  4 条告警）。`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过。真库 `alembic upgrade head`
+  到 `d2e3f4a5b6c7` 成功；用 ASGI 直接打真库的 `GET /model-config`：目录 6 行按
+  「国内厂商(10/20/30/50) → 海外厂商(40) → 无分组(90)」返回，八行智能体仍是 `source=default`（不预填）。
+  **真机探过「测试连接」三条路**：拿 qa 那一行的出厂 key 探它自己那家网关 →
+  `ok=true / source=live`，拉回 200 个模型名（前几个是 `gpt-6.1-sol` / `gpt-6-astra` / `gpt-6-sol` /
+  `gpt-6-luna` / `gpt-5.6-luna` —— 比 `.env` 里在用的那个新，正好说明「内置候选只是兜底、实时更准」）；
+  拿同一把 key 去探 deepseek、以及匿名探 deepseek → 都是 `ok=false` + `401` 原文 + 内置候选，
+  **不是 500**。
+- **没验证的**：**界面没截图**（这台机器没有浏览器、也无法查看图片）—— 分组下拉、置灰按钮、
+  「可能过时」标注的观感请刷新看一眼。**正在跑的后端还是旧代码**（进程里仍是 `provider_catalog`），
+  要重启后端才会走新装配。
+- **遗留**：① `config/model_providers.toml` 里 `default_models` 由用户补全（现在垫的是 `.env` 里
+  在用的那几个）；② 模型**热切换**仍立项（`docs/backlog.md` 1.1）。
+
+### 2026-10-12
+
+#### 模型配置界面重做：先选提供商，再填它那一套（+ 样式改用项目既有令牌）
+
+- **动机**（用户反馈）：① 界面很丑；② 少了「提供商」那一层 —— 应该**先选提供商**，再填对应的配置。
+  按 `zack-design-router` 路由到 `zack-anti-ai-look`（诊断）+ `zack-redesign-audit`（改版流程）。
+- **诊断**（扫描对象＝上一版 `SettingsModal.vue` 与它的样式）：
+
+  | 位置 | 问题 | 依据 | 严重度 |
+  | --- | --- | --- | --- |
+  | 齿轮按钮 | 用 emoji「⚙」当图标 | 铁律 6 /「emoji 当图标」 | P1 |
+  | 整个弹窗 | 缺「提供商」这一层：要用户自己知道并手填 base_url | 用户反馈（功能缺失） | P0 |
+  | 整个弹窗 | 8 行 × 5 个输入框平铺、全靠 placeholder 没有 label；四类信息挤在一列 | 「处处等量」＝没有层级 | P1 |
+  | 样式 | 游离色值 `#64748b` / `#b45309` / `rgba(15,23,42,…)`，不用项目令牌 | 「直接用框架默认调色板」 | P1 |
+  | 状态 | 只有 disabled；没有 `:focus-visible`；「恢复默认」与「测试连接」同款皮肤（危险动作没区分） | 状态缺失 | P1 |
+
+- **改了什么**：
+  - **接口** `api/routes/model_config.py` + `config.py`：快照多两格 —— `providers`（内置厂商目录：
+    key / 中文名 / base_url，**base_url 取自 `.env`** 里你正在用的那个地址）与每行的 `provider`
+    （**按 base_url 反推**：纯界面提示、不存库 ⇒ 不必加列、不必再迁移）。
+  - **界面**：`SettingsModal.vue` 重写 + 新增 `ModelRow.vue`（一行连接一个组件，四个小节复用，
+    免得同样的标记抄四遍漂掉）。每行字段顺序＝**提供商 → base_url → 模型 → key → 窗口**：
+    选中提供商即带出它的默认地址（仍可改），「测试连接」拉到的模型进 `datalist`、读到窗口就替你填。
+  - **分节**：各智能体（5 行）/ 统一模型 / 兜底模型 / 意图识别（select + 未配置提示 + 分类模型那行）。
+  - **样式**（`style.css`）：整段换成**项目既有令牌**（`--surface` / `--border` / `--accent` /
+    `--danger` / `--r-*`），一个强调色只给主按钮，危险动作（恢复默认）用 `--danger` + 二次确认；
+    字号收成 12 / 13 / 15 / 20 四级；补 `:focus-visible`；`transition` 只写具体属性并给
+    `prefers-reduced-motion` 关掉；<720px 断点把六个字段改两列堆叠；齿轮换成内联 SVG。
+- **关键决策**：**不把「提供商」存库** —— 它只影响界面带出哪个 base_url，真正决定用哪套连接的是
+  base_url + 模型 + key（见 `llm._config_for`）；按 base_url 反推既满足界面需求又零 schema 变更。
+- **验证**：`pytest` **1207 passed**（新增 2 条：目录取自 `.env`、provider 由 base_url 反推）；
+  `npm --prefix frontend run build`（含 `vue-tsc`）通过；`/model-config` 经 vite 代理回 200。
+- **没验证的**：**三宽（1440 / 1024 / 390）截图没看** —— 这台机器没有浏览器可用、也无法查看
+  图片，布局是按网格与断点推的。请刷新界面看一眼；哪一格挤了告诉我，我按断点调。
+- **不建议改的**（诊断的一部分）：**不动**项目既有的字号 / 色阶 / 圆角刻度（上一轮改版刚定的，
+  这次是沿用它）；**不动**左栏 / 右栏 / 聊天区的样式（这次只说设置弹窗）；**不引**任何前端依赖。
+- **遗留**：热切换不变（`docs/backlog.md` 1.1）。
+
+#### 修「点开模型配置就报错」：vite 的开发代理白名单漏了 `/model-config`
+
+- **现象**（用户报障）：重启后端后，点左上角齿轮立即报错。
+- **定位**：后端本身是好的 —— 直接 `curl http://127.0.0.1:8000/model-config` 回 200 与那八行
+  数据；而 `frontend/vite.config.ts` 的 `server.proxy` 是**逐个前缀列的白名单**
+  （`/sessions` `/chat` `/health` `/auth`），`/model-config` 不在里面 ⇒ 前端 `fetch('/model-config')`
+  打到了 vite 自己，拿到 404 HTML ⇒ 弹窗一开就显示「读取模型配置失败：404」。
+- **改动**：`vite.config.ts` 的 proxy 加上 `'/model-config': BACKEND`，并在那一行上面写清
+  「**后端路由前缀要逐个列这里，漏一个就是『前端 404、curl 200』**」；`AGENTS.md` 的「前端」
+  那条也补了同样的规则（外加一句：dev 只监听 IPv6 回环，用 `localhost:5173`）。
+- **验证**：vite 自己热重启后，经代理访问 `POST http://localhost:5173/model-config/probe`
+  回 200（我故意不带 key，拿到的是 `ok=false` + 可读的 401 文字 ⇒ 错误路径也走通、不是 500）；
+  `GET /model-config` 经代理回 200 与八行数据。
+- **遗留**：无（vite 改配置会自己重启；若你手动起的 dev 没重启，重启一次即可）。
+
+#### 模型配置按**智能体**落地：界面填、存 `model_endpoints`、意图识别改三关
+
+- **动机**（用户口径，逐条）：配置的键是**智能体**（不是供应商）；行名用中文；上下文窗口
+  **不让用户填**（先读、读不到再让他填）；**不给默认值**（没填就维持今天的行为）；兜底与
+  意图识别各占一行；JEV 那套不动；意图识别**二选一**（优先 JEV，没有 JEV 就用大模型）——
+  于是变成**三关**；模型热切换只立项。
+- **改动**：
+  - **表**：`model_endpoints`（`agent` 主键 + base_url / model_name / api_key / context_window），
+    一条 alembic `c1d2e3f4a5b6`（**已在真库跑过** `alembic upgrade head`）。
+  - **解析层**（`agent/llm.py`）：`agent_key()`（形态 → 行；三个子智能体跟 `coding` 那一行）、
+    `_row_for()`（`unified` → 该智能体那一行）、`resolve_window()`（行 → 出厂默认那家的窗口 → 128k）、
+    `_config_for()`；`build_fallback()` 先用界面的「兜底模型」那一行，没有才走老的
+    `FALLBACK_PROVIDER`；`build_classifier_model()` 先用「意图识别（大模型）」那一行，其次
+    `unified`，再回落出厂默认。**一行都没配时行为与改动前完全一致**。
+  - **启动加载**：`api/app.py::apply_model_endpoints()`（启动时读一次；读库失败只告警、
+    照常用 `.env` 起）。`model_config` 表里的 `intent_mode` 行决定意图识别走哪一关。
+  - **窗口**：`service._main_window` 改用 `resolve_window`（不再绕 `_provider_attr`）；
+    墙上那句「读不到」由界面的「测试连接」承担（拉厂商 `/models`，读到就替用户填上）。
+  - **接口**（`api/routes/model_config.py` + schemas）：`GET /model-config`（key 只回打码值；
+    每行给 `source=db|default`）、`PUT`（**只写给了的字段**；空串＝清掉）、
+    `DELETE /model-config/{agent}`（恢复出厂默认）、`POST /model-config/probe`
+    （一次验连通性 + 给模型清单 + 读窗口；失败是**结果**不是 500）。
+  - **界面**（`frontend/src/SettingsModal.vue`）：左上角齿轮 → 模态：8 行（问答 / 分析 / 方案 /
+    审查 / 编码 / 统一模型 / 兜底模型 / 意图识别）+ 每行「测试连接 / 恢复默认」+ 意图识别下拉
+    （JEV / 大模型）+ `JEV 未配置 → 将用默认大模型做意图分类` 的提示。
+  - **脱敏**：`Settings.model_secret_values()`（`env` 几家 + 界面配的行 + JEV/分类）接进两处
+    `secret_terms` 调用点 —— 模型 key 以前不进词表，现在进了。
+  - **意图识别三关**（`server/intent.py`）：`mode="jev"`（默认）＝ 口令 → JEV → 关键字口径
+    （JEV 判不出来**不再**回退大模型；JEV 不可用才用大模型）；`mode="llm"` ＝ 口令 → 大模型 → 关键字。
+    `force_llm`（`handoffTask` 的重判）固定走大模型 —— 重判要纠正的正是口令层。
+- **关键决策**：
+  - **「留空＝不改」**：一行都没配时逐字沿用今天的角色→供应商映射（qa→gpt、plan/coding→glm、
+    review→kimi、coder→deepseek…），所以这是**可回退**的改动（DELETE 一行即回默认）。
+  - **密钥明文存库 + 只回打码值**：与 `sessions` 表那两个 git token 同口径；界面永不回明文，
+    写回留空＝保持原值；**并把它纳入脱敏词表**（这是「明文可接受」的前提）。
+  - **窗口不给用户填是「先读」**：`/model-config/probe` 真去问厂商（实测 **deepseek 的
+    `/models` 回了 1048576**，读得到），读不到才让用户填；解析兜底 128k。
+  - **三关不四关**：用户口径如此。代价是「JEV 超时/认不出标签」时直接落关键字口径 ——
+    已在 CHANGELOG 此处记明，要四关是 `detect_intent` 里加一跳的事。
+- **验证**：
+  - 全量 `pytest` **1205 passed**（新增 `tests/test_model_config.py` 26 条：解析优先级
+    「unified → 该行 → 出厂默认」、子智能体跟 `coding`、窗口三档、兜底行与同主模型去重、
+    分类模型顺序、脱敏词表、启动加载（含表坏了只告警）、接口打码 / 留空不改 / 清空 key /
+    非法键 400 / 删除回默认 / probe 三条路径；另有 4 条既有用例按三关口径改写）；
+    `ruff` 干净；`npm --prefix frontend run build`（含 `vue-tsc`）通过。
+  - **真库端到端**（临时写、跑完删）：`GET` 八行全 `default` + `JEV 可用=True`；写一行 qa 后
+    回读 `api_key_masked=sk-…7890`（无明文）、`source=db`；`apply_model_endpoints` 后
+    `_config_for(qa)` 取到 `probe-model / 窗口 4096`、`plan` 仍 `glm-5.3`；**probe 真出网
+    `ok=True 窗口=1048576`**；`DELETE` 后回 `default`，表里清空。
+- **遗留**：
+  - **要重启后端才生效**（保存后界面会提示）。
+  - **模型热切换**：只立项（`docs/backlog.md` 1.1）—— 已建的智能体按 `(会话, 形态)` 缓存，
+    改配置要重启或重建实例。
+  - 界面只做了「配置 + 测试连接」；**没有做「保存后自动重建智能体」**（那是热切换那一档）。
+  - 意图识别选 JEV 且 JEV 运行时失败 → 直接落关键字口径（三关的代价，见上）。
+
+#### 立项清单落地：新增 `docs/backlog.md`（压缩口径 / 模型配置化 / 更早两条遗留）
+
+- **动机**（用户口径）：压缩的计数口径「立项」；模型配置化先出方案、热切换只立项。
+- **改动**：
+  - 新增 `docs/backlog.md`：放「**已经想清楚、但还没动手**」的事，每条写清「要解决什么 /
+    为什么当时不做 / 动手的抓手在哪」；`AGENTS.md` 的「去哪儿看」加一行指向它
+    （「这次改了什么」仍看 CHANGELOG；「想清楚但没动手」看 backlog）。
+  - 入册的第一批：
+    1. **模型配置化**（**按智能体为键**：5 个主控形态 qa / analysis / plan / review / coding
+       各一行「base_url / model / api_key / 窗口」，另可指定一个**统一模型**给所有智能体共用；
+       界面上填、本地场景存业务库）—— 附待拍决策（密钥怎么存、与 `.env` 的优先级、保存后
+       什么时候生效、子智能体与兜底归谁）；
+       口径已定（2026-10-13）：行名用**中文**（问答 / 分析 / 方案 / 审查 / 编码 + 统一模型 /
+       兜底模型 / 意图分类 / JEV），**所有行默认 deepseek v4.1 flash**，**兜底与意图分类各占
+       一行**，**JEV 那套不动**（不填就提示「用默认大模型做意图分类」）。
+        **1.1 模型热切换**（不做，只立项）与「保存后对新建会话生效」那一档留待评估。
+    2. **上下文压缩的计数口径**：上游 `SummarizationMiddleware` 用 4 字符/token 估中文，
+       低估约 3 倍（实测那几轮到 86% 也没触发压缩）；抓手是给它传我们自己的 `token_counter`
+       （与 `context_trim.py` 同源），风险面与剪裁不同，故单列。
+    3. 更早的两条：前端登录入口未接、沙箱测试数据配置外置（方向＝远端配置中心，
+       「平台怎么拿到 Nacos 凭据」未定）、以及 `/conversation_history/` 导出未脱敏。
+- **遗留**：模型配置化的**方案**见本轮对话（未动手），等用户拍板。
+
+#### glm-5.3 的输入窗口按 1M 校正（原来是保守估的 128k）
+
+- **动机**：用户确认 **glm-5.3 的输入窗口是 1M** —— 此前配置里按 128k 保守取值（那时的理由：
+  glm / gpt / qwen 三家接口都不暴露窗口，只能往小里猜）。
+- **改动**：`config.py` 的默认 `GLM_CONTEXT_WINDOW` `128000 → 1048576`（注释里记「glm 是例外：
+  用户确认过的真值；gpt / qwen 仍是保守估值」）；`.env` 与 `.env.example` 同步。
+- **哪条口径跟着变、哪条不变**（重要）：
+  - **跟着变**：`ModelProfile.max_input_tokens`（上游压缩按它算 85% 触发）→ 压缩线从约 109k
+    挪到约 **892k**；压力条的两条线（60% / 80%）→ 从 77k / 102k 挪到 **600k / 800k**。
+    实测那一轮的输入峰值是 110k，只占 1M 的 **11%** ⇒ **压力条基本不会再亮**了 ——
+    这是「离窗口上限还有多远」的诚实反映；要看「这一轮花了多少」是 Token 面板的事。
+  - **不受影响**：刚上线的**剪裁阈值是绝对值 40k**（这正是当初不用窗口比例的理由：coder 是
+    1M 窗口的 deepseek，按比例算等于永不触发）。
+- **验证**：全量 `pytest` **1178 passed**、`ruff` 干净。其中一条测试原本把「86% 的输入」写成
+  110,000（隐含 128k 窗口），改成按 `int(window * 0.86)` 算 —— 以后再调窗口它不会跟着红。
+- **遗留**：**要重启后端才生效**。另外压缩线的**计数口径**仍对中文低估约 3 倍（上游用 4 字符/
+  token），也就是说 892k 那条线实际上还要再打三折才可能触发 —— 与上一批的遗留同一条，单独立项。
+
+#### 历史工具结果剪裁上线：按阈值把较早的工具返回换成一行占位符（先只给 coder）
+
+- **动机**（用户口径）：按方案实施 —— 「大工具结果做中间件剪裁、省 token」。
+- **实测依据（方案里的那张表，这里复述结论）**：coder 的上下文里 **46%~55% 是历史工具结果**
+  （末次调用的输入 110,441 tokens 里约 60,500 是累积的工具返回），而同一份文件内容会跟着之后
+  **每一次**调用重发（一轮 79 次调用＝重发 79 遍）—— coder 一轮 5.4M 输入 token 主要来自这里。
+- **改动**：
+  - 新增 `agent/middleware/context_trim.py`：薄包装上游 `ContextEditingMiddleware` +
+    `ClearToolUsesEdit`（Anthropic 的 clear_tool_uses），**中文口径的 token 计数器**、
+    排除小工具、中文占位符。开关关掉就返回 `None`（不挂）。
+  - 挂载：`agent/graph.py`（主控，按配置）与 `agent/subagents.py`（子智能体，按角色），
+    都放在**最内侧**（兜底之前）—— 边界 / 脱敏 / 历史修复先跑完，剪裁只动「要给模型看的那一份」。
+    装配在 `session/manager.py`（每个角色现给一个实例）。
+  - 配置（`.env.example` 已写清依据）：`CONTEXT_TRIM_TOOL_RESULTS=true`、
+    `CONTEXT_TRIM_TRIGGER_TOKENS=40000`、`CONTEXT_TRIM_KEEP=6`、
+    `CONTEXT_TRIM_CLEAR_INPUTS=false`、`CONTEXT_TRIM_ROLES=coder`。
+- **关键决策**：
+  - **只改这一次请求**：上游在 `awrap_model_call` 里 `deepcopy` 出要发的消息、只换被剪那几条的
+    **内容**，再 `request.override(...)` ⇒ 不动 checkpoint、不动业务库、消息条数与 `tool_call_id`
+    配对都不变（不会造出孤儿 tool_call）。所以回退＝关一个开关，**数据零风险**。
+  - **阈值用绝对值（40k）而不是窗口比例**：coder 是 1M 窗口的 deepseek，按比例算等于永不触发
+    （实测它的输入峰值也就 110k）。
+  - **必须自带 token 计数器**：上游默认 `chars_per_token=4.0` 是英文口径，中文实测 ≈1.6
+    （GLM 上量到 0.45~0.68 token/字）—— 照默认值算会把中文低估约 3 倍，阈值永远不到。
+  - **第一版不剪工具入参**（`CONTEXT_TRIM_CLEAR_INPUTS=false`）：剪入参收益更大，但历史 AI 消息的
+    args 会变空，万一将来有重放 / 重试路径读 args 会踩空。观察一轮再定。
+  - **排除 `write_todos` / `updatePlanStep` / `updatePlanStatus` / `planExists`**：都极小，剪了没收益，
+    而 `write_todos` 是给模型看的进度骨架。
+  - **先只给 coder**（`CONTEXT_TRIM_ROLES=coder`）：收益集中，主控那侧只占 7%~14% —— 先在一处观察，
+    出问题好定位；要放开就改这一格配置，不动代码。
+- **验证**：
+  - 全量 `pytest` **1178 passed**（新增 `tests/test_context_trim.py` 10 条：阈值之下一条都不动；
+    超过阈值时「最近 N 条原样 + 更老的变占位符」；**消息条数与 `tool_call_id` 配对不变**；
+    被排除的工具不动；默认不剪入参；中文计数器比上游默认估得多 2 倍以上；
+    开关关掉返回 `None`；参数来自配置；角色表解析；**挂载按角色**（coder 有、planner 没有））。
+    `ruff` 干净。
+  - **真配置自检**：`.env` 读出来是 `true / 40000 / 6 / false / coder`，中间件构造为
+    `ContextEditingMiddleware` + `ClearToolUsesEdit`，排除列表与占位符都在。
+- **遗留**：
+  - **要重启后端才生效**；重启后跑一轮 coding，对比 coder 的**输入 token 合计**（上一轮 5.4M）、
+    末次输入（110k）与「重复 `read_file` 的比例」——预期合计降 40%~60%、末次输入 ≤ 60k。
+    若模型明显开始重复读文件，就把 `CONTEXT_TRIM_KEEP` 加到 10 或把阈值提到 60k。
+  - **上游压缩线的计数口径还没校准**（同一个坑）：`SummarizationMiddleware` 也用
+    `count_tokens_approximately`（4 字符/token），中文被低估约 3 倍 —— 实测那几轮输入到
+    110k/128k（86%）却一次压缩都没触发。影响的是「什么时候压缩」，与这一刀不同，建议单独立项。
+  - 用户把 GLM 从 `glm-5.3-flash` 换成了 **`glm-5.3`**：`GLM_CONTEXT_WINDOW` 仍是保守值 128000。
+    这一刀的阈值是绝对值、不受影响；但**压力条与压缩线**按这个窗口算 —— 若 glm-5.3 的窗口更大，
+    要把 `GLM_CONTEXT_WINDOW` 改准。
+
+#### 新工具 `planExists`：按 id 判「这份方案还能不能实施」，只回一个布尔、不拉正文
+
+- **动机**（用户口径）：加一个按 id 查任务是否存在的工具，**只返回有效状态（bool）** ——
+  plan 是大对象（一份一万字），不必每次都把正文拖回来；判完存在性就可以直接派 coder。
+- **改动**：
+  - `db/dao.py::plan_status()`：**只 `SELECT status`**（少选一列就少传一万字），没这条记录返回
+    ``None``。
+  - `tools/plan.py::planExists(plan_id) -> bool`（放进 `build_plan_tools` 那口池子）：
+    **存在且状态是 pending → `True`**；不存在 / 不属于本会话 / 已软删（`closed`）/ 已执行完
+    （`done`）→ `False`。docstring 写明语义，并指明「正文让 coder 自己
+    `get_unexecuted_plan` 取」。
+  - `tools/register.py`：`_PLAN_TOOL_NAMES` 收进 `planExists`；**coding 主控**与 **plan 主控**
+    都拿到它（前者用于「派 coder 之前确认还能实施」，后者用于「只要判存在性就别读全文」）。
+    planner / coder 两个子智能体不给：前者只写新方案，后者本来就要取全文。
+  - 提示词三处：coding 指令第 1 步与编码流程 c 各补一句「**已知 `plan_id` 时先用
+    `planExists(plan_id)` 判定**（只回布尔），`true` 就直接派 coder、正文让 coder 自己取；
+    这一步是你自己一条工具调用的事，别为此派子智能体」；plan 形态的「查」那一节指到它。
+- **关键决策**：
+  - **语义定成「还能不能拿去实施」（`pending`）**，而不是「记录在不在」：主控问这句话的目的
+    就是「能不能派 coder」，`done` / `closed` 都该是 `False`。名字仍按用户口径叫 `exists`，
+    三种 `False` 在 docstring 里写清。
+  - **只 SELECT 状态列**：判存在性不该把正文拖回来 —— 这正是提这条的初衷。
+- **验证**：
+  - 全量 `pytest` **1168 passed**（新增 5 条：`pending`→`True`；`closed` / `done` / 不存在→
+    `False`；并且断言它**不会**调 `get_plan`（即不拉正文）；注册表两条：两个形态都拿到、
+    别的形态不误拿）。`ruff` 干净、`scripts/check_prompts.py` 冲突 0 条。
+  - **真库回放**：`39/40/44`（done）、`41/42/43`（closed）、`9999`（不存在）全部 `False`；
+    本会话与全库当前都没有 pending 的方案（`True` 那条由单测覆盖）。顺带确认：**plan 44
+    已经跑完并被标成 `done`** —— 那一轮实施完成了。
+- **遗留**：**要重启后端才生效**。
+
+#### write_todos 子树挂错：父项改成「按角色找那一步」，不再看「此刻谁 in_progress」
+
+- **动机**（用户口径）：树稳定挂错，要处理。
+- **现象（真机 2026-10-13，trace `99f2f0a268d7`）**：主控的清单是
+  `[in_progress] 确认 plan_id=44 处于待执行状态` / `[pending] 派 coder 按方案实施（写码/测试/提 PR）`
+  / `[pending] 派 reviewer 审查 PR` …，而 **coder 的六步子树整棵挂到了「确认…」底下**。
+- **根因**：父项取的是「委派那一刻 `in_progress` 的那一项」，而**主控推进清单是滞后的** ——
+  它习惯在子智能体返回之后才更新清单。五次实测里三次因此挂错（派 planner 时 in_progress 还停在
+  「查询是否存在未执行的方案」；派 coder 时还停在「确认 plan_id=44 处于待执行状态」）。上一批
+  记过这条、当时选择先不动；现在改成由**角色**定。
+- **改动**（`stream.py`）：`note_delegation` 的父项改由 `_delegation_parent(role)` 决定 ——
+  1. 在清单里找**第一条未完成**、**不是前置动作开头**（`确认`/`查询`/`查看`/`检查`/`核对`/`获取`/
+     `准备`/`拉取`/`读取`/`了解`/`弄清`）、且**含该角色词**的项
+     （planner: 方案/计划/设计/规划；coder: 实施/编码/写码/写代码/开发/落地/提 pr/提交 pr/改代码；
+     reviewer: 审查/评审/复核）；
+  2. 找不到就**回落到老规则**（`in_progress` 那项 → 最后一个未完成项 → `None`）—— 最差也只是
+     回到现状，不会让子清单整棵消失。
+
+  角色是委派那一刻就确定的事实，比主控的清单推进可靠；而且这是**确定性规则**，不依赖模型把清单写对。
+- **关键决策**：
+  - **不做「延迟锚定」**（等主控下一次清单更新再决定父项）：子树是**实时**下发的，事后再挪就变成
+    用户以前抱怨过的「跑完就漂移」。
+  - 关键词表**只服务于这一件事**（选父项）且带兜底；一主三从的流程是固定的，换角色才需要改这张表。
+  - 前置动词只**跳过**明显以「确认 / 查询 / 获取」开头的项，不做更聪明的语义猜测。
+- **验证**：
+  - 全量 `pytest` **1163 passed**（新增 4 条：coder / planner 各一条「前置项还停在 in_progress 时
+    也要挂到那一步」、没有角色词时回落老规则、已完成项不再收子树）；`ruff` 干净。
+  - **真数据回放**：拿这一轮真实的清单 + coder 六步跑一遍，子树从「确认 plan_id=44 处于待执行状态」
+    挪到了「派 coder 按方案实施（写码/测试/提 PR）」下，前置项保持无子树。
+- **遗留**：**要重启后端才生效**（`stream.py` 在后端进程里）；**已经在跑的那一轮不会变**（它的树
+  已经发下去了）。
+
+#### 意图判据里 `plan` 一档改成「方案对象的增删改查都归它」（真 JEV 六例验证）
+
+- **动机**（用户口径）：JEV 里针对 planner 那一档的判定要写详细 —— **方案的增删改查都要判给
+  这一档**。
+- **改动**（`server/intent.py`，JEV 的 `criteria` 与「大模型判定」那一档共用同一份说明）：
+  - `_INTENT_SPECS` 的 `plan` 从「要方案 / 计划 / 设计 / 步骤（还没动手做）」扩成四件事：
+    **出方案**（要计划 / 设计 / 步骤）、**查方案**（最新的是哪一份、某份的正文与步骤）、
+    **改方案**（改正文 / 标题 / 步骤、修掉乱码或过时内容）、**删方案**（删掉 / 作废某一份），
+    各带一句「常说的样子」，并写明**只管方案文本本身**（要动代码就是 coding）。
+  - `_BOUNDARY` 加一条分界：plan 管方案对象本身；**查仓库文件 / PR / 提交归 qa**；
+    **按方案改代码 / 提 PR 归 coding** —— 方案文本的增删改只有 plan 这一档有工具。
+  - 为什么是这一档：只有 plan 形态的主控手里有 `getPlan` / `updatePlan` / `updatePlanSteps` /
+    `deletePlan`；coding 形态对方案只读（`get_unexecuted_plan`），让它去改方案只能让 planner
+    另存一份（实测就是这么造出 plan 42 / 43 两份「修复版」的）。
+  - **没动关键字层**：强关键字命中的那一路会**跳过模型判定**，而「删掉那份方案」这类自然说法
+    本来就匹配不到固定串（要写成 `删掉方案` 才行）—— 交给 JEV 更稳，也就不加固定串去抢。
+- **验证**：
+  - 全量 `pytest` **1159 passed**（新增 2 条：判据里四件事齐全 + 分界那句话在；
+    `ruff` 干净）。
+  - **真 JEV 六例**（直接调判定器，只读）：
+    ```
+    出方案      → plan    p=1.00      对照·coding → coding  p=1.00
+    查方案      → plan    p=1.00      对照·qa     → qa      p=1.00
+    改方案      → plan    p=1.00
+    删方案      → plan    p=1.00
+    ```
+    四件事全部落到 plan，两条对照没有被 plan 抢走。
+- **遗留**：**要重启后端才生效**（判定器在建会话时读配置与提示词）。
+
+#### plan 41 为什么坏：正文没人校验（a）+ 正文限长（b）+ 失锁后不再"无主"跑（c）
+
+- **动机**：先查清 plan 41 为什么会坏，再按用户口径把 a（正文自检）/ b（限长与精简）/
+  c（运行权失锁）一起做掉。
+- **定位（plan 41 的坏法，证据链）**：正文 9,521 字，**写到第 4 步（共 6 步）就断了** ——
+  没有步骤 5/6、没有验收节；步骤 3 写了两遍（`### 步骤 3（更正稿）：` 空标题 +
+  `### 歨骤 3 更正稿（以此为准）：…`，错字「歨」）；路径写成 `wanqi-male-user-service`；
+  结尾是一句自我引用「…（更正稿见正文）」。
+  写它的那次调用（21:01:40，`ae71fa67882b` 那轮的第二次 planner）：输入 54,748 /
+  **输出 5,159 tokens**，**工具参数 11,499 字符全都收到**（我加的那行「本次产出」量的），
+  `steps` 6 项齐全并通过校验、工具成功、无重试无兜底 ⇒ **不是存储截断、不是传输截断、
+  不是输出上限**（同模型当晚还有 17,635 / 10,194 输出 token 的调用），是**模型自己写坏 +
+  没有任何一层校验正文**。
+- **a. 落库前的正文自检**（`tools/plan.py`）：
+  - 新增 `MAX_CONTENT_CHARS = 6000` 与 `_check_content(content, steps)`，`storePlan` 与
+    `updatePlan` 都走它（与 `_normalize_steps` 同一套做法：不合格返回可读理由、方案不写入，
+    由模型重写）。判据全是确定性的：太短（<100 字）/ 带自我修补字样（「更正稿」「以此为准」
+    「（更正）」）/ 结尾是半句（以「（」「、」「：」「…」收尾）/ **「步骤 N」小节没覆盖到
+    `steps` 的最后一步** / 超长。
+  - 顺序**先结构、后长度**：既超长又带修补片段时，先让它「重写一份干净的」（那也自然压下来），
+    而不是只收到一句「压缩」。
+  - 只认**标题行**里的「步骤 N」（正文里顺口提到不算），避免误拒。
+- **b. 提示词限长与精简**（`_PLAN_METHOD` / `_PLAN_RULES`，planner 与 plan 形态共用）：
+  正文 **4000 字以内**（硬上限 6000，超了工具拒）；写明**该写什么 / 不该写什么** ——
+  读码过程、文件片段、逐行分析、背景复述不进正文（coder 自己会读码）；一次写完写干净、
+  不追加更正片段；正文写到第几步就覆盖到 `steps` 的第几步。
+- **c. 运行权失锁**（`server/runs.py`）：
+  - 起因（真机）：20:43:50 起 `renew` 每 30 秒失败一次、一直失败到轮次结束 —— 钥匙在 Redis
+    抖动时 TTL 到点消失，而 `renew` 只「查+续」、不会重建 ⇒ 那一轮**「无主」跑了 95 分钟**，
+    UI 的订阅还先收尾了（界面显示成跑完了，其实还在跑）。
+  - `_watch`：续期失败 → **先 `acquire` 重新拿回**（自己的钥匙过期时这一下就拿回来，记 INFO）；
+    拿不回（真被别的 worker 持有）→ 取消本轮 + 清缓冲 + warning，不无主地继续写同一个会话。
+  - `subscribe`：**本进程在跑的轮次不再拿 `held()` 二次判定**（本地 task 才是权威）；只有
+    「不是本进程在跑」时才用运行权当存活信号 —— 否则锁一抖，正在跑的这轮就被自己的订阅者
+    判成「已结束」。
+- **验证**：
+  - 全量 `pytest` **1157 passed**（新增 13 条：正文自检 7 条、运行权 3 条、提示词 3 条 ——
+    含「提示词里的硬上限必须等于工具里的常量」这条耦合测试）；`ruff` 干净；
+    `scripts/check_prompts.py` 渲染 8 份、**冲突 0 条**。
+  - **真库回放**：plan 41（9519 字）被「自我修补字样」拦下、plan 42 / 43 被「超长」拦下 ——
+    库里那三份坏正文现在都进不来。
+- **遗留 / 风险**：
+  - 6000 字是**硬拒**：模型要是反复写超长会被连着拒（提示词给了 4000 的目标值、拒绝理由也
+    具体；真出现反复被拒就把上限放宽，或把超长改成只警告）。
+  - **要重启后端才生效**。
+  - 盘子里那三份坏方案（41 残缺 / 42 v2 / 43 v3）**已按用户要求清掉**：走 `deletePlan` 同一条
+    dao 路径软删（状态改 `closed`，行留在库里，改回状态即可恢复）。清完之后
+    `get_unexecuted_plan` 返回「没有未执行的方案」，`/sessions/{id}/plan` 回落到 plan 40（阿里云短信，
+    done）。聊天里原有的「方案」链接不受影响 —— 每条 plan 记录自己带着正文，前端不按 id 回查。
+
+#### 意图判定带上「助手上一轮的末尾」：用户回一句「修复吧」不再判错形态
+
+- **动机**（用户口径）：按方案 A 做（**不做**纯规则的兜底 C）。
+- **定位（实测 2026-10-12）**：助手上一轮结尾问「要不要我把方案正文修复一遍再给你确认？」，
+  用户回「修复吧」→ 判定只看这一句 → 判成 `coding`（JEV p=0.96）→ 走了**编码形态**去「修方案
+  文本」，而那个形态没有写方案的工具、planner 又只能新建（`storePlan`）→ 白折腾 25 分钟、
+  多造出一份方案（41 残缺 + 42 修复版），树上因此多出一个 plan 子任务。
+  - 代码事实：判定用的历史是 `dao.recent_user_summaries`（**只取 `type="user"`** 的最近 4 条），
+    助手那侧一条都没有；而 assistant 记录的 `summary` 是 `content[:200]`，那句反问在 1,400 字
+    回复的**末尾** —— 取 summary 也读不到（真库核对过）。
+- **改动**：
+  - `db/dao.py::latest_assistant_tail()`：最近一条 `type == "assistant"` 记录的**末尾**若干字
+    （Python 切片，不用 PG 专属的 `right()`；一行最多几千字，取回再切划算）。
+  - `server/intent.py`：`PREVIOUS_REPLY_CHARS=300` / `PREVIOUS_REPLY_SLACK=100` /
+    `tail_excerpt()` —— 取末尾 300 字左右，**尽量从句末标点之后开始**（不留半句；
+    一整段没有标点就不切，免得把要说的话也切没）。
+  - `_user_prompt()` 多一格「助手上一轮回复（末尾节选）」（放在「本轮消息」之前）；
+    `_system_prompt()` 加一条规则：短肯定 / 否定 / 指代句（「修复吧」「好的」）很可能是在
+    **回答助手上一轮的那个问题** —— 按那个问题所指的动作归类，不要只看这一句的字面。
+  - **两条判定路径一起吃到**：JEV 的 `decide(previous_reply=…)`（协议 + 实现）与大模型那一档
+    共用同一份 `_user_prompt`，所以一处改动两处同时生效。
+  - **重判（`handoffTask` 的回调）也带上**：回调契约仍是 `(message, history)` 两个参数，
+    `chat()` 用 `functools.partial` 把 session 与「助手上一轮」先绑进去。
+  - 与用户历史**同一个开关**：`INTENT_HISTORY_TURNS=0` 时不碰库（库连不上时那一跳会白等一个
+    超时）；读失败只降级成「不带这段上下文」，不打断本轮。
+- **关键决策**：
+  - **不「先改写再判」**（用户提的另一条路）：改写做的事就是把上下文揉进一句话，而现在直接把
+    上下文交给判定器 —— 省一次模型调用与 1~2 秒延迟，也少一处会漂的措辞。
+  - **取尾部而不是 `summary`**：那句反问在末尾，`summary` 只有前 200 字，正好切掉它。
+  - **不加规则兜底（C）**：按用户口径不做。
+  - 成本：判定输入 +~200 token（实测那次判定是 1,358 token 输入）。
+- **验证**：
+  - 全量 `pytest` **1143 passed**（新增 14 条：节选取尾 / 按句切 / 无标点不切、prompt 里有它
+    且在「本轮消息」之前、没有就不加那一格、system prompt 含新规则、JEV 与大模型两条路都拿到、
+    service 只读一次且参数正确、窗口 0 不碰库、读失败降级、重判回调仍是两个参数）；`ruff` 干净。
+  - **真库自检**：那次误判的回复（536 字）现在会被摘成一段尾部节选，**结尾正是
+    「要不要我把方案正文修复一遍再给你确认？」** —— 判定终于看得到指代对象。
+- **遗留**：
+  - **要重启后端才生效**。
+  - 只解决「指代句」这一类误判；**plan 41 的正文为什么会被写坏**（长输出的自我修补 + 尾部截断）
+    是另一件事，仍未处理。
+
+#### 方案正文不再被抄来抄去：planner 只回报摘要、主控不把方案贴进 coder 的任务
+
+- **动机**（用户口径）：先做「减少上下文 token」清单里的前两条。
+- **定位（实测那一轮 `a9379a36ddec`，阿里云短信）**：同一份方案在上下文里**出现 4 次、留下
+  2 份副本** —— planner 生成（`storePlan`）→ planner 回报主控（**6,270 字**）→ 主控抄进 coder
+  的任务描述 → coder 又 `get_unexecuted_plan` 取回库里那份（**10,915 字**，与上面那份还不是
+  同一版本）。之后**每次都重发**：主控 8 次、coder **79 次**、planner 1~2 次。
+  两处 token 跳变独立吻合（≈0.68 token/字）：主控 `57,832 → 62,072`（+4,240 / 6,270 字）、
+  coder `14,819 → 22,211`（+7,392 / 10,915 字）→ **光这一项 ≈96 万 input tokens**
+  （占全轮 6.97M 的 13.8%），还埋着「两份版本谁为准」的隐患。
+- **改动**（都在 `agent/prompts.py`，不动工具与代码）：
+  1. `_PLAN_METHOD` 新增第 6 条「**回报 / 答复只写摘要，不抄方案全文**」：子智能体形态回报
+     `plan_id` + 3~8 行摘要（做什么 / 关键决策 / 风险与不确定项 / 待确认点）；plan 形态同样只给
+     摘要 —— 全文由「方案」链接承载。
+  2. 主控编排段（编码流程 c）与 coding 意图指令第 3 步：派 coder 的任务描述**只给 `plan_id` 与
+     目标 / 边界，不要抄方案全文**（coder 自己 `get_unexecuted_plan` 取，那是唯一权威的那份）。
+  3. 「调度原则」加一条通用约束：**不搬运长文**（方案全文、清单原文、大段日志、文件内容），
+     只给引用（`plan_id` / PR 编号 / 路径 / 命令）。
+  4. coder 取计划那一步补一句：**方案正文只有这一个来源**，任务描述里不会带全文，别因此停下来反问。
+  5. `_ROLE_PLAN_MAIN`：把「把方案呈给用户」明确成「把**摘要**呈给用户（全文在库 / 链接里）」。
+- **关键决策**：
+  - **plan 形态也给摘要**（这是一处行为变化）：用户在聊天里看到的是摘要 + 方案链接，而不是上万字
+    的方案墙；全文仍可点开 —— 与「方案改成聊天里的一条链接」的既有口径一致。要恢复成全文照旧的话，
+    只回退这一处即可（planner 与主控那两条可以留着）。
+  - **只改提示词、不动工具契约**：coder 本来就该调 `get_unexecuted_plan`（它的工作流第 2 步写着），
+    所以这一刀不引入新的失败模式，也不改任何写路径。
+- **验证**：
+  - `tests/test_prompts.py` **116 passed**（新增 4 条钉住这几句，防止后续编辑悄悄回退）；
+  - `scripts/check_prompts.py`：**渲染 8 份成品提示词、冲突扫描 0 条**（AGENTS.md 的硬要求）；
+  - 全量 `pytest` **1129 passed**；`ruff` 干净。
+- **遗留**：
+  - **要重启后端才生效**（提示词在建会话时读取）。
+  - **收益待下一轮真机量化**：看 coder 第一次调用的输入是否少了那 ~4.2k、以及 `get_unexecuted_plan`
+    的结果是否成了唯一那份方案。
+  - 清单（`write_todos`，每次整份重发，几百 token）与「老工具结果出上下文」没做 —— 后者是最大
+    的一刀（coder 5.4M / 79 次），要单独立项定「保留规则」。
+
+#### Redis 命令加一层兜底超时：`socket_timeout` 管不到写阻塞（真机实测一条命令等了 556 秒）
+
+- **动机**（真机观察到的）：隧道被重建的那一刻，降级日志里出现
+  `运行缓冲 不可用（这条命令花了 **556243 ms** 才失败）` —— 配置的 `socket_timeout` 是 5 秒，
+  它没兜住这一条。
+- **定位**：`socket_timeout` 只管**读**。隧道半死时**写**会一直阻塞（asyncio 的 drain 要等
+  TCP 自己放弃，默认十几分钟量级），于是那一条命令的结果能拖到九分钟才回来。它不影响事件
+  循环（别的东西照跑），但没有任何一层在管「一条命令最多等多久」。
+- **改动**：
+  - `redis_cache.py` 新增 `COMMAND_GUARD_FACTOR = 3` 与 `command_guard_seconds(settings)`；
+    `RedisBacked.run()` 用 `asyncio.wait_for` 把**整条命令**兜住，超时按失败处理 → 走进程内
+    与冷却纪律（`_degraded_until`），不新增一条出口。
+  - 三个实现（熔断 / 运行缓冲 / 运行权）与装配处（`api/app.py`）透传 `guard_seconds`，
+    与上一批 `cooldown_seconds` 同一套走法。
+- **关键决策**：
+  - **兜底跟着配置的 socket 超时走（×3），不写死常数**：把超时放大到 30 秒的部署（远端 /
+    慢隧道），不该被一个 15 秒的兜底先掐掉 —— 写死就与配置的意图相反。再乘 3 是因为一条
+    命令可能是「取号 + 入列 + 过期」这种几次往返。
+  - `REDIS_TIMEOUT_SECONDS=0`（redis-py 语义＝不超时）时兜底也是 0 ＝ 不兜底，与配置一致。
+  - 兜底只是**上限**，不改降级纪律：超时那次照样记「花了多少毫秒才失败」并进冷却。
+- **验证**：全量 `pytest` **1125 passed**（新增 3 条：挂住的命令被掐掉且日志里记的是
+  `TimeoutError`、正常的慢命令（隧道量级）不被掐、兜底值跟随配置）；`ruff` 干净。
+- **遗留**：**要重启后端才生效**。
+
+#### 「本次产出」第一版有两处字段名是猜的：真机一轮就露馅（含「那批大输出是思考」的结论）
+
+- **动机**：用户重启后跑了一轮新的 coding 任务，让我观察上一批那行诊断。第一个数据点就
+  自相矛盾：planner 那次调用**输出 3,936 tokens**，这行却写「可见正文 0 字 / 思考 0 字 /
+  工具参数 185 字」。
+- **两处都错在「照自己的想当然写字段名」，而不是读上游契约**：
+  1. **思考那一格读错了键**。v3 的 `reasoning-delta` 把文本放在 **`reasoning`** 字段里，
+     正文才是 `text-delta` + `text`（见 `langchain_core.language_models._compat_bridge
+     ._to_content_delta`）。我照正文的字段名去读思考 → **永远是 0 字**。
+     **测试里的假事件也写错了同一个字段名**（`tests/v3_events.py::reasoning` 用的是 `text`），
+     于是代码与测试一起错、跑多少个用例都是绿的 —— 这正是「假事件照着自己想当然写」的代价。
+  2. **用量里思考 token 的两个键都不对**。v3 事件里那份用量是 LangChain 归一后的
+     `UsageMetadata`：思考在 `output_token_details` 里、键就叫 `reasoning`（按服务档位加
+     前缀，如 `priority_reasoning`，见 `langchain_openai.chat_models.base
+     ._create_usage_metadata`）。我查的是 `completion_tokens_details` /
+     `output_tokens_details`（那是 OpenAI 原始形状与 Responses 形状）→ 这一格也一直不出。
+  3. 顺手修一个少算：**工具参数原来跨 block 取最大值**，而一次消息里可以并行多个工具调用
+     （本轮实测三个并行 `read_file`/`grep`）→ 改成**逐 block 求和**（每个 block 自己仍取
+     累加值的最大值）。
+- **结论（用户问的那件事）**：正文那一格是**读对了**的，真机读到 0 字；而桥接保证
+  text/reasoning 块**一定**发一条 delta（只有 tool_call/image 这类已定型的块才只发 finish）
+  ⇒ **那次调用根本没产出正文块** ⇒ 3,936 − 465（工具参数）≈ 3,400 tokens 只能落在**思考**
+  上。上一轮那 4.8 万输出 tokens 同理：**主要是模型的思考 token，不是被丢掉的旁白草稿**。
+  所以改法方向是「管住思考」（关/降 GLM 的思考、给 planner 换模型、或收短探索预算），
+  而不是「约束子智能体别写草稿」。
+- **改动**：`observability/run_log.py` 的 `_note_delta`（读 `reasoning` 键）、
+  `reasoning_tokens_of`（改认 `output_token_details.reasoning`，并保留两种原始形状作兜底）、
+  `_take_output_detail`（工具参数逐 block 求和）；`tests/v3_events.py::reasoning` 改成真形状
+  并把「**不要改回 `text`**」写进它的说明。
+- **验证**：全量 `pytest` **1122 passed**（新增 4 条：字段名与夹具形状、服务档位前缀、
+  OpenAI 原始形状、并行工具调用求和）；`ruff` 干净。
+- **遗留**：**还要再重启一次**这版才生效（这一轮跑完再重启即可），之后「思考 N 字」与
+  「网关记的思考 token N」才会有数。
+
+#### 诊断「一轮 64 分钟」：给大调用补一行「产出明细」（可见正文 / 思考 / 工具参数各多少字）
+
+- **动机**（用户口径）：上一批分析出那一轮 64 分钟里 planner 的 4 次调用吐了 **4.8 万输出
+  tokens、占 20 分钟**，但**分不清**那 4.8 万是什么 —— 是模型的**思考 token**、是子智能体
+  **被前端丢掉的旁白**，还是**工具参数**？三种可能对应三种完全不同的改法（关思考 / 改提示词
+  约束草稿 / 换模型）。所以先补证据、再动手（用户拍：「先做 1」）。
+- **改动**（`observability/run_log.py`，都在同一份事件流上，不碰 SSE 契约）：
+  - `on_message` 现在也认 `content-block-delta`：`text-delta` 与 `reasoning-delta` 都是
+    **增量**，各按 `namespace` 分桶累计字数；`block-delta` 的 `args` 是**累加值**（bridge
+    已按 block 下标把 `tool_call_chunks` 拼好 —— `stream.py` 同一处注释也是这么说的），
+    所以取**最大值**而不是求和，否则同一份 JSON 会被数好几遍。
+  - `message-finish` 时**无条件取走并清零**（小调用也要清）：不清的话，一串小调用的增量会
+    攒到后面某个大调用头上，那一行就成了假账。
+  - **输出 ≥ 2000 tokens** 的调用多记一行
+    `本次产出：可见正文 N 字 / 思考 M 字 / 工具参数 K 字`。门槛是模块常量
+    `DETAIL_OUTPUT_TOKENS`（正常调用只有几百 token，不该被这行淹掉；想每次都看就设 0）。
+  - 网关若单列了思考 token（`completion_tokens_details.reasoning_tokens`，也认
+    `output_tokens_details`）就一并写出来 —— 那是比字数更硬的证据。**没报就不写**
+    （「没报」与「报了 0」不是一件事）。
+  - 真的一个增量都没收到时，如实写 `没有收到任何输出增量`，而不是假装 0 字。
+  - `_accumulate` 改收调用方解好的 `(输入, 输出)`：同一条事件既记账又判明细，解两遍容易
+    两处各认一半。
+- **关键决策**：
+  - **门槛式，不是全量 dump**：这行是一个长期可用的诊断（「这次调用为什么慢」），不是一次
+    性的调试输出，所以默认只在大调用上出现。
+  - **分三类数 delta，而不是只看 usage**：在 usage 里「思考」与「旁白」长得一模一样（都算
+    output tokens），只有 delta 的**类型**分得开 —— 这正是这次要回答的问题。
+  - 不改日志既有那行的格式：`LLM 调用完成：输入 … / 输出 … tokens` 有测试逐字钉着，明细
+    单独一行，两者互不干扰。
+- **验证**：
+  - 全量 `pytest` **1118 passed**（新增 7 条）；`ruff check` 本次改动文件干净。
+  - 新用例：正文与思考分开计、小调用不记这行、计数不串到下一次调用、子智能体那次归到
+    **它自己**名下（planner）、网关报了思考 token 才写那一格、工具参数按累加值只算一次。
+  - 事件形状照 `tests/v3_events.py`（照真机探针实测造的）—— 与 `stream.py` 读同一批字段
+    （`payload["index"]` / `delta["fields"]["args"]`），口径只有一处。
+- **遗留**：
+  - **真机确认要等下一次运行**：这行只在真实一轮里才有数据。重启后端跑一轮，
+    `grep 本次产出 logs/agent.log`（或直接看右栏「日志」面板）就能看到那 4 次大调用的里子，
+    再按结论决定改哪一处。
+  - 本轮没动任何影响行为的东西：不提速、不换模型、不改提示词。
+
+#### Token 面板复核：主控的**真名**没被认出来，上下文压力整块是死的（+ 三处小账）
+
+- **动机**（用户口径）：「token 面板已经做了，你看一下」—— 复核时在**真机**上发现
+  「上下文压力」那一整块静默失效，面板里第一行还挂着一个英文名。
+- **定位（三条真机证据，不是读代码猜的）**：
+  1. 真库 + 真接口：`GET /sessions/cb4c905c…/usage` 回
+     `context.max_input = 0 / ratio = 0.0`，`actors[0].key = "ai-coding-harness"` ——
+     而同一轮的 `logs/agent.log` 明明写着「LLM 调用完成：输入 26432」。
+  2. `agent/graph.py` 建主智能体时传了 `name="ai-coding-harness"`，于是**主控那一路模型
+     调用的 `lc_agent_name` 就是它**（当日日志里 3094 行 `[ai-coding-harness]`；只有
+     `service.py` 手写的那几行是 `[main]`）。
+  3. 而 `run_log._account_key` 只把**占位名** `MAIN_AGENT`（`"main"`）归成 `main`，
+     `_main_peak_input` 又只在 key == `main` 时累加 → 真机上峰值恒 0。对照实验：
+     同一条事件喂 `agent="None"` → 归 `main`、峰值 26432；喂 `agent="ai-coding-harness"`
+     → 归到英文名、**峰值 0**。
+  - **为什么测试没抓到**：测试助手的默认署名就是占位串 `"None"`，而代码正是照那个假设写的；
+    `run_log` 文档里那句「主智能体是字符串 `"None"`」在设了 `name=` 之后就不成立了。
+- **改动**：
+  - **主智能体的真名只有一处定义**：`observability/logging.py` 新增 `MAIN_AGENT_NAME`，
+    `graph.py` 的 `name=` 改用它；`run_log` 判「是不是主控」用
+    `{MAIN_AGENT, MAIN_AGENT_NAME}`（归账与峰值共用这一处），并修掉两句过期注释。
+  - **旧账按同一规则归一次**（读路径）：新增 `run_log.account_key()`，写账与读账
+    （会话级聚合、单条记录的 `usage`）共用 —— 本功能刚上线的那几轮把主控记在真名下，
+    不归的话面板与消息角标里会冒出一个英文名。
+  - **`totals.calls` 补上**：轮账与聚合都给了这一格（聚合以前恒为 0，而 `by_actor` 里明明有）。
+  - **「意图分类」也算进总数**：以前它只进 `by_actor`，于是 `totals` 小于各角色之和 ——
+    界面上的「合计」与下面那些行自相矛盾。
+  - **压缩之后不再虚高**：新增 `_main_last_input`（本轮主控**末值**），`_turn_context` 在
+    「这一轮压过」时改用末值 —— 峰值是压缩前那一次，用它会让提示永久停在「接近压缩线」，
+    而历史其实已经掉到 10%。
+  - **JEV 那一关的账有人接了**：`decide(usage=…)` 由 `detect_intent` 把自己的累加器传下去；
+    删掉 `JevDecider` 上那份没人读、还从不 reset 的 `self.usage`（将来谁接上就会把历史几轮
+    一起算进当轮），顺手修掉 `usage` 变量被后面日志那几行覆盖的写法。
+  - 文档：README 的 API 清单补上 `/memory`、`/pulls`、`/logs`、`/logs/download`、`/usage`
+    （前四个是上一批就漏的）。
+- **关键决策**：
+  - 主控名字**只在归类处**归一（推荐 a）：日志行仍署真名（它是有信息量的），账与压力用归类名。
+  - **读路径也归一次**，不是只修写路径：库里已经躺着的那几轮正是这次复核的对象，界面上
+    不能两种名字并存。规则只有 `account_key()` 一处，不算多一份口径。
+  - 压缩口径按推荐 b（末值）：**实时那条压力条取最近一轮的账**，所以压完会跟着降下来；
+    面板里那一段仍取会话内**最紧**的一档 —— 它自己写着「峰值输入」，两个标签口径不同，
+    已经在各自的说明里写清。
+  - **不算钱**、**缺数据不当 0** 这些原有的口径没动。
+- **验证**：
+  - 全量 `pytest` **1111 passed**（本次净增 5 条：真名归类、压缩后回落、旧账合并、
+    JEV 累加器、接口合计调用数）；`ruff check` 本次改动文件干净。
+  - **真机（真库 + 真路由，只读）**：聚合回 `actors[0].key = "main"`、`totals.calls = 1`；
+    单条记录的 `by_actor` 也归成 `main`；对照探针里两种署名现在都归 `main` 且峰值 26432
+    （修前真名那份是 0）。
+  - `npm --prefix frontend run build`（`vue-tsc -b && vite build`）**通过**。
+  - 顺带把上一批记错的两条遗留结掉：`npm run build` 现在跑得通；pytest 那 60 条
+    `%TEMP%` setup 错误也消失了（全量 1111 条 0 error，进度表已从 1046 改成 1111）。
+- **遗留**：
+  - **要重启后端才生效**（8000 上跑的还是旧进程）。重启后跑一轮：主控那行会显示「主控」，
+    输入框上方的压力条会出现。
+  - 旧那一轮（`cb4c905c` 的 17:15 qa）**存下来的** `context.max_input` 与 `totals.calls`
+    都是 0（旧代码写的），回填不出来；新轮次正常。消息角标对老记录按 `by_actor` 自己数调用数，
+    所以那一轮显示 1 次调用，不是 0。
+  - 会话 `cb4c905c` 仍 `running=True`：10-12 17:16 那条 coding 消息没有对应记录，日志停在
+    17:37:18 planner 的最后一次工具返回（后端进程 17:14 起、还活着）。看着像那一轮卡住了 ——
+    与本次改动无关，待单独排查。
+
+#### 消耗记到消息上 + 上下文压力提醒（顺手修掉一个「80% 触发压缩」的错口径）
+
+- **动机**（用户两条口径）：① 会话的 token 消耗应该**展示在每条消息记录上**，不能只在右栏
+  面板里；② 上下文压缩是超出窗口才发生的，那么**快到压缩时应该给用户提个醒**（原话里还
+  带一条「可以归档本次聊天记录」，后经用户拍板**归档先不做**，本次只做提醒）。
+- **顺带修掉的错口径（实测核对，不是猜的）**：项目里两处写着「压缩在窗口 **80%** 触发」
+  —— README 与 `config.py` 的注释。真身在上游
+  `deepagents/middleware/summarization.py:243` 的 `_summarization_defaults`：
+  `trigger=("fraction", 0.85)` / `keep=("fraction", 0.10)`（模型带 `max_input_tokens`
+  时走这套；不带 profile 时改用固定 `170000` tokens —— 所以窗口值必须准）。两处一起改成
+  **85% 触发、压缩后保留 10%**，`.env.example` 也补上了新的两个阈值键。
+- **改动（记账层）**：
+  - `observability/run_log.py`：`AgentRunLog` 新增两个计数 —— **主控单次调用的输入峰值**
+    （`peak_input`）与**本轮的压缩次数**（`compressions`）。两个判断都写进了注释：
+    压力**只看主控**（子智能体各有窗口，coder 是 1M，拿它的输入比主控窗口会得出「永远
+    安全」的错结论）；压缩的判据用**现成的内部调用信号**（摘要只在压缩时发起），不去上游
+    埋钩子。`usage_snapshot(context=…)` 多一格上下文。
+  - `server/service.py`：新增 `_main_window()`（按**本轮主控形态**取模型窗口，形态→角色
+    复用 `llm._provider_attr`，只有一处口径）、`_ratio()`、`_turn_context()`。
+    `_turn_usage()` 现在带 `context`；`_context_state`（会话 → [峰值, 压缩次数]）**跨轮**
+    存在服务实例上 —— 压力问的是「这个会话涨到多大了」，逐轮清零只看得到本轮那点量。
+  - `config.py`：新增 `context_warn_ratio`（0.6）/ `context_alert_ratio`（0.8），
+    **只提醒、不改行为**（压缩仍由上游在 85% 触发）。
+- **改动（出口）**：
+  - **消息记录带上账**：`schemas.RecordItem.usage`（新 `UsageDetail` / `UsageTokens` /
+    `UsageContext`），`get_records` 用 `_usage_detail()` 从 `extra["usage"]` 提出来 ——
+    前端不必知道内层形状；形状不对一律 `None`（老记录只该让角标不显示，不该报错）。
+  - **实时也带上**：`_run_agent` 正常收尾后补一帧 `{"type": "usage", …}`。发在正文**之后**
+    → 天然贴在回复末尾；不刷新页面就能看到本轮的账。
+  - `/sessions/{id}/usage` 的聚合新增 `context`：取**各轮里最紧的一档**（峰值最大、窗口
+    最小、压缩次数最多）—— 用户问的是「现在有多满」，报最松的那轮等于粉饰；`ratio` 由
+    服务端按取到的极值**重算**，不抄某一轮那个（否则会出现 105000/256000 这种假比例）。
+- **改动（界面）**：
+  - **消息角标**（`App.vue` + `style.css`）：助手消息的时间行上方一行很轻的元信息
+    `● 输入 12.3k · 输出 0.9k · 8 次调用`，点开就地展开按角色的明细（最多 4 项）。中断的轮
+    带「（中断）」、缺用量的带「N 次无用量」。**默认显示**（藏起来等于没做），开关在 Token
+    面板里，选择记在本地（复用既有的 `readPref` / `writePref`）；展开态用**绝对下标**
+    （`hiddenCount + i`），与待办折叠同一套 —— 窗口往前滑时下标不能跟着变。
+  - **上下文压力条**（输入框上方，`ctxbar`）：<60% 什么都不画，≥60% 一条细进度条，≥80%
+    转警示色并写明「接近 85% 压缩线：下一条消息可能触发压缩，回复会变短」；已压缩过就带上
+    「已压缩 N 次」。取**最近一次拿到的账**（本轮还没账时留上一轮的），否则会一闪一闪。
+  - `UsagePanel.vue` 加「上下文」一段（进度条 + 峰值/窗口/占比 + 压缩次数）与那个开关。
+  - **顺手修掉上一批的一个真 bug**：`api.ts` 里 `UsageSnapshot` 写的是 camelCase
+    （`roundsWithUsage`），而接口回的是 snake_case —— 读一个不存在的键得到 `undefined`，
+    「另有 N 轮没有用量数据」那句**永远不显示**，而且不报错。接口字段一律照原样（注释里
+    写清为什么：改名的活在前端做只会多一处会漂的地方，漂了还不报错）。
+- **关键决策**：
+  - **阈值分两档**：单档要么太晚（85% 时下一条就压了，来不及做任何决定），要么太早
+    （刚开口就报警，成了噪声）。60% 起让人**有预期地看着它涨**，80% 才给一句话。
+  - **压力按「主控峰值输入」算，不自己估消息长度**：系统提示 + 仓库记忆 + 工具 schema
+    都是输入的一部分，估算必然偏；而实测的 `input_tokens` 就是真实占用。
+  - **归档不做**（用户拍板）：所以 80% 那条提示**目前没有可点的动作**，纯粹是让人有预期。
+    要恢复的话，`/conversation_history/{thread_id}.md` 里存着被压掉的原文（每次压缩追加
+    一节）—— 但那份**没过脱敏**，导出会成为一个新的凭据出口，届时必须重过一遍脱敏。
+  - **`UsageDetail` 与 `UsageSnapshot` 是两个类型**：一个是那一轮的原始账、一个是把它加
+    起来的视图；共用 `UsageTokens` / `UsageActor`，免得同一个概念长出两种字段名。
+- **验证**：
+  - 全量 `pytest` **1046 passed，0 failed**（本次净增 7 条：`tests/test_token_usage.py`
+    从 14 → 21；另有 6 条既有断言因多了一帧 `usage`／`extra.usage` 多了 `context` 而更新）。
+    `ruff check --no-cache` 本次改动文件干净。那 60 条 setup 错误仍是 pytest 临时目录被本机
+    文件沙箱挡住，与本次无关。
+  - 新增用例：**子智能体的 90 万输入不算进压力**（把「拿子智能体窗口比主控」这个错结论钉死）、
+    压缩次数来自内部调用、窗口跟着**本轮主控形态**走（coding/plan→GLM、review→Kimi、
+    qa→GPT）、峰值与压缩次数**跨轮累计**、**按会话隔离**（不串台）、窗口未知时不瞎算比例、
+    接口取最紧的一档且**重算 ratio**。
+  - 前端：`vue-tsc` 对 app 与 node 两份配置**均通过**（仍是临时 tsconfig 绕开
+    `node_modules/.tmp` 写不进去的问题，临时文件已删）。
+- **遗留**：
+  - **要重启后端才生效**（8000 上跑的仍是旧进程）；前端刷新即可。
+  - **`_context_state` 在进程内存里**，重启归零：重启后第一次拿到的压力会偏低（要等下几轮
+    涨回来）。它是**提示**不是账，所以没为此建表 —— 真要跨重启准，得把峰值落进会话行。
+  - **峰值只反映「主控调过的最贵那一次」**，不等于「下一条消息的输入」：下一轮还会带上这轮
+    的新内容。所以 85% 附近那条提示说「**可能**触发压缩」而不是「一定」。
+  - **没有真机跑一轮验证界面**：本机后端要重启，本轮只做了逻辑层核对与类型检查。重启后
+    发一条消息，看回复下面有没有那行角标、输入框上方有没有压力条即可确认。
+  - 归档（含导出 `/conversation_history/`）仍待做，见上面「关键决策」里的安全说明。
+
+#### 右栏新增「Token」标签：按执行主角记账（右栏视图列表里最后一个）
+
+- **动机**（用户口径，四条都点过）：右栏视图里最后一个没做的是 Token 消耗。它也是复盘时
+  唯一能给出**量化**的那一项 —— 在此之前项目里没有任何成本数字可引用。
+- **改动（记账）**：
+  - `observability/run_log.py`：新增 `usage_numbers()`（**两种字段名都认**：
+    `input_tokens`/`prompt_tokens`、`output_tokens`/`completion_tokens`），`usage_of()`
+    改成调它、只管渲染日志那一行。`AgentRunLog` 开始**记账**：每次 LLM 调用的用量按
+    执行主角累加，新增 `usage_snapshot()` 输出本轮那份账。归属**沿用日志那套 `actor()`**
+    （`lc_agent_name` + `namespace` 反查），所以账与日志不会各说各话。
+  - 归类名三个常量：`MAIN_ACTOR`（主控，账上不用日志那个中文占位名）、`INTERNAL_ACTOR`
+    （中间件自己的调用，目前只有上下文摘要）、`INTENT_ACTOR`（意图判定，流外调用）。
+  - `server/service.py`：`_turn_usage()` 把「智能体链路（按主角）+ 意图判定那一笔」合并
+    成记录里的 `extra["usage"]`；**三处出口都写**：正常收尾、`TurnStop` 中止、异常中断
+    （`_record_interrupted` 新增 `usage=` 参数）。每轮开头清空判定累加器
+    （`self._intent_usage`，它挂在服务实例上，因为重判要跨调用累加）。
+  - `server/intent.py`：`detect_intent()` 新增可选 `usage` 累加器，`_record_usage()` 解
+    `usage_metadata` 或 SDK 原始对象；JEV 那条路在**请求成功处**就记（后面「认不出的标签」
+    会返回 `None` 交给下一关，但那次调用是真花了钱）。
+- **改动（接口 + 面板）**：
+  - `GET /sessions/{id}/usage`（`api/routes/sessions.py` 的 `_aggregate_usage`）+
+    `api/schemas.py` 的 `UsageActor` / `UsageSnapshot`：聚合各轮记录，按主角求和、
+    **花得多的排前面**（与 PR 面板「未合并排最前」同一考虑）。
+  - `frontend/src/UsagePanel.vue`（新）：三段总数 + 按角色的横条 + 明细表；`api.ts` 加
+    `getUsage()` / `UsageSnapshot`；`App.vue` 加第五个标签（`rightTab` / `panelTabs` /
+    `activeTab` / `panel-body` 各一行 —— 这套就是为此设计的）；`style.css` 加
+    `.usage-*` 一族（无图表库，横条是一层 div）。
+- **关键决策**：
+  - **不加表、不加列、不需要迁移**：一条记录一份 usage，与 `session_records` 是 1:1
+    （同一个 `(session_id, created_at)` 轴），直接放进本来就在的 `extra` JSONB。拆表只多一次
+    join、还要多一条迁移；将来要跨会话做「按天 / 按模型」统计时再迁。
+  - **不算钱**（用户点）：各家计价口径与缓存折扣不同，显示一个错的金额比不显示更糟。
+  - **中断的轮次也算**（用户点）：钱真花了，只如实标 `interrupted`，界面说明这段数字不完整。
+  - **缺数据绝不当 0**：平台没回用量 → `missing` 计数；本功能上线前的记录 → `rounds` 与
+    `rounds_with_usage` 分开回报，界面写「另有 N 轮没有用量数据」。这是本次最容易糊弄、
+    也最容易看错的一处。
+  - **摘要调用单列**：实测单次就有 **7 万~8 万输入 tokens**，并进「主控」名下等于把最大的
+    一笔开销藏起来。**第一次手动核对就证实了这个判断**：主控 24,895 + coder 12,000 +
+    摘要 72,301 的一轮里，摘要占 **65%**。
+  - **先不做 SSE 实时推**（用户点）：本轮结束刷新面板即可；实时推要动 SSE 帧契约。
+- **验证**：
+  - 全量 `pytest` **1039 passed，0 failed**（本次净增 14 条：`tests/test_token_usage.py`；
+    另 2 条既有断言因记录里多了 `usage` 而更新）。`ruff check --no-cache` 本次改动文件干净。
+    另有 60 条 setup 错误全部是 `PermissionError: WinError 5 → %TEMP%\pytest-of-<user>`，
+    即 pytest 临时目录被本机文件沙箱挡住，**与本次改动无关**（改动前即如此）。
+  - 新增 `tests/test_token_usage.py` **14 例**：两种字段名都认且认不出返回 `None`（不是
+    `(0,0)`）、账初始为空、按主角分组（主控/子智能体）、摘要单列、**认不出的用量记
+    `missing` 且不进总数**、中断标记、判定那笔单独归一类、口令命中不产生该项、中断轮次的账
+    跟着记录落库，以及接口层：求和与排序、缺数据的轮次如实上报、空会话、
+    **脏数据（JSONB 不干净）不打挂面板**、非法 id 400。
+  - 前端：`vue-tsc` 对 app 与 node 两份配置**均通过**（`npm run build` 见遗留 —— 卡在
+    `vite build` 的进程派生受限，不是类型问题）。
+  - 手动端到端核对（假事件走真记账 + 真聚合）：`main 24,895/2,645`、`coder 12,000/900`、
+    `internal 72,301/3,339`，总数 `109,196/6,884`，排行 `internal > main > coder` —— 与
+    `logs/agent.log` 里既有那两类行（「LLM 调用完成」「摘要调用完成」）逐条对得上。
+- **遗留**：
+  - **要重启后端才生效**（8000 上跑的仍是旧进程）；前端是 vite 热更新，刷新即可。
+  - **`npm --prefix frontend run build` 在本机跑不通**（两处都不是本次改动引起的）：
+    ① `vue-tsc` 写 `frontend/node_modules/.tmp/*.tsbuildinfo` 被拒（该目录写不进去，已用
+    诊断脚本补过权限仍未过）；② `vite build` 在 `optimizeSafeRealPathSync` 里
+    `spawn EPERM`（沙箱不允许捕获子进程输出）。本次改用**临时 tsconfig 把 tsbuildinfo 指到
+    可写处**完成了两份类型检查（临时文件已删），但**产物未构建**。要出产物请在本机不被沙箱
+    限制的终端里跑一次。
+  - **本功能上线前的会话看不到账**：那些记录里没有 `extra.usage`，且**回填不出来**（当时
+    没记）。面板对这类会话显示空态，不会显示成「消耗 0」。
+  - **JEV 判定那笔没入账**：它走 SDK、用量对象形状未核对；本次只记了分类模型那笔
+    （`intent` 这一类）。顺带记：`classifier_model` 当前实现是**临时直连 deepseek**，
+    所以本轮「意图分类」这一项其实花在主模型上。
+  - **没有真机跑一轮验证面板**：本机后端要重启、本轮只做了逻辑层核对与类型检查；
+    重启后点开「Token」标签对一眼 `logs/agent.log` 的用量行即可确认。
+
 ### 2026-10-11
+
+#### Redis 降级根因：`127.0.0.1:6379` 其实是 SSH 隧道，1 秒超时 + 「一次失败即永久降级」把它变成一锤子买卖
+
+- **动机**（上一条留的遗留项）：「Redis 上的 运行缓冲 不可用，本进程后续退回进程内实现」这条
+  WARNING 反复出现（用户说「redis 本身是可以连接的」），而它有真实后果 —— 正是它留下了
+  那个骗了近一小时的半成品缓冲（见上一条）。
+- **定位（实测，不是猜的）**：
+  1. 日志里 3 次同样的 WARNING，都是**一轮对话开始后 1~2 秒**：`12:54:43` / `20:43:39` /
+     `21:20:43`，异常是 `TimeoutError: Timeout reading from 127.0.0.1:6379`。
+  2. 但服务端一点都不慢：Redis **慢日志是空的**；客户端 `PING` 往返 20 次的分布是
+     **min 59.3ms / median 62.0ms / p95 92.7ms / max 94.0ms**。本机回环不该有 60ms。
+  3. `netstat` 找到了那 60ms：`127.0.0.1:6379` 与 `127.0.0.1:5432` 由**同一个 `ssh` 进程**
+     （PID 50028）转发 —— 所谓「本机 Redis / 本机 PG」其实是 SSH 隧道另一端。
+  4. 于是「1.0 秒超时」的真实含义是：只给 16 倍余量，**一次 TCP 重传（通常 ≥200ms、
+     连丢可到 1s 以上）就能把一条命令顶过超时**。
+  5. 而旧纪律是 **「第一次失败即永久降级」** —— 一次瞬时抖动 = 这个进程此后彻底失去跨进程
+     能力（跨 worker 可见性、运行权、帧重放全没了），要**重启后端**才回来。代价与收益完全
+     不成比例。（顺带排除了一个错误假设：JEV / SystemOne 不阻塞事件循环 —— 实测调用 2.62s
+     期间事件循环最大延迟 63ms、Redis 命令最大 93ms。）
+- **改动**：
+  - **放大超时**：`config.py` 的 `redis_timeout_seconds` 默认 `1.0 → 5.0`（注释里写清上面这组
+    实测数字）；`.env.example` 同步成 `REDIS_TIMEOUT_SECONDS=5.0` 并说明「远端 / 走隧道必须
+    放大」。
+  - **降级改成「失败 → 冷却 → 再试一次」**：`redis_cache.py::RedisBacked` 新增
+    `cooldown_seconds`（默认 60s，配置键 `REDIS_DEGRADE_COOLDOWN_SECONDS`）。失败时记下
+    「冷却截止时刻」，窗口内直接走进程内（不白撞超时），**窗口过了再试一次**，成功即恢复并留
+    一条 `已恢复（冷却结束后的重试成功）` 的 info；再失败就重新进冷却。`degraded` 属性由
+    「一个布尔位」变成「现在是否在冷却窗口内」。
+  - **失败日志带上耗时**：`（这条命令花了 %.0f ms 才失败）` —— 只说「不可用」分不清是服务端慢
+    还是链路抖，而 62ms 基线与 1000ms 超时之间差的正是一次重传。
+  - `cooldown_seconds` 从 `api/app.py` 的装配处一路传给三个实现（`RedisCircuitStore` /
+    `RedisRunBuffer` / `RedisRunLock` 的构造函数各加一个参数，默认 60）。
+- **关键决策**：
+  - 保留一个**逃生开关**：`REDIS_DEGRADE_COOLDOWN_SECONDS=0` ＝ 退回旧纪律「一次失败即永久
+    降级」（`_degraded_until = inf`）—— 想要「宁可不要跨进程能力也别每帧白等」的部署不用改代码。
+  - 冷却而不是「指数退避 + 每次必试」：那套需要状态机，而这里要防的只是「半死时每帧白等一次
+    超时」，一个窗口就够了。
+  - 超时与冷却都做成**配置**而不是常量：隧道质量是部署环境的事，不该写死在代码里。
+- **验证**：
+  - `pytest` 全量 **1085 passed**（此前 1080；新增 5 条）；`ruff check` 本次改动文件干净。
+  - 新增回归（`tests/test_redis_cache.py`）：失败 → 冷却窗口内**不再撞 Redis** → 窗口过后重试
+    成功且 `degraded` 回到 False；恢复只记一条 info；冷却后再失败会**重新进冷却**；失败日志里
+    有真实的 `312 ms 才失败`；`cooldown=0` 时过了任意久都不再撞 Redis。
+  - **真机自检**（conda `aicoding` + 真 Redis，探针不入库）：`REDIS_TIMEOUT=5.0` 已生效、
+    `socket_timeout=5.0`、PING 中位 62ms（再次证实隧道）；失败 → 冷却内不白撞 → 冷却结束
+    自动恢复，三个状态都按预期走。
+  - **修掉一个隐蔽 bug**：上一版补 `time.monotonic()` / `perf_counter()` 时忘了 `import time`，
+    `RedisBacked.run` 每次都 `NameError` —— 是这批测试（含既有的运行缓冲 / 熔断用例）先红出来的。
+- **遗留**：
+  - **要重启后端才生效**（8000 上跑的还是旧进程）；`.env` 我已加上 `REDIS_TIMEOUT_SECONDS=5`。
+  - Redis / PG 走 SSH 隧道本身是**部署形态问题**（用户机器上 `localhost:6379` 与 `:5432` 由同一个
+    ssh 进程转发）。长期方案是把它们放到本机或直连，隧道只当开发期过渡 —— 本批只是让平台在
+    这个形态下不被打死。
 
 #### 界面卡在「正在接续本轮」：残留的运行缓冲骗了 `is_running`，用运行权当存活信号
 

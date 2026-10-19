@@ -7,30 +7,45 @@ import {
   destroySession,
   ensureWorkspace,
   getRecords,
+  getClarification,
   getSession,
   listSessions,
   postChat,
   resumeChat,
   type ChatEvent,
+  type ClarificationInfo,
   type PlanInfo,
   type PlanStep,
+  type RecordItem,
   type SessionItem,
   type TodoItem,
+  type UsageContext,
+  type UsageDetail,
+  type ChangesInfo,
+  type FileChange,
+  getRepoDiff,
   type WorkspaceStatus,
 } from './api'
 import { renderMarkdown } from './markdown'
 import MemoryPanel from './MemoryPanel.vue'
 import LogPanel from './LogPanel.vue'
 import PrPanel from './PrPanel.vue'
+import UsagePanel from './UsagePanel.vue'
 import RepoPanel from './RepoPanel.vue'
+import SettingsPage from './SettingsPage.vue'
+import ClarificationDialog from './ClarificationDialog.vue'
+import { defaultPanelTab } from './prefs'
 import { usePanelWidth } from './splitter'
 import { splitLongText } from './streamblocks'
 import { shouldShowTodos } from './todos'
+import { readView, watchView, writeView, type AppView, type SettingsPanel } from './viewState'
 
 /** AI 消息里的三种块；用户消息恒为单个 text 块。待办树固定渲染在回复最下边。 */
 type Part =
   /** `sealed` = 这块已经写完，不会再变（流式分块用，见 streamblocks.ts）。 */
   | { kind: 'text'; content: string; sealed?: boolean }
+  /** 思考：只在前端存在、不落库；与正文同处 `parts`，按到达顺序交错。 */
+  | { kind: 'reasoning'; agent: string; text: string }
   | { kind: 'todos'; items: TodoItem[] }
   /**
    * 方案：以**一条链接**出现在聊天流里，点开就地展开。
@@ -43,9 +58,226 @@ type Part =
 interface Message {
   role: 'user' | 'assistant'
   parts: Part[]
+  /** 历史记录 id；实时消息没有（翻页游标只认历史记录）。 */
+  recordId?: number
   /** 该条消息的时间，ISO 串（历史来自记录，实时取本地钟）；流没结束时是空串。 */
   at: string
+  /**
+   * 这一轮的 token 账（只有 AI 消息有）。历史来自记录里的 `usage` 字段，实时来自 SSE 的
+   * `usage` 帧 —— **两者同一份形状**，所以一条渲染路径。
+   *
+   * 注意它是**这一段对话**的消耗，不是「这一条离窗口上限有多近」：子智能体用的是别的模型
+   * （coder 是 1M 窗口），它们的量也算在这一条上。要看压力看输入框上方那条。
+   */
+  usage?: UsageDetail | null
+  /**
+   * 这一轮改了什么（**建成 PR 才有**）。历史来自记录里的 `changes`，实时来自 SSE 的
+   * `changes` 帧 —— 同一份形状，一条渲染路径。数据是服务端在**本地代码缓存**里算的，
+   * 所以沙箱被回收之后点开某个文件照样看得到 diff。
+   */
+  changes?: ChangesInfo | null
+  /**
+   * 这一轮从什么时候开始跑的（epoch 毫秒）—— 用来在回复最上面显示 `working… 12s`。
+   *
+   * 两个来源：**自己发的**那轮就是发送时刻；**刷新/重新打开时正跑着的那轮**取
+   * **用户那条消息的时间**（用户口径：「未打开场景下突然打开，从现在开始计时 + 从用户发的
+   * 消息算」）—— 于是数字是「这一轮已经跑了多久」，即使我们才刚开始看。
+   */
+  startedAt?: number
+  /** 跑完之后冻结下来的总时长（毫秒）；没跑完就是 undefined */
+  elapsedMs?: number
 }
+
+/** 账目里一组计数的可读写法：`输入 12.3k · 输出 0.9k · 8 次调用`。 */
+function usageSummary(u: UsageDetail): string {
+  const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
+  const calls = Object.values(u.by_actor ?? {}).reduce((sum, a) => sum + (a.calls ?? 0), 0)
+  return `输入 ${k(u.totals.input)} · 输出 ${k(u.totals.output)} · ${calls} 次调用`
+}
+
+/** 角色名（账里的归类名 → 中文），与 Token 面板同一张表。 */
+const USAGE_ACTOR_LABEL: Record<string, string> = {
+  main: '主控',
+  planner: 'planner',
+  coder: 'coder',
+  reviewer: 'reviewer',
+  internal: '摘要',
+  intent: '意图分类',
+}
+
+function usageActorLabel(key: string): string {
+  return USAGE_ACTOR_LABEL[key] ?? key
+}
+
+/** 展开的角标（消息下标 → 是否展开明细）。与待办折叠、方案步骤同一套做法。 */
+const usageOpen = ref<Record<number, boolean>>({})
+
+function toggleUsage(index: number) {
+  usageOpen.value[index] = !usageOpen.value[index]
+}
+
+/** 「这一轮改了什么」的展开状态，同样按**绝对**下标记（与 token 明细一个口径）。 */
+const changesOpen = ref<Record<number, boolean>>({})
+
+function toggleChanges(index: number) {
+  changesOpen.value[index] = !changesOpen.value[index]
+}
+
+const REASONING_AGENT_LABEL: Record<string, string> = {
+  main: '主控',
+  planner: 'planner',
+  coder: 'coder',
+  reviewer: 'reviewer',
+}
+
+function reasoningAgentLabel(agent: string): string {
+  return REASONING_AGENT_LABEL[agent] ?? (agent || '子智能体')
+}
+
+/** 思考块：连续同一角色并进上一块，换了角色就新起一块（与正文同处 `parts`，保持到达顺序）。 */
+function pushReasoning(parts: Part[], agent: string, text: string) {
+  if (!text) return
+  const last = parts[parts.length - 1]
+  if (last?.kind === 'reasoning' && last.agent === agent) last.text += text
+  else parts.push({ kind: 'reasoning', agent, text })
+}
+
+/** 明细行：`主控 12.3k / coder 4.0k`（按用量从大到小，最多显示 4 项）。 */
+function usageRows(u: UsageDetail): { label: string; value: number }[] {
+  return Object.entries(u.by_actor ?? {})
+    .map(([key, item]) => ({
+      label: usageActorLabel(key),
+      value: (item.input ?? 0) + (item.output ?? 0),
+    }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 4)
+}
+
+/**
+ * 「这一轮改了什么」：摘要那一行的文案 + 文件列表的展开状态。
+ *
+ * 折叠状态与「看过的 diff」都按**消息下标**记（与 token 明细同一个口径：窗口往前滑时
+ * 下标不能跟着变，所以用绝对下标）。
+ */
+function changesSummary(info: ChangesInfo): string {
+  const files = info.total ?? info.files.length
+  const added = info.files.reduce((sum, f) => sum + f.added, 0)
+  const deleted = info.files.reduce((sum, f) => sum + f.deleted, 0)
+  return `改动 ${files} 个文件 · +${added} −${deleted}`
+}
+
+/** 状态码 → 一个字母（界面上那一位要窄）：新增 / 改 / 删 / 改名 / 其它。 */
+function changeMark(status: string): string {
+  const head = status.charAt(0).toUpperCase()
+  return { A: 'A', M: 'M', D: 'D', R: 'R' }[head] ?? head
+}
+
+/** 点一个文件：没加载过就现拉一次（服务端在本地缓存里算 + 脱敏 + 截断）。 */
+async function loadDiff(msg: Message, file: FileChange) {
+  if (file.diff !== undefined || file.diffState === '加载中…') return
+  const info = msg.changes
+  if (!info || !currentId.value) return
+  file.diffState = '加载中…'
+  try {
+    const result = await getRepoDiff(currentId.value, info.base, info.head, file.path)
+    file.diff = result.text
+    file.diffTruncated = result.truncated
+    file.diffState = ''
+  } catch (e: any) {
+    file.diffState = `读不到：${e?.message ?? e}`
+  }
+}
+
+/**
+ * diff 正文按行拆开，好给 +/- 上色。
+ *
+ * 只做「加/删/位置/元信息」四类，不做行号也不做语法高亮 —— 这一块是**看改动**，
+ * 不是编辑器；真要看代码上下文的去看右栏的代码面板。
+ */
+function diffLines(text: string): { text: string; kind: string }[] {
+  return text.split('\n').map((line) => {
+    if (line.startsWith('+++') || line.startsWith('---')) return { text: line, kind: 'meta' }
+    if (line.startsWith('+')) return { text: line, kind: 'add' }
+    if (line.startsWith('-')) return { text: line, kind: 'del' }
+    if (line.startsWith('@@')) return { text: line, kind: 'hunk' }
+    if (line.startsWith('diff ') || line.startsWith('index ')) return { text: line, kind: 'meta' }
+    return { text: line, kind: 'ctx' }
+  })
+}
+
+/**
+ * 这一轮跑了多久：`working… 12s` 的依据。
+ *
+ * - 跑着的消息且我们知道起点 → 用**现在**减起点，所以数字会自己走；
+ * - 跑完的消息 → 用冻结下来的 `elapsedMs`（刷新回放时也照实显示）；
+ * - 没有起点（老的记录）→ 不显示。
+ *
+ * 「不需要很精确」（用户口径）：秒级、不补零、超过一分钟给 `1m03s`。
+ */
+/** 每秒走一下的「现在」——只在有活在跑的时候才开定时器（见下面的 watch）。 */
+const nowTick = ref(Date.now())
+
+function elapsedLabel(m: Message): string {
+  const total = m.elapsedMs ?? (m.startedAt ? nowTick.value - m.startedAt : 0)
+  if (!total || total < 0) return ''
+  const seconds = Math.round(total / 1000)
+  if (seconds < 60) return `${seconds}s`
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`
+}
+
+/**
+ * 上下文压力（输入框上方那条）。
+ *
+ * 取**最近一次拿到的账**：本轮刚开始还没账时留上一轮的，刷新页面后由记录回填 ——
+ * 否则那条提示会一闪一闪。
+ */
+const latestContext = computed<UsageContext | null>(() => {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const ctx = messages.value[i].usage?.context
+    if (ctx && ctx.window > 0) return ctx
+  }
+  return null
+})
+
+/**
+ * 压力档位：低于告警线＝中性，过了告警线＝警告色，过了危险线＝危险色。
+ *
+ * 两条线**由服务端随上下文那一格发下来**（设置页可改：上下文窗口配置里的那两格），
+ * 界面不写死 —— 阈值只有一个出处。旧记录没这两格时按 0.6 / 0.8 兜（与服务端默认值一致）。
+ */
+const contextLevel = computed(() => {
+  const ctx = latestContext.value
+  if (!ctx) return 'none'
+  const alert = ctx.alert_ratio ?? 0.8
+  const warn = ctx.warn_ratio ?? 0.6
+  if (alert > 0 && ctx.ratio >= alert) return 'alert'
+  if (warn > 0 && ctx.ratio >= warn) return 'warn'
+  return 'none'
+})
+
+const contextPercent = computed(() => {
+  const ctx = latestContext.value
+  if (!ctx || ctx.window <= 0) return 0
+  return Math.min(100, Math.round(ctx.ratio * 100))
+})
+
+/**
+ * 环图的悬浮说明（也是无障碍读屏那句话）。
+ *
+ * 原来这些字是**常驻**在输入框上方一条横条里的；2026-10-14 换成发送框右边的小环图
+ * （用户口径），文字挪进 `title` —— 信息没丢，只是不再天天占一行。
+ */
+const contextTitle = computed(() => {
+  const ctx = latestContext.value
+  if (!ctx) return ''
+  const num = (n: number) => n.toLocaleString('en-US')
+  const parts = [`上下文已用 ${contextPercent.value}%（${num(ctx.max_input)} / ${num(ctx.window)}）`]
+  if (ctx.ratio >= (ctx.alert_ratio ?? 0.8)) {
+    parts.push('接近压缩线：下一条消息可能触发压缩，回复会变短')
+  }
+  if (ctx.compressed) parts.push(`已压缩 ${ctx.compressed} 次`)
+  return parts.join('；')
+})
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 
@@ -198,28 +430,52 @@ function showsTodos(m: Message): boolean {
 type TextPart = Extract<Part, { kind: 'text' }>
 
 /**
- * 一条消息的正文分组：**连续**的 text 块合成一组，一组渲染成一个气泡。
+ * 一条消息的「正文 / 思考」流：**连续**的 text 块合成一组（一组渲染成一个气泡），
+ * 思考块在运行中原样插在它到达的位置 —— 于是渲染出来就是「思考 → 正文 → 思考 → 正文」；
+ * 跑完之后只留正文（思考不占屏、不落库）。
  *
  * 为什么要分组：流式分块（见 streamblocks.ts）会把一段长回复切成多块，块与块之间只是
  * 「这一帧哪些内容要重渲染」的界限，视觉上必须还是一条连续正文 —— 每块各占一个气泡的话，
- * 每 1.5 KB 就会断一次、还多出 16px 间距。待办把它们隔开时（后端 parts 只在出现过待办的
- * 回合才按顺序落盘），照旧分成两个气泡，与改动前一致。
+ * 每 1.5 KB 就会断一次、还多出 16px 间距。待办 / 方案不参与这条流，仍固定在底部渲染。
  */
-function textGroups(m: Message): TextPart[][] {
-  const groups: TextPart[][] = []
+type FlowEntry =
+  | { kind: 'text'; parts: TextPart[] }
+  | { kind: 'reasoning'; agent: string; text: string }
+
+function flowEntries(m: Message): FlowEntry[] {
+  const out: FlowEntry[] = []
   let current: TextPart[] | null = null
   for (const p of m.parts) {
+    if (p.kind === 'reasoning') {
+      // 跑完只留正文：思考只用于运行中观察，结束后不占屏、也不落库。
+      // **别在这里把 current 置空** —— 跳过思考之后，它前后的正文仍应合成一个
+      // Markdown 气泡，而不是被思考切成两段。
+      if (m.at) continue
+      current = null
+      out.push({ kind: 'reasoning', agent: p.agent, text: p.text })
+      continue
+    }
     if (p.kind !== 'text') {
       current = null
       continue
     }
     if (!current) {
       current = []
-      groups.push(current)
+      out.push({ kind: 'text', parts: current })
     }
     current.push(p)
   }
-  return groups
+  return out
+}
+
+/**
+ * 一组连续正文拼成一份完整的 Markdown。
+ *
+ * 流式期间这些块是为了「只重渲染最后一块」而切开的；任务结束时要把它们拼回去，
+ * 一次 `renderMarkdown` 渲染整组 —— 否则列表 / 表格会在块边界处断掉。
+ */
+function groupText(group: TextPart[]): string {
+  return group.map((p) => p.content ?? '').join('')
 }
 
 /** 历史里的待办归一化：新记录是 `{content, status, children?}`，老记录只有字符串。 */
@@ -308,7 +564,8 @@ const messages = ref<Message[]>([])
  * 一次性渲染（实测 120ms 阻塞）和流式每帧的强制重排版（实测 8~9ms，随消息数上涨）。
  * 历史本来就一次拉回内存了，这里只是先不挂进 DOM。
  */
-const VISIBLE_TAIL = 60
+// 历史已经由后端按 20 条分页；这里不再做本地截断（保留变量是为了模板 key 的兼容）。
+const VISIBLE_TAIL = Number.MAX_SAFE_INTEGER
 const visibleTail = ref(VISIBLE_TAIL)
 /** 被挡在前面的条数；0 表示这个会话全都在 DOM 里。 */
 const hiddenCount = computed(() => Math.max(0, messages.value.length - visibleTail.value))
@@ -316,10 +573,48 @@ const visibleMessages = computed(() =>
   hiddenCount.value ? messages.value.slice(-visibleTail.value) : messages.value,
 )
 function showEarlier() {
-  visibleTail.value += VISIBLE_TAIL * 2
+  void loadOlder()
+}
+
+function onMessagesScroll() {
+  const box = msgBox.value
+  if (box && box.scrollTop <= 80) void loadOlder()
+}
+
+async function loadOlder() {
+  const id = currentId.value
+  if (!id || loadingOlder.value || !hasMoreHistory.value || !nextBeforeId.value) return
+  const before = nextBeforeId.value
+  const box = msgBox.value
+  const previousHeight = box?.scrollHeight ?? 0
+  const previousTop = box?.scrollTop ?? 0
+  loadingOlder.value = true
+  try {
+    const page = await getRecords(id, before, 20)
+    if (currentId.value !== id) return
+    const older = page.items
+      .map(recordToMessage)
+      .filter((m): m is Message => m !== null && m.parts.length > 0)
+    if (older.length) messages.value = [...older, ...messages.value]
+    hasMoreHistory.value = page.has_more
+    nextBeforeId.value = page.next_before_id
+    visibleTail.value = VISIBLE_TAIL
+    await nextTick()
+    if (box) box.scrollTop = box.scrollHeight - previousHeight + previousTop
+  } catch (e: any) {
+    setNotice(`更早的历史加载失败：${e?.message ?? e}`)
+  } finally {
+    loadingOlder.value = false
+  }
 }
 const input = ref('')
 const loading = ref(false)
+const hasMoreHistory = ref(false)
+const loadingOlder = ref(false)
+const nextBeforeId = ref<number | null>(null)
+/** 当前要展示的澄清弹窗；null = 没有（或用户已经关掉）。 */
+const clarification = ref<ClarificationInfo | null>(null)
+const clarificationBusy = ref(false)
 // 输入框上方那条快捷动作：默认收起（见模板处的说明）
 const quickOpen = ref(false)
 // 这一轮流是「用户自己喊停」的吗：本地据此补终止标记，并抑制 abort 带出来的那行「错误」
@@ -387,12 +682,24 @@ const {
   invert: true,
 })
 
-// 右侧栏：代码 / 记忆 / PR / 日志（四个视图齐了）
-const rightTab = ref<'code' | 'memory' | 'pulls' | 'logs'>('code')
+// 右侧栏：代码 / 记忆 / PR / 日志 / Token。初始标签来自设置页的「基本设置」
+// （本机偏好，见 prefs.ts）；之后点标签照旧自由切，不再回写那个偏好。
+const rightTab = ref<'code' | 'memory' | 'pulls' | 'logs' | 'usage'>(defaultPanelTab.value)
 // 方案链接里展开的步骤（按 index 记）：随会话切换重置
 const expandedSteps = ref<number[]>([])
 // 右侧栏「全屏」（面板盖满整个窗口）：临时状态，不持久化
 const panelFullscreen = ref(false)
+// 左上角那颗齿轮：设置**整页工作台**（左菜单三栏）。
+//
+// 两处刻意的做法：
+// - 切页时聊天区是 `v-show` 藏起来而不是 `v-if` 卸掉 —— 正在跑的流还在往 App 的状态里写，
+//   卸掉 DOM 再挂回来没意义，反而多一堆空引用要防；
+// - 「在哪一页」记在 URL hash 上（见 `viewState.ts`），刷新后回到原来那页 ——
+//   用户口径：「刚才在设置页面，刷新了一下还在设置页面才是对的」。
+const initialView = readView()
+const view = ref<AppView>(initialView.view)
+const settingsPanel = ref<SettingsPanel>(initialView.panel)
+watch([view, settingsPanel], () => writeView(view.value, settingsPanel.value))
 // 从计划步骤点「涉及文件」跳过来时用：at 只用来区分同一路径的重复点击（否则 watch 不触发）
 const codeTarget = ref<{ ref: string; path: string; at: number } | null>(null)
 
@@ -421,6 +728,8 @@ function setNotice(text: string) {
 const LAST_SESSION_KEY = 'ui.lastSessionId'
 /** 上次停在「新建对话」页（用户点了「＋ 新对话」还没开始时）。 */
 const NEW_CHAT_KEY = 'ui.newChatPending'
+/** 消息上要不要显示 token 角标（默认显示：藏起来等于没做）。 */
+const SHOW_USAGE_KEY = 'ui.showMessageUsage'
 
 /** localStorage 在隐私模式 / 被禁时会抛异常：读不到、写不进都只当「没记住」。 */
 function readPref(key: string): string {
@@ -439,6 +748,14 @@ function writePref(key: string, value: string): void {
     /* 记不住就算了：恢复不了也照常用 */
   }
 }
+
+/** 消息上要不要显示 token 角标。默认显示 —— 藏起来等于没做；嫌吵可以在此关掉，
+ * 选择记在本地（与侧栏宽度同一套 `readPref` / `writePref`）。 */
+const showUsage = ref(readPref(SHOW_USAGE_KEY) !== '0')
+
+watch(showUsage, (on) => {
+  writePref(SHOW_USAGE_KEY, on ? '1' : '0')
+})
 
 /**
  * 初次加载恢复上次的页面：优先回到上次打开的会话（直接复用 ``openSession`` —— 历史、方案、
@@ -597,6 +914,27 @@ async function confirmNewChat() {
   }
 }
 
+function recordToMessage(r: RecordItem): Message | null {
+  if (r.type === 'plan') {
+    const plan = planFromRecord(r)
+    return {
+      role: 'assistant',
+      parts: plan ? [{ kind: 'plan', plan }] : [],
+      at: r.created_at,
+      recordId: r.id,
+    }
+  }
+  if (r.type !== 'user' && r.type !== 'assistant') return null
+  return {
+    role: r.type === 'user' ? 'user' : 'assistant',
+    parts: partsOf(r),
+    at: r.created_at,
+    usage: r.usage ?? undefined,
+    changes: (r.extra?.changes as ChangesInfo | undefined) ?? undefined,
+    recordId: r.id,
+  }
+}
+
 async function openSession(id: string) {
   // 记住这次打开的会话（初次加载就用它恢复）
   writePref(LAST_SESSION_KEY, id)
@@ -607,16 +945,20 @@ async function openSession(id: string) {
   notice.value = ''
   // 换会话就把「显示更早」的展开量收回默认值
   visibleTail.value = VISIBLE_TAIL
+  clarification.value = null
   resetPanels()
   resetWorkspace()
   // 上一个会话的流若还在收尾，它的 finally 不会再碰 loading（会话号对不上了）；这里复位，
   // 下面若发现本轮真在跑会重新置回 true
   loading.value = false
   // 会话详情拉不到不该挡住历史消息，故单独兜住
-  const [records, detail] = await Promise.all([
+  const [page, detail] = await Promise.all([
     getRecords(id),
     getSession(id).catch(() => null),
   ])
+  const records = page.items
+  hasMoreHistory.value = page.has_more
+  nextBeforeId.value = page.next_before_id
   // 三类记录进聊天流：用户 / 助手 / **方案**（方案以链接形式出现，见 planFromRecord）
   messages.value = records
     .filter((r) => r.type === 'user' || r.type === 'assistant' || r.type === 'plan')
@@ -633,11 +975,21 @@ async function openSession(id: string) {
         role: r.type === 'user' ? ('user' as const) : ('assistant' as const),
         parts: partsOf(r),
         at: r.created_at,
+        // 这一轮的账（老记录没有 → undefined，角标不显示）
+        usage: r.usage ?? undefined,
+        // 这一轮改了哪些文件（只有建成 PR 的轮次才有；老记录同样没有）
+        changes: (r.extra?.changes as ChangesInfo | undefined) ?? undefined,
       }
     })
     // 方案记录万一缺 plan_id（老数据）会映射成空块：丢掉它，别留一条空消息
     .filter((m) => m.parts.length)
+  visibleTail.value = VISIBLE_TAIL
   scrollToBottom()
+  try {
+    clarification.value = await getClarification(id)
+  } catch {
+    clarification.value = null
+  }
   // 刷新时这一轮还在跑：库里的记录还没有它（收尾才落库），得接回直播流
   if (detail?.running) void attachRunning(id)
   // 已就绪就别再碰工作区（免得白等一次重连）；异常态只显示重试，不自动重踢
@@ -654,6 +1006,7 @@ async function removeSession(id: string) {
     writePref(LAST_SESSION_KEY, '')
     currentId.value = ''
     messages.value = []
+    clarification.value = null
     pendingRepo.value = false
     loading.value = false
     resetWorkspace()
@@ -737,27 +1090,30 @@ function toggleStep(index: number) {
     : [...expandedSteps.value, index]
 }
 
-const activeTab = computed<'code' | 'memory' | 'pulls' | 'logs'>(() => rightTab.value)
+const activeTab = computed<'code' | 'memory' | 'pulls' | 'logs' | 'usage'>(
+  () => rightTab.value,
+)
 
 /**
  * 右侧标签（竖着排）。
  *
  * **加标签只往这张表里加一项** —— 模板是 `v-for` 渲染的，不用动结构。
  *
- * 「计划」不再在这里：方案改成聊天流里的一条链接（面板取消，2026-10-06）。第二批会往这张
- * 表里加「仓库记忆 / PR / 日志」。
+ * 「计划」不再在这里：方案改成聊天流里的一条链接（面板取消，2026-10-06）。第二批加的
+ * 是「仓库记忆 / PR / 日志」，最后加的是「Token」（本会话消耗，只读聚合）。
  */
 const panelTabs = computed<
-  { key: 'code' | 'memory' | 'pulls' | 'logs'; label: string; dot?: string }[]
+  { key: 'code' | 'memory' | 'pulls' | 'logs' | 'usage'; label: string; dot?: string }[]
 >(() => [
   { key: 'code', label: '代码' },
   { key: 'memory', label: '记忆' },
   { key: 'pulls', label: 'PR' },
   { key: 'logs', label: '日志' },
+  { key: 'usage', label: 'Token' },
 ])
 
 /** 点竖标签：切过去并展开（收起状态下点一下就展开到那个标签）。 */
-function selectTab(tab: 'code' | 'memory' | 'pulls' | 'logs') {
+function selectTab(tab: 'code' | 'memory' | 'pulls' | 'logs' | 'usage') {
   rightTab.value = tab
   panelCollapsed.value = false
 }
@@ -767,6 +1123,20 @@ function selectTab(tab: 'code' | 'memory' | 'pulls' | 'logs') {
 function togglePanelFullscreen() {
   panelFullscreen.value = !panelFullscreen.value
   if (panelFullscreen.value) panelCollapsed.value = false
+}
+
+/**
+ * 设置页「基本设置」里的「恢复默认布局」：两个栏宽回默认、两侧都展开、退出右栏全屏。
+ *
+ * 宽度与收起状态都由 `usePanelWidth` 的 watcher 落盘（见 splitter.ts），这里只改状态 ——
+ * 不自己动 localStorage，免得和拖拽那条路径写出两套口径。
+ */
+function resetLayout() {
+  resetSidebarWidth()
+  resetRightWidth()
+  sidebarCollapsed.value = false
+  panelCollapsed.value = false
+  panelFullscreen.value = false
 }
 
 function onFullscreenKeydown(event: KeyboardEvent) {
@@ -871,9 +1241,26 @@ const RENDER_INTERVAL_MS = 100
  * 迟早只改其中一处。
  */
 function attachStream(msg: Message) {
-  // 分片先攒着，按间隔统一落进消息里：每来一个分片就把整篇重渲染太费
-  let pending = ''
+  // 分片先攒着，按间隔统一落进消息里：每来一个分片就把整篇重渲染太费。
+  // **必须是一条有序队列**：正文和思考各用一个缓冲的话，flush 时会把「先思考后正文」
+  // 拼成「先正文后思考」——交错效果就没了。
+  type PendingChunk =
+    | { kind: 'text'; text: string }
+    | { kind: 'reasoning'; agent: string; text: string }
+  let pending: PendingChunk[] = []
   let timer = 0
+  const queueText = (text: string) => {
+    if (!text) return
+    const last = pending[pending.length - 1]
+    if (last?.kind === 'text') last.text += text
+    else pending.push({ kind: 'text', text })
+  }
+  const queueReasoning = (agent: string, text: string) => {
+    if (!text) return
+    const last = pending[pending.length - 1]
+    if (last?.kind === 'reasoning' && last.agent === agent) last.text += text
+    else pending.push({ kind: 'reasoning', agent, text })
+  }
   const flush = () => {
     if (timer) {
       clearTimeout(timer)
@@ -881,9 +1268,12 @@ function attachStream(msg: Message) {
     }
     // 先判断用户还在不在底部：下面一置底，scrollTop 就到底了，事后再读永远算「在底部」
     const stick = nearBottom()
-    if (pending) {
-      pushText(msg.parts, pending)
-      pending = ''
+    if (pending.length) {
+      for (const chunk of pending) {
+        if (chunk.kind === 'text') pushText(msg.parts, chunk.text)
+        else pushReasoning(msg.parts, chunk.agent, chunk.text)
+      }
+      pending = []
     }
     // 这一块太长了就在安全点封口，下一帧只重渲染新块；不封口的话整条回复每 100ms 重渲染一次
     splitLongText(msg.parts)
@@ -893,13 +1283,20 @@ function attachStream(msg: Message) {
     if (!timer) timer = window.setTimeout(flush, RENDER_INTERVAL_MS)
   }
   const append = (text: string) => {
-    pending += text
+    queueText(text)
     schedule()
   }
   const onEvent = (ev: ChatEvent) => {
     if (ev.type === 'ai' && ev.content) {
       activity.value = '正在生成回答'
       append(ev.content)
+    } else if (ev.type === 'reasoning' && ev.content) {
+      // 思考只在前端攒着，后端不落库；主控与子智能体都发，按角色分段
+      const agent = ev.agent || 'main'
+      activity.value =
+        agent === 'main' ? '正在思考' : `正在思考（${reasoningAgentLabel(agent)}）`
+      queueReasoning(agent, ev.content)
+      schedule()
     } else if (ev.type === 'todos') {
       // 待办树永远画在正文下面，这里不用抢在正文前头落地
       pushTodos(msg.parts, ev.items ?? [])
@@ -910,6 +1307,16 @@ function attachStream(msg: Message) {
     } else if (ev.type === 'plan') {
       // 后端每次推的都是全量快照：同一份方案只占一块，就地替换（`plan: null` = 方案被删）
       pushPlan(msg.parts, ev.plan ?? null)
+    } else if (ev.type === 'usage') {
+      // 本轮的账：后端落在正文之后发，所以它天然贴在回复末尾。不参与「正文/待办」的块序列
+      // —— 它是这条消息的**属性**，不是一段内容（渲染在时间那一行上面）。
+      msg.usage = ev.usage ?? null
+    } else if (ev.type === 'changes') {
+      // 这一轮改了什么：同样贴在这条消息上（只有建成 PR 的轮次才发这一帧）
+      msg.changes = ev.changes ?? null
+    } else if (ev.type === 'clarification') {
+      clarification.value = ev.clarification ?? null
+      activity.value = '等待确认'
     } else if (ev.type === 'error') {
       append(`\n[错误] ${ev.error}`)
     }
@@ -944,6 +1351,8 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
     flush()
     // AI 那条的时间＝流结束时刻（失败/中断也补上，否则这条会一直没有时间）
     msg.at = new Date().toISOString()
+    // 计时收尾：从开跑那一刻算起，冻结下来（之后刷新回放也照实显示这个数）
+    if (msg.startedAt) msg.elapsedMs = Date.now() - msg.startedAt
     if (currentId.value === id) {
       loading.value = false
       scrollToBottom()
@@ -987,9 +1396,11 @@ function quickAct(text: string) {
   void send()
 }
 
-async function send() {
-  const text = input.value.trim()
-  if (!text || !currentId.value || loading.value) return
+async function sendTurn(choice?: { info: ClarificationInfo; index: number }) {
+  const picked = choice ? choice.info.options[choice.index] : null
+  const text = choice ? '' : input.value.trim()
+  const displayText = choice ? `选择：${picked?.label ?? '澄清选项'}` : text
+  if ((!choice && !text) || !currentId.value || loading.value) return
   // 工作区没好就不发（输入框此时也是禁用的，这里兜住其它触发路径）
   if (!workspaceReady.value) return
   const id = currentId.value
@@ -999,8 +1410,9 @@ async function send() {
   // 后端那一轮已经在跑，于是收到 409。渲染与置 loading 都提前，这两个毛病一起消掉。
   input.value = ''
   // 用户那条的时间＝发送时刻；AI 那条等流结束再补，与后端「回合收尾才写记录」对齐
-  messages.value.push({ role: 'user', parts: [{ kind: 'text', content: text }], at: new Date().toISOString() })
-  messages.value.push({ role: 'assistant', parts: [], at: '' })
+  messages.value.push({ role: 'user', parts: [{ kind: 'text', content: displayText }], at: new Date().toISOString() })
+  // 计时从这一下开始（用户口径：自己发的那轮就直接计时）
+  messages.value.push({ role: 'assistant', parts: [], at: '', startedAt: Date.now() })
   // 取**数组里的响应式代理**来改（改局部原始对象不会触发重渲染）
   const msg = messages.value[messages.value.length - 1]
   loading.value = true
@@ -1012,7 +1424,12 @@ async function send() {
   const controller = new AbortController()
   streamAbort = controller
   try {
-    resp = await postChat(id, text, controller.signal)
+    resp = await postChat(
+      id,
+      text,
+      controller.signal,
+      choice ? { clarificationId: choice.info.id, choice: choice.index } : undefined,
+    )
   } catch (e: any) {
     if (streamAbort === controller) streamAbort = null
     // 用户点的是终止（响应头还没回来就点了）：这不是发送失败 —— 别摘掉刚放上去的两条消息、
@@ -1023,12 +1440,14 @@ async function send() {
       loading.value = false
       msg.parts.push({ kind: 'text', content: TERMINATED })
       msg.at = new Date().toISOString()
+      if (msg.startedAt) msg.elapsedMs = Date.now() - msg.startedAt
       return
     }
     // 没发出去：把刚放上去的两条摘掉、输入还原，别留下两条空消息（用户那条后端根本没收到）。
     // loading 期间输入框与按钮都是禁用的，末尾这两条不会被别人动过，按下标摘是安全的。
     messages.value.splice(messages.value.length - 2, 2)
-    input.value = text
+    if (choice) clarification.value = choice.info
+    else input.value = text
     loading.value = false
     // 409 的两种成因状态码相同，靠 running 区分（见 isRunInProgress）：本轮真在跑就接回它，
     // 用户那条后端没收到，所以内容留在输入框里，等这一轮完了他自己再发一次；
@@ -1041,6 +1460,29 @@ async function send() {
     return
   }
   await runStream(id, resp, msg, controller.signal)
+}
+
+async function send() {
+  await sendTurn()
+}
+
+function chooseClarification(index: number) {
+  const info = clarification.value
+  if (!info || clarificationBusy.value) return
+  clarification.value = null
+  clarificationBusy.value = true
+  void sendTurn({ info, index }).finally(() => {
+    clarificationBusy.value = false
+  })
+}
+
+function otherClarification() {
+  clarification.value = null
+  setNotice('已关闭澄清弹窗，直接在输入框里说你想做什么即可。')
+  nextTick(() => {
+    const box = document.querySelector<HTMLTextAreaElement>('.composer-input')
+    box?.focus()
+  })
 }
 
 /**
@@ -1081,7 +1523,16 @@ async function attachRunning(id: string) {
   }
   if (currentId.value !== id) return
   streamAbort = controller
-  messages.value.push({ role: 'assistant', parts: [], at: '' })
+  // 重新打开时这一轮**已经在跑**：起点取**用户那条消息的时间** —— 于是计时器显示的是
+  // 「这一轮已经跑了多久」，而不是「我看了多久」（用户口径：不需要很精确）
+  const lastUser = [...messages.value].reverse().find((item) => item.role === 'user')
+  const startedAt = lastUser ? Date.parse(lastUser.at) : NaN
+  messages.value.push({
+    role: 'assistant',
+    parts: [],
+    at: '',
+    startedAt: Number.isFinite(startedAt) ? startedAt : Date.now(),
+  })
   const msg = messages.value[messages.value.length - 1]
   loading.value = true
   activity.value = '正在接续本轮'
@@ -1094,8 +1545,32 @@ onMounted(async () => {
   await reloadSessions()
   await restoreLastView()
 })
-// 卸载时停掉轮询：定时器持有组件闭包，不停会在切页后继续打接口
-onUnmounted(stopWorkspacePoll)
+// 手改地址 / 前进后退改了 hash：跟着切页（页面自己写 hash 那几次不会触发这里）
+const unwatchView = watchView((next) => {
+  view.value = next.view
+  settingsPanel.value = next.panel
+})
+
+// 「working… 12s」那个秒针：只在有活在跑时开，跑完就停（空转的定时器没必要留着）
+let tickTimer = 0
+watch(loading, (on) => {
+  if (on && !tickTimer) {
+    nowTick.value = Date.now()
+    tickTimer = window.setInterval(() => {
+      nowTick.value = Date.now()
+    }, 1000)
+  } else if (!on && tickTimer) {
+    clearInterval(tickTimer)
+    tickTimer = 0
+  }
+})
+
+onUnmounted(() => {
+  // 卸载时停掉轮询：定时器持有组件闭包，不停会在切页后继续打接口
+  stopWorkspacePoll()
+  if (tickTimer) clearInterval(tickTimer)
+  unwatchView()
+})
 </script>
 
 <template>
@@ -1103,6 +1578,7 @@ onUnmounted(stopWorkspacePoll)
     <!-- 左侧会话栏：可收起（收成一条竖标签）、可拖宽 -->
     <aside
       class="sidebar"
+      v-show="view === 'chat'"
       :class="{ collapsed: sidebarCollapsed }"
       :style="sidebarCollapsed ? null : { width: `${sidebarWidth}px` }"
     >
@@ -1116,6 +1592,25 @@ onUnmounted(stopWorkspacePoll)
       <div v-else class="sidebar-body">
         <div class="brand-row">
           <div class="brand">ai-coding-harness</div>
+          <!-- 图标用内联 SVG 而不是 emoji（emoji 在不同系统上字形不一、也一眼廉价） -->
+          <button
+            class="panel-toggle-btn"
+            title="设置"
+            aria-label="设置"
+            @click="view = 'settings'"
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path
+                d="M2.5 5h11M2.5 11h11"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+              <circle cx="6" cy="5" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="10.5" cy="11" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+          </button>
           <button class="panel-toggle-btn" title="收起会话栏" @click="toggleSidebar">‹</button>
         </div>
         <button class="new-chat" @click="startNewChat">＋ 新对话</button>
@@ -1147,7 +1642,7 @@ onUnmounted(stopWorkspacePoll)
 
     <!-- 左侧拖拽热区：拖动改宽、双击回到默认、方向键微调 -->
     <div
-      v-if="!sidebarCollapsed"
+      v-if="!sidebarCollapsed && view === 'chat'"
       class="grip"
       role="separator"
       aria-orientation="vertical"
@@ -1164,7 +1659,7 @@ onUnmounted(stopWorkspacePoll)
       @keydown="sidebarGripKey"
     ></div>
 
-    <main class="main">
+    <main v-show="view === 'chat'" class="main">
       <!-- 新建对话：输入仓库地址 -->
       <div v-if="pendingRepo" class="repo-setup">
         <h2>新建对话</h2>
@@ -1187,10 +1682,11 @@ onUnmounted(stopWorkspacePoll)
       </div>
 
       <!-- 消息区 -->
-      <div v-else class="messages" ref="msgBox" @click="onMessagesClick">
+      <div v-else class="messages" ref="msgBox" @scroll.passive="onMessagesScroll" @click="onMessagesClick">
         <!-- 更早的历史先不挂进 DOM（见 visibleTail）：真要翻再点出来 -->
-        <div v-if="hiddenCount" class="load-earlier">
-          <button type="button" @click="showEarlier">显示更早的 {{ hiddenCount }} 条</button>
+        <div v-if="loadingOlder" class="load-earlier">正在加载更早的历史…</div>
+        <div v-else-if="hasMoreHistory" class="load-earlier">
+          <button type="button" @click="showEarlier">加载更早的 20 条</button>
         </div>
         <!-- key 与待办折叠 key 一律用**绝对**下标（hiddenCount + i）：窗口往前滑时下标不能跟着变，
              否则同一个下标会落到另一条消息上，折叠状态会串 -->
@@ -1198,23 +1694,38 @@ onUnmounted(stopWorkspacePoll)
           <!-- 用户输入按纯文本显示；AI 回复按块渲染：正文 Markdown，待办是列表 -->
           <div v-if="m.role === 'user'" class="bubble">{{ userText(m) }}</div>
           <div v-else class="bubble">
-            <!-- 一组连续的正文块共用一个气泡（分组规则见 textGroups）：流式把一段回复切成
-                 多块之后，视觉上仍是一条连续正文，不会每块断一次 -->
-            <div v-for="(group, gi) in textGroups(m)" :key="gi" class="ai-part text markdown">
-              <!-- v-memo：正文没变就别重跑 renderMarkdown。这个调用以前落在模板里，
-                   于是**组件每次重渲染**（正文 flush、每个工具帧、待办帧、方案帧…）都会把
-                   会话里**每条**消息重新 parse + 消毒 + 重新高亮一遍 —— 实测一次按键的
-                   重渲染就要 ~110ms（59 个 markdown 块）。依赖只有 p.content，所以流式的
-                   那条消息照旧每次更新都重渲染，其余消息原样跳过；流式分块封口后的块内容
-                   不再变，也就跟着跳过。 -->
+            <!-- 执行时间（用户口径：放在 AI 回复的最上面，就叫 working…）。
+                 跑着显示 `working… 12s`，跑完冻结成「用时 12s」。 -->
+            <p v-if="m.startedAt || m.elapsedMs" class="working">
+              <template v-if="m.elapsedMs">用时 {{ elapsedLabel(m) }}</template>
+              <template v-else>working<span class="working-dots">…</span> {{ elapsedLabel(m) }}</template>
+            </p>
+            <!-- 运行中思考与正文按到达顺序交错：连续的正文块仍合成一个气泡（分组规则见
+                 flowEntries），思考块浅色、始终展开；跑完隐藏思考、只留正文。
+                 流式期间正文按纯文本显示（不解析 Markdown），任务结束后整组一次性渲染。 -->
+            <template v-for="(entry, ei) in flowEntries(m)" :key="ei">
+              <div v-if="entry.kind === 'reasoning'" class="ai-part reasoning-inline">
+                <div class="reasoning-inline-head">
+                  思考过程<span v-if="entry.agent !== 'main'">
+                    · {{ reasoningAgentLabel(entry.agent) }}</span>
+                </div>
+                <div class="reasoning-inline-text">{{ entry.text }}</div>
+              </div>
               <div
-                v-for="(p, j) in group"
-                :key="j"
-                v-memo="[p.content]"
-                class="md-block"
-                v-html="renderMarkdown(p.content || '…')"
-              ></div>
-            </div>
+                v-else
+                class="ai-part text"
+                :class="m.at ? 'markdown' : 'streaming-text'"
+              >
+                <!-- v-memo：任务结束后正文不再变，整组只 parse 一次。 -->
+                <div
+                  v-if="m.at"
+                  v-memo="[groupText(entry.parts)]"
+                  class="md-block"
+                  v-html="renderMarkdown(groupText(entry.parts) || '…')"
+                ></div>
+                <div v-else class="streaming-plain">{{ groupText(entry.parts) }}</div>
+              </div>
+            </template>
             <!-- 待办树固定画在正文下面：它表示「现在什么状态」，不是「说到哪儿了」。
                  整棵全完成、且这一轮已收尾就不画（见 showsTodos）—— 那份全绿清单只是噪音，
                  没做完才要留着；空列表是「参数还没流完」的中间态，也不占位 -->
@@ -1315,8 +1826,79 @@ onUnmounted(stopWorkspacePoll)
               v-html="renderMarkdown('…')"
             ></div>
           </div>
-          <!-- 时间：解析不出（流还没结束、时间没定下来）就整块不渲染，不占位 -->
-          <div v-if="formatTime(m.at)" class="msg-time">{{ formatTime(m.at) }}</div>
+          <!-- 本轮消耗：贴在时间那一行上面。默认显示（藏起来等于没做），可在右栏关掉。
+               展开态用**绝对**下标（hiddenCount + i）—— 窗口往前滑时下标不能跟着变 -->
+          <div
+            v-if="m.changes"
+            class="msg-changes"
+            :class="{ open: changesOpen[hiddenCount + i] }"
+          >
+            <button
+              class="msg-changes-badge"
+              :title="changesOpen[hiddenCount + i] ? '收起改动' : '展开改动'"
+              @click="toggleChanges(hiddenCount + i)"
+            >
+              <span class="msg-changes-dot"></span>
+              {{ changesSummary(m.changes) }}
+            </button>
+            <ul v-if="changesOpen[hiddenCount + i]" class="msg-changes-list">
+              <li v-for="file in m.changes.files" :key="file.path" class="msg-change">
+                <button class="msg-change-head" @click="loadDiff(m, file)">
+                  <span class="msg-change-mark" :data-status="changeMark(file.status)">
+                    {{ changeMark(file.status) }}
+                  </span>
+                  <span class="msg-change-path">{{ file.path }}</span>
+                  <span class="msg-change-count">+{{ file.added }} −{{ file.deleted }}</span>
+                </button>
+                <p v-if="file.diffState" class="msg-change-note">{{ file.diffState }}</p>
+                <template v-else-if="file.diff !== undefined">
+                  <pre class="msg-change-diff"><span
+                    v-for="(line, li) in diffLines(file.diff)"
+                    :key="li"
+                    :class="`d-${line.kind}`"
+                  >{{ line.text + '\n' }}</span></pre>
+                  <p v-if="file.diffTruncated" class="msg-change-note">
+                    改动太长，只显示前一段
+                  </p>
+                </template>
+              </li>
+            </ul>
+          </div>
+          <div
+            v-if="showUsage && m.role === 'assistant' && m.usage"
+            class="msg-usage"
+            :class="{ open: usageOpen[hiddenCount + i] }"
+          >
+            <button
+              class="msg-usage-badge"
+              :title="usageOpen[hiddenCount + i] ? '收起明细' : '展开明细'"
+              @click="toggleUsage(hiddenCount + i)"
+            >
+              <span class="msg-usage-dot"></span>
+              {{ usageSummary(m.usage) }}
+              <span v-if="m.usage.interrupted" class="msg-usage-flag">（中断）</span>
+              <span v-if="m.usage.missing" class="msg-usage-flag">
+                {{ m.usage.missing }} 次无用量
+              </span>
+            </button>
+            <ul v-if="usageOpen[hiddenCount + i]" class="msg-usage-detail">
+              <li v-for="row in usageRows(m.usage)" :key="row.label">
+                <span>{{ row.label }}</span>
+                <b>{{ row.value.toLocaleString('en-US') }}</b>
+              </li>
+            </ul>
+          </div>
+          <!-- 末行：**回答这条的模型** + 时间（两者都没有就整块不渲染，不占位）。
+               模型不受「显示用量」开关影响 —— 它是「谁答的」，不是账。 -->
+          <div v-if="m.usage?.model || formatTime(m.at)" class="msg-time">
+            <template v-if="m.usage?.model">
+              <span class="msg-model" :title="`本轮主控模型：${m.usage.model}`">
+                {{ m.usage.model }}
+              </span>
+              <span v-if="formatTime(m.at)" class="msg-meta-sep">·</span>
+            </template>
+            {{ formatTime(m.at) }}
+          </div>
         </div>
         <!-- 流式进行中的提示：请求没结束就一直转，结束时连同 loading 一起消失 -->
         <div v-if="loading" class="thinking">
@@ -1366,6 +1948,7 @@ onUnmounted(stopWorkspacePoll)
           </button>
         </template>
       </div>
+      <!-- 输入区 -->
       <div v-if="!pendingRepo" class="composer">
         <textarea
           v-model="input"
@@ -1393,12 +1976,36 @@ onUnmounted(stopWorkspacePoll)
         >
           发送
         </button>
+        <!-- 上下文压力环图：放在发送框右边（原来是输入框上方一条横条）。
+             <60% 中性色、≥60% 警告色、≥80% 危险色 —— 阈值口径与服务端一致（它算 ratio）。
+             详细数字与「会不会触发压缩」挪进 title，不再常驻一行文字。 -->
+        <div
+          v-if="currentId && latestContext"
+          class="ctx-ring"
+          :class="contextLevel"
+          role="img"
+          :title="contextTitle"
+          :aria-label="contextTitle"
+        >
+          <svg viewBox="0 0 36 36" width="30" height="30" aria-hidden="true">
+            <circle class="ctx-ring-track" cx="18" cy="18" r="15.5" />
+            <circle
+              class="ctx-ring-fill"
+              cx="18"
+              cy="18"
+              r="15.5"
+              pathLength="100"
+              :stroke-dasharray="`${contextPercent} ${100 - contextPercent}`"
+            />
+          </svg>
+          <span class="ctx-ring-num">{{ contextPercent }}</span>
+        </div>
       </div>
     </main>
 
     <!-- 右侧拖拽热区（收起了就没有可拖的宽度，热区一并隐藏） -->
     <div
-      v-if="currentId && !pendingRepo && !panelCollapsed && !panelFullscreen"
+      v-if="currentId && !pendingRepo && !panelCollapsed && !panelFullscreen && view === 'chat'"
       class="grip"
       role="separator"
       aria-orientation="vertical"
@@ -1418,6 +2025,7 @@ onUnmounted(stopWorkspacePoll)
     <!-- 右侧栏：**竖排标签条** + 内容。收起＝收内容，标签留着（点一下就展开到那个标签） -->
     <aside
       v-if="currentId && !pendingRepo"
+      v-show="view === 'chat'"
       class="right-panel"
       :class="{ collapsed: panelCollapsed, fullscreen: panelFullscreen }"
       :style="panelCollapsed || panelFullscreen ? null : { width: `${rightWidth}px` }"
@@ -1481,9 +2089,34 @@ onUnmounted(stopWorkspacePoll)
         <!-- PR：本仓库的 PR 列表（查不到会显示成错误，不是空列表） -->
         <PrPanel v-else-if="activeTab === 'pulls'" :session-id="currentId" />
         <!-- 日志：这个会话自己的日志（面板只显示尾部；整份走「下载」） -->
-        <LogPanel v-else :session-id="currentId" />
+        <LogPanel v-else-if="activeTab === 'logs'" :session-id="currentId" />
+        <!-- Token：本会话消耗（只读聚合；缺数据的轮次会如实说出来，不显示成 0） -->
+        <UsagePanel
+          v-else
+          v-model:show-usage="showUsage"
+          :session-id="currentId"
+        />
       </div>
     </aside>
+
+    <!-- 设置页（整页工作台）：左上角齿轮打开；左菜单分基本设置 / 外观 / 模型配置。
+         当前在哪一栏由 App 持有（它同时负责写 hash），设置页只发意图上来。 -->
+    <SettingsPage
+      v-if="view === 'settings'"
+      :panel="settingsPanel"
+      @close="view = 'chat'"
+      @panel="settingsPanel = $event"
+      @reset-layout="resetLayout"
+    />
+
+    <ClarificationDialog
+      v-if="clarification"
+      :info="clarification"
+      :busy="clarificationBusy"
+      @choose="chooseClarification"
+      @other="otherClarification"
+      @close="clarification = null"
+    />
 
   </div>
 </template>

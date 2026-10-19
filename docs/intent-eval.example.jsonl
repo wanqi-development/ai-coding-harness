@@ -1,0 +1,10 @@
+{"message":"修复 PR #13 的审查问题","expected":"rework","previous_intent":"review"}
+{"message":"你为什么不派 coder 执行","expected":"rework","previous_intent":"rework"}
+{"message":"上一轮，你的意图不是 rework 吗","expected":"rework","previous_intent":"rework"}
+{"message":"为什么这里会超时","expected":"analysis"}
+{"message":"现在有哪些 PR","expected":"qa"}
+{"message":"代码审查一下 PR #13","expected":"review"}
+{"message":"按评审意见修改","expected":"rework"}
+{"message":"出个方案","expected":"plan"}
+{"message":"实现登录接口","expected":"coding"}
+{"message":"同步仓库","expected":"sync"}

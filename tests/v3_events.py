@@ -98,14 +98,26 @@ def text(
 
 
 def reasoning(
-    part: str, *, ns: tuple[str, ...] = MAIN_NS, agent: str = MAIN_NAME, index: int = 0
+    part: str,
+    *,
+    ns: tuple[str, ...] = MAIN_NS,
+    agent: str = MAIN_NAME,
+    index: int = 0,
+    internal: bool = False,
 ) -> dict:
-    """一段推理分片：v3 用 ``reasoning-delta``，天然不会被当成正文。"""
+    """一段推理分片：v3 用 ``reasoning-delta``，天然不会被当成正文。
+
+    **字段名与正文不同**：思考放在 ``reasoning`` 里，不是 ``text``。
+    真身见 ``langchain_core.language_models._compat_bridge._to_content_delta``；
+    这里曾经照正文写成 ``text``，于是「读思考」的代码与测试一起错、测试还是绿的
+    （2026-10-12 真机一轮才发现），别改回去。
+    """
     return messages(
         "content-block-delta",
         ns=ns,
         agent=agent,
-        payload={"delta": {"type": "reasoning-delta", "text": part}},
+        internal=internal,
+        payload={"delta": {"type": "reasoning-delta", "reasoning": part}},
         index=index,
     )
 

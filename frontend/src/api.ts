@@ -29,7 +29,94 @@ export interface RecordItem {
    * 有 `parts` 就按它回放，否则退回 `content`。
    */
   extra: any
+  /**
+   * 这一轮的 token 账（只有 assistant 记录有；本功能上线前的记录是 null）。
+   *
+   * 后端已从 `extra.usage` 提出来单列，所以消息角标读它即可，不必知道内层形状。
+   */
+  usage: UsageDetail | null
   created_at: string
+}
+
+/** 历史记录的一页：默认最近 20 条，`next_before_id` 继续向前翻。 */
+export interface RecordPage {
+  items: RecordItem[]
+  has_more: boolean
+  next_before_id: number | null
+}
+
+/** 一组输入 / 输出计数（一轮的合计，或某个执行主角的累计）。 */
+export interface UsageTokens {
+  input: number
+  output: number
+  calls: number
+}
+
+/**
+ * 一轮的消耗明细（每条 assistant 记录一份，也是 SSE `usage` 帧的载荷）。
+ *
+ * 与会话级的 `UsageSnapshot` 是两个东西：这个是原始账、那个是把它加起来。
+ */
+export interface UsageDetail {
+  totals: UsageTokens
+  /** 归类名 → 该主角在这一轮的用量（`main` / `planner` / `coder` / `reviewer` / `internal` / `intent`） */
+  by_actor: Record<string, UsageTokens>
+  /** 这一轮**主控**解析出来的模型名（标在这条回答的最下边）；空 ＝ 解析不到，不显示那一格 */
+  model: string
+  /** 平台没回用量的调用次数 —— 账上的缺口，如实显示而不是当 0 */
+  missing: number
+  /** 这一轮没跑完（用户终止 / 守卫中止 / 故障）：钱照样算，但标出来 */
+  interrupted: boolean
+  context?: UsageContext | null
+}
+
+/**
+ * 上下文压力：这个会话的历史离主控模型的窗口还有多远。
+ *
+ * `window` 是**该轮主控模型**的窗口（orchestrate / plan 是 GLM 128k、review 是 Kimi 256k），
+ * 所以同一份历史在不同形态下的 `ratio` 本来就不同。`max_input` 是**当前水位**：平时取各轮
+ * 峰值（最近一次会因为缓存命中而偏小），压过之后改用压缩后的真实占用 —— 所以它会在压缩后
+ * 掉下来，不会永久停在「接近压缩线」。
+ *
+ * 字段名与接口一致（snake_case），不做转换：后端每个模型都直接序列化，多一层改名就多
+ * 一处会漂的地方。
+ */
+/** 一个文件的改动：路径 + 增删行数 + 状态码（`A` 新增 / `M` 改 / `D` 删 / `R` 改名）。 */
+export interface FileChange {
+  path: string
+  added: number
+  deleted: number
+  status: string
+  /** 点开之后才有：这个文件的 diff 正文（服务端已脱敏，可能被截断） */
+  diff?: string
+  /** 加载状态或失败原因（没点开过就是空） */
+  diffState?: string
+  diffTruncated?: boolean
+}
+
+/**
+ * 这一轮改了什么（**建成 PR 才有**）。
+ *
+ * 数据源是宿主机上那份代码缓存（`repo_cache`），`base...head` 两支来自 `create_pr` 的入参 ——
+ * 与沙箱是否还在无关，所以沙箱被回收之后这些 diff 照样点得开。
+ */
+export interface ChangesInfo {
+  base: string
+  head: string
+  files: FileChange[]
+  /** 文件数超过服务端上限时才有：真实总数 */
+  total?: number
+}
+
+export interface UsageContext {
+  /** 服务端认的告警线 / 危险线（占窗口比例）：环图的变色口径由它给，界面不写死阈值 */
+  warn_ratio?: number
+  alert_ratio?: number
+  max_input: number
+  window: number
+  ratio: number
+  compressed: number
+  compressed_now: boolean
 }
 
 export interface PlanStep {
@@ -108,16 +195,57 @@ export interface TodoItem {
   children?: TodoItem[]
 }
 
+/** 意图澄清弹窗里的一个候选；`intent` 由后端固定，label/description 是 qa 自由写的。 */
+export interface ClarificationOption {
+  intent: string
+  label: string
+  description?: string
+}
+
+/** SSE `clarification` 帧 / GET 待澄清接口的同一份载荷。 */
+export interface ClarificationInfo {
+  id: string
+  question: string
+  options: ClarificationOption[]
+  allow_other?: boolean
+}
+
 export interface ChatEvent {
-  type: 'ai' | 'tool' | 'todos' | 'plan' | 'done' | 'error'
+  type:
+    | 'ai'
+    | 'reasoning'
+    | 'tool'
+    | 'todos'
+    | 'plan'
+    | 'usage'
+    | 'changes'
+    | 'clarification'
+    | 'done'
+    | 'error'
   content?: string
   name?: string
-  /** `tool` 帧：只有委派子智能体的 `task` 带，值是角色名（`coder` / `reviewer` / `planner`） */
+  /**
+   * `reasoning` 帧：产出这段思考的角色（`main` / `planner` / `coder` / `reviewer`）。
+   * `tool` 帧：只有委派子智能体的 `task` 带，值是角色名。
+   */
   agent?: string
   /** `todos` 帧：**整棵**待办树的全量内容（每次都是整体替换，不是增量） */
   items?: TodoItem[]
   error?: string
   plan?: PlanInfo
+  clarification?: ClarificationInfo
+  /**
+   * `usage` 帧：本轮收尾时下发的那份账。
+   *
+   * 放在正文之后发，所以它天然贴在回复末尾；前端把它挂到**当前这条** AI 消息上，
+   * 用户不必刷新页面就能看到本轮的消耗与上下文压力。
+   */
+  usage?: UsageDetail
+  /**
+   * `changes` 帧：这一轮**建成 PR** 时下发的「改了哪些文件」（在本地那份代码缓存里算的）。
+   * 与 `usage` 一样贴在回复末尾：一条消息的**属性**，不是一段内容。
+   */
+  changes?: ChangesInfo
 }
 
 export async function listSessions(): Promise<SessionItem[]> {
@@ -158,8 +286,14 @@ export async function ensureWorkspace(id: string): Promise<void> {
   if (!r.ok) throw new Error(`代码工作区准备失败：${r.status}`)
 }
 
-export async function getRecords(id: string): Promise<RecordItem[]> {
-  const r = await fetch(`/sessions/${id}/records`)
+export async function getRecords(
+  id: string,
+  beforeId?: number | null,
+  limit = 20,
+): Promise<RecordPage> {
+  const q = new URLSearchParams({ limit: String(limit) })
+  if (beforeId) q.set('before_id', String(beforeId))
+  const r = await fetch(`/sessions/${id}/records?${q}`)
   if (!r.ok) throw new Error(`记录加载失败：${r.status}`)
   return r.json()
 }
@@ -168,6 +302,13 @@ export async function getRecords(id: string): Promise<RecordItem[]> {
 export async function getPlan(id: string): Promise<PlanInfo | null> {
   const r = await fetch(`/sessions/${id}/plan`)
   if (!r.ok) throw new Error(`方案加载失败：${r.status}`)
+  return r.json()
+}
+
+/** 当前待回答的意图澄清（刷新后恢复弹窗用）；没有就是 null。 */
+export async function getClarification(id: string): Promise<ClarificationInfo | null> {
+  const r = await fetch(`/sessions/${id}/clarification`)
+  if (!r.ok) throw new Error(`澄清状态加载失败：${r.status}`)
   return r.json()
 }
 
@@ -220,7 +361,371 @@ export function logsDownloadUrl(id: string): string {
   return `/sessions/${id}/logs/download`
 }
 
+/**
+ * 一个执行主角在本会话的累计用量。
+ *
+ * `key` 是固定归类名（`main` / `planner` / `coder` / `reviewer` / `internal` / `intent`），
+ * 中文标签由面板自己映射 —— 接口不掺展示文案（与 PR 的 `state` 码同一口径）。
+ */
+export interface UsageActor {
+  key: string
+  input: number
+  output: number
+  calls: number
+  total: number
+}
+
+/**
+ * 本会话的 token 消耗（右栏「Token」标签）。
+ *
+ * `rounds > rounds_with_usage` 时**必须**在界面上说明「其中 N 轮没有用量数据」：
+ * 这些轮次是本功能上线前跑的，把缺数据当 0 消耗是最容易看错的一种错。
+ *
+ * 字段名与接口一致（snake_case）—— 后端直接序列化，改名的活在前端做只会多一处会漂的
+ * 地方，而且**漂了不报错**（读一个不存在的键得到 undefined，界面静默地少显示一句）。
+ */
+export interface UsageSnapshot {
+  totals: UsageActor
+  actors: UsageActor[]
+  rounds: number
+  rounds_with_usage: number
+  rounds_interrupted: number
+  /** 平台没回用量的调用次数 —— 账上的缺口，如实显示而不是抹掉 */
+  missing: number
+  /** 各轮里**压力最大**的那一份（服务端已取极值）；没有 context 数据时为 null */
+  context: UsageContext | null
+}
+
+/**
+ * 该会话的 token 消耗（**聚合视图，只读**）。
+ *
+ * 数据源是各轮记录里的 `extra.usage`，由后端在轮末写入、按执行主角分类；换会话时
+ * 重新拉一次即可（本轮的账在这一轮结束时落库，面板不需要跟着流实时变）。
+ */
+export async function getUsage(id: string): Promise<UsageSnapshot> {
+  const r = await fetch(`/sessions/${id}/usage`)
+  if (!r.ok) throw new Error(await errorDetail(r, `用量加载失败：${r.status}`))
+  return r.json()
+}
+
+/* -- 模型配置（按智能体，2026-10-13）--------------------------------------- */
+
+/**
+ * 「模型配置」里的一行：按**智能体**配，键是 `qa` / `analysis` / `plan` / `review` /
+ * `coding`，外加 `unified`（统一模型）/ `fallback`（兜底）/ `classifier`（意图识别的大模型那一关）。
+ *
+ * - `api_key_masked` 是**打码值**（`sk-…e2b7`）：后端永远不回明文；写回时留空＝不改；
+ * - `source`：`db`（库里这一行填过）/ `unset`（没配）。**没有出厂默认**（2026-10-15）——
+ *   没配就是空的，要回答「现在真的用什么」看 `effective`；
+ * - `context_window`：0 ＝ 没填（留空＝按模型查 → 查不到用保守值）；界面「测试连接」读到
+ *   就帮你填上（那一格按 K / M 显示）。
+ */
+export interface ModelConfigRow {
+  key: string
+  label: string
+  /** 属于设置页的哪一栏：`agents` / `global` / `intent` */
+  section: string
+  /** 这一行服务哪些角色（`plan` 行 = `plan` + `planner`）—— 「编码」那一组靠它按角色画 */
+  roles: string[]
+  /** 界面「提供商」那一栏选中的是谁（后端按 base_url 反推；不存库，纯界面提示） */
+  provider: string
+  /** 供应商被锁死（界面上不让改）：JEV 那一行锁 `typesafe` */
+  provider_locked: boolean
+  base_url: string
+  model: string
+  api_key_masked: string
+  has_key: boolean
+  context_window: number
+  source: string
+  /** 现在真的用谁（本行 → 统一模型兜底 → 没配）—— 列表上那句「生效值」 */
+  effective: ModelConfigEffective | null
+}
+
+/** 一个角色现在真的用什么（设置页的「生效值」）。 */
+export interface ModelConfigEffective {
+  role: string
+  /** 真正取值的那一行（被「统一模型」顶掉时就是 `unified`） */
+  row: string
+  model: string
+  window: number
+  /** 那个窗口哪来的：`row`（行内手填）/ `model`（按模型查到的）/ `fallback`（我们的保守值）/
+   *  `none`（没配）—— 界面只回显 row / model（兜底值不是厂商给的数，回显出来会误导） */
+  window_source: string
+  base_url: string
+  has_key: boolean
+  /** `row`（这一行配的）/ `unified`（**这一行没配**，走统一模型兜底）/ `unset`（没配，用不了） */
+  source: string
+}
+
+/** 「编码」那一组的一个角色：落在哪一行、是不是复用别人的行。 */
+export interface CodingGroupRole {
+  role: string
+  label: string
+  row: string
+  reused: boolean
+}
+
+/** 设置页左菜单里的一小节（后端下发，前端不硬编码行名）。 */
+export interface SectionOption {
+  key: string
+  label: string
+}
+
+/**
+ * 厂商目录里的一项（后端存在库里的表 `model_providers`，新库按 `config/model_providers.toml` 灌）。
+ *
+ * - `base_url`：选中它时带出的地址（可改）——这是「少打字」，不是「改默认值」；
+ * - `ui_group` / `sort_order`：下拉的分组与顺序，**后端已排好**，界面照画即可；
+ * - `default_models`：拉不到实时清单时的**内置候选**（可能过时，界面要标出来）。
+ *
+ * 目录是后端**现读库**的：改库 + 刷新界面就生效，不用重启后端。
+ */
+export interface ProviderOption {
+  key: string
+  label: string
+  base_url: string
+  ui_group: string
+  sort_order: number
+  /** 拉清单的路径：相对路径拼在 base_url 后面，**也可以写绝对 URL**（qwen 的清单在另一个根下） */
+  models_path: string
+  /** 鉴权头怎么写（多数是 `Authorization` + `Bearer `；有的网关是 `x-api-key`） */
+  auth_header: string
+  auth_prefix: string
+  /** 1 启用 / 0 停用（停用的不进下拉，但在「提供商」栏里看得到、能改回来） */
+  status: number
+  /** 这家官方有没有 `/models`（只是标注；「测试连接」不看它） */
+  is_dynamic_model_list: boolean
+}
+
+/** 写一行提供商目录（整行覆盖；键在 URL 里、不可改）。 */
+export interface ProviderUpsert {
+  label: string
+  base_url: string
+  ui_group: string
+  sort_order: number
+  models_path: string
+  auth_header: string
+  auth_prefix: string
+  status: number
+  is_dynamic_model_list: boolean
+}
+
+export interface ModelConfigSnapshot {
+  rows: ModelConfigRow[]
+  providers: ProviderOption[]
+  /** 左菜单这一栏里的小节（key + 中文名） */
+  sections: SectionOption[]
+  /** 「编码」那一组按角色展示：角色 → 落在哪一行、是不是复用 */
+  coding_group: CodingGroupRole[]
+  /** 意图识别走哪一关：`jev` / `llm`（**严格二选一**，不互相兜底） */
+  intent_mode: string
+  /** JEV 这一侧配齐了没有（地址 + key）：false 时选了 JEV 会落关键字口径 */
+  jev_configured: boolean
+}
+
+export interface ProviderProbeResult {
+  ok: boolean
+  models: string[]
+  /** 上面那份清单哪来的：`live`＝刚从厂商拉的；`builtin`＝目录里的内置候选（可能过时） */
+  source: string
+  context_window: number
+  note: string
+  error: string
+}
+
+export async function getModelConfig(): Promise<ModelConfigSnapshot> {
+  const r = await fetch('/model-config')
+  if (!r.ok) throw new Error(await errorDetail(r, `读取模型配置失败：${r.status}`))
+  return r.json()
+}
+
+/** 保存：只提交**改过**的字段（不传＝不改；`api_key` 传空串＝清掉）。 */
+export async function putModelConfig(
+  rows: Record<string, { base_url?: string; model?: string; api_key?: string; context_window?: number }>,
+  intentMode?: string,
+): Promise<ModelConfigSnapshot> {
+  const r = await fetch('/model-config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(intentMode ? { rows, intent_mode: intentMode } : { rows }),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, `保存模型配置失败：${r.status}`))
+  return r.json()
+}
+
+/** 清掉一行的覆盖值 ＝ 恢复出厂默认。 */
+export async function deleteModelConfig(key: string): Promise<ModelConfigSnapshot> {
+  const r = await fetch(`/model-config/${encodeURIComponent(key)}`, { method: 'DELETE' })
+  if (!r.ok) throw new Error(await errorDetail(r, `恢复默认失败：${r.status}`))
+  return r.json()
+}
+
+/**
+ * 「测试连接」：拿这套 base_url/key 拉那家的模型清单（一次验连通性 + 给模型下拉 + 读窗口）。
+ * **只在点这个按钮时拉**：不轮询、保存时也不拉。`provider` 决定去哪拉、怎么鉴权。
+ */
+export async function probeProvider(
+  baseUrl: string,
+  apiKey: string | null,
+  keyFrom?: string,
+  provider?: string,
+): Promise<ProviderProbeResult> {
+  const r = await fetch('/model-config/probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: baseUrl,
+      api_key: apiKey,
+      key_from: keyFrom ?? null,
+      provider: provider ?? null,
+    }),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, `探测失败：${r.status}`))
+  return r.json()
+}
+
+/**
+ * 一格**运行期配置**（设置页「基本设置」里的代码缓存配置 / 上下文窗口配置）。
+ *
+ * `source=db` ＝ 这一格在界面里改过；`default` ＝ 还在用 `.env` / 代码默认值。
+ * 这些值**改完立刻生效**（不用重启）：后端把值赋回 `Settings`，而主智能体每轮现建。
+ */
+export interface RuntimeSettingItem {
+  key: string
+  label: string
+  group: string
+  /** 值的类型：界面据此选输入框与校验 */
+  kind: 'str' | 'int' | 'float' | string
+  value: string | number | null
+  source: string
+}
+
+export interface RuntimeSettingsSnapshot {
+  items: RuntimeSettingItem[]
+}
+
+export async function getAppSettings(): Promise<RuntimeSettingsSnapshot> {
+  const r = await fetch('/app-settings')
+  if (!r.ok) throw new Error(await errorDetail(r, `读取运行期配置失败：${r.status}`))
+  return r.json()
+}
+
+/** 保存：**只提交改过的键**（不传＝不改）。值非法后端回 400，界面上原样显示那句话。 */
+export async function putAppSettings(
+  items: Record<string, string | number>,
+): Promise<RuntimeSettingsSnapshot> {
+  const r = await fetch('/app-settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, `保存运行期配置失败：${r.status}`))
+  return r.json()
+}
+
 /** 取错误响应里的 `detail`；不是 JSON 或没有该字段就退回兜底文案。 */
+/**
+ * 供应商的**模型详情**（表 `provider_models` 的一行）：名字 / 类型 / 上下文长度 / 来源。
+ *
+ * 上下文长度挂**模型**而不是供应商：同一家 `glm-5.3` 是 1M、`glm-4.6` 是 128k。
+ * `context_window` 为 0 ＝ 还不知道（界面照实显示「未知」）。
+ */
+export interface ProviderModelItem {
+  provider: string
+  model: string
+  /** chat / embedding / rerank / image / video / audio / other */
+  model_type: string
+  context_window: number
+  /** probe（刷新时读到的）/ manual / seed */
+  source: string
+  status: number
+}
+
+export interface ProviderModelList {
+  provider: string
+  items: ProviderModelItem[]
+  /** 这次刷新从厂商那儿读回来几条 */
+  refreshed?: number
+  /** 刷新时的一句话（例如「这个入口没回窗口」） */
+  note?: string
+}
+
+export async function getProviderModels(provider: string): Promise<ProviderModelList> {
+  const r = await fetch(`/model-config/providers/${encodeURIComponent(provider)}/models`)
+  if (!r.ok) throw new Error(await errorDetail(r, `读取模型清单失败：${r.status}`))
+  return r.json()
+}
+
+/**
+ * 提供商目录**全量**（含停用）—— 设置页「提供商」那一栏的列表用它。
+ * （快照里的 `providers` 是「只含启用」的那份，给弹窗下拉。）
+ */
+export async function getProviders(): Promise<ProviderOption[]> {
+  const r = await fetch('/model-config/providers')
+  if (!r.ok) throw new Error(await errorDetail(r, `读取提供商目录失败：${r.status}`))
+  return r.json()
+}
+
+/** 写一行提供商（**整行覆盖**；键在 URL 里、不可改）。回的是目录全量。 */
+export async function putProvider(
+  key: string,
+  body: ProviderUpsert,
+): Promise<ProviderOption[]> {
+  const r = await fetch(`/model-config/providers/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, `保存提供商失败：${r.status}`))
+  return r.json()
+}
+
+/**
+ * **点按钮才刷**：拿这家的地址去调它的清单接口并写进表（界面口径：不主动刷新）。
+ *
+ * `baseUrl` 传**这一行手填的地址**：代理 / 自建网关与目录里的默认地址不是一回事，
+ * 不传才退回目录里的默认地址 —— 「测试连接」用的就是你填的那个地址，两处口径必须一致。
+ */
+export async function refreshProviderModels(
+  provider: string,
+  baseUrl?: string,
+): Promise<ProviderModelList> {
+  const query = baseUrl ? `?base_url=${encodeURIComponent(baseUrl)}` : ''
+  const r = await fetch(
+    `/model-config/providers/${encodeURIComponent(provider)}/models/refresh${query}`,
+    { method: 'POST' },
+  )
+  if (!r.ok) throw new Error(await errorDetail(r, `刷新模型清单失败：${r.status}`))
+  return r.json()
+}
+
+/** 手填 / 手改一个模型（窗口 / 类型 / 启停）。 */
+export async function putProviderModel(
+  provider: string,
+  body: { model: string; model_type?: string; context_window?: number; status?: number },
+): Promise<ProviderModelList> {
+  const r = await fetch(`/model-config/providers/${encodeURIComponent(provider)}/models`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, `保存模型失败：${r.status}`))
+  return r.json()
+}
+
+/** 取一个文件在某次改动里的 diff（服务端在本地缓存里算，已脱敏 + 显式截断）。 */
+export async function getRepoDiff(
+  sessionId: string,
+  base: string,
+  head: string,
+  path: string,
+): Promise<{ path: string; text: string; truncated: boolean }> {
+  const query = new URLSearchParams({ base, head, path })
+  const r = await fetch(`/sessions/${encodeURIComponent(sessionId)}/repo/diff?${query}`)
+  if (!r.ok) throw new Error(await errorDetail(r, `读取改动失败：${r.status}`))
+  return r.json()
+}
+
 async function errorDetail(resp: Response, fallback: string): Promise<string> {
   try {
     const body = await resp.json()
@@ -240,11 +745,15 @@ export async function postChat(
   id: string,
   message: string,
   signal?: AbortSignal,
+  options?: { clarificationId?: string; choice?: number | string },
 ): Promise<Response> {
+  const body: Record<string, unknown> = { message }
+  if (options?.clarificationId) body.clarification_id = options.clarificationId
+  if (options?.choice !== undefined) body.choice = options.choice
   const resp = await fetch(`/chat/${id}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify(body),
     signal,
   })
   // 409 有两种成因：本轮已在跑（接回去就行），或会话已失效 / 缺仓库信息（只能报错）。

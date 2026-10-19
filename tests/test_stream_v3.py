@@ -195,9 +195,38 @@ def test_subagent_events_are_dropped() -> None:
     assert tr.parts.has_todos is False
 
 
-def test_reasoning_delta_is_not_text() -> None:
+def test_reasoning_delta_is_a_transient_event_not_text() -> None:
+    """思考单独下发，**不进 parts**（不落库）；主控标 ``main``。"""
     tr = V3Translator()
-    assert tr.feed(reasoning("（思考）")) == []
+    assert tr.feed(reasoning("（思考）")) == [
+        {"type": "reasoning", "content": "（思考）", "agent": "main"}
+    ]
+    assert tr.parts.data == []
+
+
+def test_subagent_reasoning_carries_its_role_but_stays_out_of_parts() -> None:
+    """子智能体的思考也下发（2026-10-17 用户口径），但要标出是哪个角色。"""
+    tr = V3Translator()
+
+    assert tr.feed(reasoning("先读代码", ns=SUB_NS, agent="coder")) == [
+        {"type": "reasoning", "content": "先读代码", "agent": "coder"}
+    ]
+    assert tr.parts.data == []
+
+
+def test_internal_reasoning_is_dropped() -> None:
+    """摘要等中间件内部调用的思考不是助手对用户说的话。"""
+    tr = V3Translator()
+
+    assert tr.feed(reasoning("摘要的思考", internal=True)) == []
+    assert tr.parts.data == []
+
+
+def test_nested_subagent_reasoning_is_dropped() -> None:
+    """两级以上嵌套没有展示位置，与正文/待办同一口径。"""
+    tr = V3Translator()
+
+    assert tr.feed(reasoning("深层思考", ns=("tools:c1", "tools:c2"), agent="coder")) == []
     assert tr.parts.data == []
 
 
@@ -341,6 +370,113 @@ def test_subagent_todos_nest_under_the_running_item() -> None:
         }
     ]
     assert tr.parts.data[-1]["items"][1]["children"] == children
+
+
+def _delegate(tr: V3Translator, role: str, *, call_id: str = "t1") -> None:
+    """按真实形状派一次子智能体：``task`` 的入参里带 ``subagent_type``。"""
+    tr.note_delegation(
+        tool_start(
+            "task", call_id=call_id, input={"subagent_type": role, "description": "做事"}
+        )
+    )
+
+
+def _child_todos(
+    tr: V3Translator, role: str, items: list[dict], *, call_id: str = "t1"
+) -> list[dict]:
+    """子智能体那一侧：自报角色（认领这次委派）→ 它的清单落进树，返回下发的帧。"""
+    ns = sub_ns(call_id)
+    tr.feed(text_delta("开工。", ns=ns, agent=role))
+    tr.feed(todo_start(ns=ns, agent=role))
+    return tr.feed(todo_finish(items, ns=ns, agent=role))
+
+
+def test_a_delegation_lands_on_the_step_named_after_its_role() -> None:
+    """父项按**角色**找那一步，而不是「此刻 in_progress 的那项」。
+
+    实测（2026-10-13，真机）：主控的清单是
+        [in_progress] 确认 plan_id=44 处于待执行状态
+        [pending]     派 coder 按方案实施（写码/测试/提 PR）
+    而 coder 的六步子树整棵挂到了「确认…」底下 —— 因为委派那一刻 in_progress 的是它。
+    角色是委派那一刻就确定的事实，比主控的清单推进可靠（主控推进清单是滞后的）。
+    """
+    tr = V3Translator()
+    tr.feed(todo_start())
+    tr.feed(
+        todo_finish(
+            [
+                {"content": "确认 plan_id=44 处于待执行状态", "status": "in_progress"},
+                {"content": "派 coder 按方案实施（写码/测试/提 PR）", "status": "pending"},
+                {"content": "派 reviewer 审查 PR", "status": "pending"},
+            ]
+        )
+    )
+    _delegate(tr, "coder")
+    out = _child_todos(tr, "coder", [{"content": "步骤 1：改存储"}])
+
+    items = out[0]["items"]
+    assert items[0].get("children") is None, "前置项（确认…）不该长出子树"
+    assert items[1]["children"] == [T("步骤 1：改存储")], "挂在「派 coder 按方案实施…」下"
+
+
+def test_the_planner_lands_on_the_planning_step_even_when_the_check_is_still_running() -> None:
+    """同样的一类：派 planner 时 in_progress 还停在「查询是否存在未执行的方案」。"""
+    tr = V3Translator()
+    tr.feed(todo_start())
+    tr.feed(
+        todo_finish(
+            [
+                {"content": "查询是否存在未执行的方案", "status": "in_progress"},
+                {"content": "制定忘记密码与短信验证码实施方案", "status": "pending"},
+                {"content": "按方案实施代码并提交 PR", "status": "pending"},
+            ]
+        )
+    )
+    _delegate(tr, "planner")
+    out = _child_todos(tr, "planner", [{"content": "读码核实"}])
+
+    items = out[0]["items"]
+    assert items[0].get("children") is None
+    assert items[1]["children"] == [T("读码核实")]
+
+
+def test_the_running_item_is_still_the_fallback() -> None:
+    """清单里没有该角色的词（自由写法）→ 回落到老规则（in_progress 那一项），
+    不至于让子清单整棵消失。"""
+    tr = V3Translator()
+    tr.feed(todo_start())
+    tr.feed(
+        todo_finish(
+            [
+                {"content": "看看这个仓库", "status": "in_progress"},
+                {"content": "然后收工", "status": "pending"},
+            ]
+        )
+    )
+    _delegate(tr, "coder")
+    out = _child_todos(tr, "coder", [{"content": "读 diff"}])
+
+    assert out[0]["items"][0]["children"] == [T("读 diff")]
+
+
+def test_a_completed_step_is_not_a_parent() -> None:
+    """已完成的那一步不再收子清单：角色词命中的是下一步。"""
+    tr = V3Translator()
+    tr.feed(todo_start())
+    tr.feed(
+        todo_finish(
+            [
+                {"content": "制定实施方案", "status": "completed"},
+                {"content": "派 coder 按方案实施", "status": "in_progress"},
+            ]
+        )
+    )
+    _delegate(tr, "coder")
+    out = _child_todos(tr, "coder", [{"content": "写码"}])
+
+    items = out[0]["items"]
+    assert items[0].get("children") is None, "已完成的那一项不该再长子树"
+    assert items[1]["children"] == [T("写码")]
 
 
 def test_children_survive_a_main_list_replacement() -> None:

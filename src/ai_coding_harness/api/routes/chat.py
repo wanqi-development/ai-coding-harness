@@ -56,7 +56,13 @@ async def chat(
     session = await resolve_session(request, session_id)
     runs: RunHub = request.app.state.runs
     try:
-        await runs.start(session_id, session, req.message)
+        await runs.start(
+            session_id,
+            session,
+            req.message,
+            clarification_id=req.clarification_id,
+            choice=req.choice,
+        )
     except RunInProgress:
         raise HTTPException(
             status_code=409, detail="本轮仍在进行中，等它结束或刷新页面接回。"

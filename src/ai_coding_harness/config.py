@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_coding_harness.codeplatform import Platform
+
+logger = logging.getLogger(__name__)
 
 
 def _default_repo_view_dir() -> str:
@@ -35,6 +40,359 @@ class ModelConfig:
     temperature: float = 0.3
 
 
+#: 「模型配置」界面上的行：稳定键 → 中文名（2026-10-13 用户口径：按**智能体**配，名字用中文）。
+#: 接口按这张表下发，前端不自己映射 —— 免得两处各写一份中文、漂了还看不出来。
+#: 三个子智能体（planner / coder / reviewer）不各占一行：planner 复用「方案」、
+#: reviewer 复用「审查」、coder 单占「编码」（见 ``agent/llm._AGENT_KEY``）。
+MODEL_AGENT_ROWS: tuple[tuple[str, str], ...] = (
+    ("qa", "问答"),
+    ("analysis", "分析"),
+    ("plan", "方案"),
+    ("review", "审查"),
+    # 「编码」是一主三从：主控与 coder 各占一行（2026-10-14 用户口径），
+    # 另外两个角色**复用已有的两行** —— planner 用「方案」、reviewer 用「审查」
+    # （见 ``agent/llm._AGENT_KEY``），所以这里不再为它们各开一行。
+    ("coding", "编码主控"),
+    ("coder", "编码"),
+    ("unified", "统一模型"),
+    ("fallback", "兜底模型"),
+    # 意图识别二选一：JEV 一行（供应商锁定 typesafe）、大模型一行（走普通模型配置那一套）。
+    ("jev", "意图识别（JEV）"),
+    ("classifier", "意图识别（大模型）"),
+)
+
+#: 键 → 中文名（界面上的报错要能说出「哪一行」）
+MODEL_AGENT_LABEL: dict[str, str] = dict(MODEL_AGENT_ROWS)
+
+#: 每一行属于设置页的哪一栏（界面按它分组 —— 前端不再自己硬编码行名，2026-10-15）
+MODEL_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("agents", "各智能体"),
+    ("global", "全局"),
+    ("intent", "意图识别"),
+)
+MODEL_AGENT_SECTION: dict[str, str] = {
+    "qa": "agents",
+    "analysis": "agents",
+    "plan": "agents",
+    "review": "agents",
+    "coding": "agents",
+    "coder": "agents",
+    "unified": "global",
+    "fallback": "global",
+    "jev": "intent",
+    "classifier": "intent",
+}
+
+#: 每一行**服务哪些角色**（口径与 ``agent/llm._AGENT_KEY`` 同一份事实，反着写一遍给界面用）
+MODEL_AGENT_ROLES: dict[str, tuple[str, ...]] = {
+    "qa": ("qa",),
+    "analysis": ("analysis",),
+    "plan": ("plan", "planner"),
+    "review": ("review", "reviewer"),
+    "coding": ("orchestrate",),
+    "coder": ("coder",),
+    "unified": ("*",),
+    "fallback": ("*",),
+    "jev": (),
+    "classifier": ("classifier",),
+}
+
+#: 角色 → 界面上怎么叫它（只用于展示）
+ROLE_LABELS: dict[str, str] = {
+    "orchestrate": "主控",
+    "planner": "规划",
+    "coder": "编码",
+    "reviewer": "评审",
+}
+
+#: 「编码」那一组**按角色**展示的顺序：``(角色, 落在哪一行, 是否复用别的行)``
+CODING_GROUP: tuple[tuple[str, str, bool], ...] = (
+    ("orchestrate", "coding", False),
+    ("planner", "plan", True),
+    ("coder", "coder", False),
+    ("reviewer", "review", True),
+)
+
+#: 供应商被**锁死**的行（界面上那一栏不可改）：JEV 就是 typesafe 那家（2026-10-15 用户口径）
+MODEL_AGENT_PROVIDER_LOCK: dict[str, str] = {"jev": "typesafe"}
+
+#: 每一行拿**哪个角色**去算「生效值」（一行服务多个角色时取值结果一致，取头一个即可）。
+#: ``fallback`` / ``jev`` 不在表里：它们不是主模型，没有「生效值」这一说。
+MODEL_AGENT_EFFECTIVE_ROLE: dict[str, str] = {
+    "qa": "qa",
+    "analysis": "analysis",
+    "plan": "plan",
+    "review": "review",
+    "coding": "orchestrate",
+    "coder": "coder",
+    # 「统一模型」那一行看的是**它自己**：拿 orchestrate 去算会让它显示成「编码主控」的模型
+    # （2026-10-15 用户报的「里边是 deepseek，外边显示 glm」）
+    "unified": "unified",
+    "classifier": "classifier",
+}
+
+#: 窗口读不到、也没填时的保守值（用户口径：保守取 128k）
+FALLBACK_CONTEXT_WINDOW = 128_000
+
+
+#: **可以改完立刻生效**的配置项（表 ``app_settings`` 里存的那几格）。
+#:
+#: 为什么需要这张表：这些值原本只在 ``.env`` 里，改一个就要重启后端。用户口径（2026-10-14）：
+#: 「热生效」—— 界面上改完立刻用新的。做法是**把值写回这份 ``Settings`` 实例**（这些字段本来就
+#: 是实例属性，读它们的地方一行都不用改）＋ **主智能体每轮现建、不缓存**（见 ``SessionManager.get_agent``），
+#: 于是「改完这一轮就是新的模型/窗口」。
+#:
+#: 每条：稳定键（也是 ``app_settings.key``）／界面中文名／分组／类型／落在 ``Settings`` 的哪个字段。
+@dataclass(frozen=True)
+class RuntimeSetting:
+    key: str
+    label: str
+    group: str
+    kind: str  # "str" | "int" | "float"
+    field: str
+
+
+RUNTIME_SETTINGS: tuple[RuntimeSetting, ...] = (
+    # -- 代码缓存配置（代码面板那份本地裸仓）--
+    RuntimeSetting("repo_view_dir", "代码缓存路径", "代码缓存配置", "str", "repo_view_dir"),
+    RuntimeSetting("gitee_base_branch", "默认分支（Gitee）", "代码缓存配置", "str", "gitee_base_branch"),
+    RuntimeSetting("github_base_branch", "默认分支（GitHub）", "代码缓存配置", "str", "github_base_branch"),
+    # -- 上下文窗口配置：**只留两条阈值**（2026-10-14 用户口径）--
+    # 窗口本身是**模型**的属性，界面上不再逐家/逐个配：按模型查（表 provider_models）→
+    # 行内手填覆盖 → 兜底值。阈值是**提醒**的口径（环图变色），留在这儿。
+    RuntimeSetting(
+        "context_warn_ratio", "告警线（环图变色）", "上下文窗口配置", "float", "context_warn_ratio"
+    ),
+    RuntimeSetting(
+        "context_alert_ratio", "危险线（给一句说明）", "上下文窗口配置", "float", "context_alert_ratio"
+    ),
+    RuntimeSetting(
+        "context_pretrim_notice_ratio",
+        "裁剪前提醒线（压缩线×比例，0=关闭）",
+        "上下文压缩配置",
+        "float",
+        "context_pretrim_notice_ratio",
+    ),
+    # -- 意图识别：低置信度时转 qa 追问（0 = 关闭）--
+    RuntimeSetting(
+        "intent_clarify_confidence",
+        "低置信度澄清阈值（0=关闭）",
+        "意图识别",
+        "float",
+        "intent_clarify_confidence",
+    ),
+)
+
+#: 键 → 定义（写接口与启动加载都按它校验/落到字段上）
+RUNTIME_SETTING_BY_KEY: dict[str, RuntimeSetting] = {item.key: item for item in RUNTIME_SETTINGS}
+
+
+def coerce_runtime_setting(item: RuntimeSetting, value: Any) -> Any:
+    """把界面/库里来的值转成该字段的类型；转不动就抛 ``ValueError``（调用方回 400）。
+
+    空串对字符串是合法值（比如把默认分支清空＝回到「用远程探测的默认分支」）。
+    """
+    if item.kind == "str":
+        return str(value).strip()
+    if item.kind == "int":
+        return int(value)
+    return float(value)
+
+
+def apply_runtime_settings(settings: Settings, values: dict[str, Any]) -> None:
+    """把 ``{键: 值}`` 落到 ``Settings`` 实例上（认不出的键、转不动的值一律跳过）。
+
+    跳过而不是报错：一次加载/保存里坏一格，不该让其它格都不生效 —— 校验在写接口那侧做。
+    """
+    for key, raw in values.items():
+        item = RUNTIME_SETTING_BY_KEY.get(key)
+        if item is None:
+            logger.warning("认不出的运行期配置项，已忽略：%s", key)
+            continue
+        try:
+            setattr(settings, item.field, coerce_runtime_setting(item, raw))
+        except (TypeError, ValueError):
+            logger.warning("运行期配置项 %s 的值不合法，已忽略：%r", key, raw)
+
+#: 内置**厂商目录**（2026-10-13 用户口径①：界面上先选提供商，再填它那一套）。
+#: 只做「帮你少打字」：选中一个就把它的 base_url 带出来（仍可改），并作为「测试连接」的默认
+#: 地址。base_url **取自 `.env` 的同名配置** —— 你正在用的那个网关就是它（比如 gpt 那一格你
+#: 走的是自建网关），取不到就留空让你填。``custom`` 是「自定义 / 其它网关」。
+PROVIDER_OPTIONS: tuple[tuple[str, str, str], ...] = (
+    ("deepseek", "DeepSeek", "deepseek_base_url"),
+    ("kimi", "Kimi（月之暗面）", "kimi_base_url"),
+    ("glm", "GLM（智谱）", "glm_base_url"),
+    ("gpt", "GPT（OpenAI 兼容）", "gpt_base_url"),
+    ("qwen", "Qwen（通义）", "qwen_base_url"),
+    ("custom", "自定义 / 其它网关", ""),
+)
+
+
+#: 提供商目录的种子文件（表为空时灌一次；之后**以库为准**）。
+#: 里面每个 ``[[provider]]`` 一节的字段说明见文件本身的注释。
+PROVIDER_SEED_PATH = Path(__file__).resolve().parents[2] / "config" / "model_providers.toml"
+
+
+@dataclass(frozen=True)
+class ProviderMeta:
+    """一家提供商的元数据（表 ``model_providers`` 的一行 / 种子文件的一节）。
+
+    **配置的轴仍然是智能体**（见 ``model_endpoints``）：这里只决定界面「提供商」那一栏长什么样、
+    选中它带出哪个地址，以及「测试连接」去哪拉模型列表、怎么鉴权。
+    """
+
+    provider: str
+    display_name: str
+    default_base_url: str = ""
+    ui_group: str = ""
+    sort_order: int = 0
+    status: int = 1
+    is_dynamic_model_list: bool = True
+    models_path: str = "/models"
+    auth_header: str = "Authorization"
+    auth_prefix: str = "Bearer "
+
+
+def load_provider_seed(path: Path | None = None) -> tuple[ProviderMeta, ...]:
+    """读种子文件（缺文件 / 坏了都返回空元组，由调用方决定告警）。
+
+    只认 ``[[provider]]`` 一节里的白名单字段；不认识的键**丢掉并告警**（与 RAGFlow 那份
+    方案里 ``extra_config`` 白名单同一个思路：数据不许写逻辑，字段不许无限长）。
+    """
+    import tomllib  # Python 3.11+ 标准库，不引依赖
+
+    target = path or PROVIDER_SEED_PATH
+    if not target.is_file():
+        return ()
+    try:
+        data = tomllib.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("读模型提供商种子文件失败：%s", target)
+        return ()
+    allowed = set(ProviderMeta.__dataclass_fields__)
+    out: list[ProviderMeta] = []
+    for section in data.get("provider", []):
+        if not isinstance(section, dict):
+            continue
+        unknown = set(section) - allowed
+        if unknown:
+            logger.warning("提供商种子里的字段不认，已忽略：%s %s", section.get("provider"), sorted(unknown))
+        fields = {key: value for key, value in section.items() if key in allowed}
+        if not fields.get("provider") or not fields.get("display_name"):
+            logger.warning("提供商种子缺 provider / display_name，已跳过：%r", section)
+            continue
+        try:
+            out.append(ProviderMeta(**fields))
+        except TypeError:
+            logger.exception("提供商种子这一节解析失败：%r", section)
+    return tuple(out)
+
+
+#: **只收特定温度**的模型：**按模型名判**（与 ``model_types.model_type_of`` 同一个套路）。
+#: 实测 kimi-k2.6 / k3：传 0.3 直接 400 `invalid temperature: only 1 is allowed for this model`。
+#: 2026-10-15 之前这条信息写在 `.env` 的 ``kimi_model`` 属性上（那里写死 1）；那套删掉之后
+#: 界面上的行**没有温度这一格**，于是任何 kimi 行都 400（连兜底都挂 —— 用户那次分析轮就这么死的）。
+TEMPERATURE_HINTS: tuple[tuple[str, float], ...] = (("kimi", 1.0),)
+
+
+def temperature_for(model: str, default: float) -> float:
+    """这个模型该用多少温度：命中 ``TEMPERATURE_HINTS`` 就按它，否则用给的默认值。"""
+    name = (model or "").lower()
+    for hint, value in TEMPERATURE_HINTS:
+        if hint in name:
+            return value
+    return default
+
+
+def provider_key_for(base_url: str, metas: Sequence[ProviderMeta]) -> str:
+    """按 base_url 反推「提供商」——**纯界面提示，不参与任何解析**。
+
+    命中目录里某个地址就给它的 key，否则 ``custom``。之所以不把「提供商」存进 agent 那一行：
+    它只影响界面带出哪个 base_url，而模型真正用哪套连接由 base_url + 模型 + key 决定
+    （见 ``llm._config_for``）。
+    """
+    target = (base_url or "").strip().rstrip("/").lower()
+    if not target:
+        return "custom"
+    for meta in metas:
+        if meta.default_base_url and meta.default_base_url.strip().rstrip("/").lower() == target:
+            return meta.provider
+    return "custom"
+
+
+def provider_meta_of(row: Any) -> ProviderMeta:
+    """把 ``model_providers`` 的一行（或任何同形对象）掰成 ``ProviderMeta``。
+
+    只做形状对齐：``None`` → 空串、缺列给默认值。不查库也不校验 —— 表里存的就是界面要的
+    （种子文件的字段在 ``load_provider_seed`` 里过白名单）。
+    """
+    return ProviderMeta(
+        provider=str(row.provider),
+        display_name=str(row.display_name or row.provider),
+        default_base_url=row.default_base_url or "",
+        ui_group=row.ui_group or "",
+        sort_order=int(row.sort_order or 0),
+        status=int(row.status if row.status is not None else 1),
+        is_dynamic_model_list=bool(row.is_dynamic_model_list),
+        models_path=row.models_path or "/models",
+        auth_header=row.auth_header or "Authorization",
+        auth_prefix=row.auth_prefix or "",
+    )
+
+
+def provider_metas_of(rows: Iterable[Any]) -> tuple[ProviderMeta, ...]:
+    """一表行 → ``ProviderMeta`` 元组（顺序交给 ``Settings.provider_metas`` 排）。"""
+    return tuple(provider_meta_of(row) for row in rows)
+
+
+@dataclass(frozen=True)
+class ProviderModelMeta:
+    """供应商的**模型详情**的一行（表 ``provider_models``，2026-10-14 加）。
+
+    只带解析与界面要的那几格；**上下文长度挂在这里而不是供应商上** —— 同一家 ``glm-5.3`` 是 1M、
+    ``glm-4.6`` 是 128k，挂在家上会把压缩线推错地方。
+    """
+
+    provider: str
+    model: str
+    model_type: str = "chat"
+    context_window: int = 0
+    #: 这个窗口/类型哪来的：probe（刷新时读到的）/ manual / seed
+    source: str = "manual"
+    status: int = 1
+
+
+def model_meta_of(row: Any) -> ProviderModelMeta:
+    """表行 → ``ProviderModelMeta``（形状对齐，不查库不校验）。"""
+    return ProviderModelMeta(
+        provider=str(row.provider),
+        model=str(row.model),
+        model_type=str(getattr(row, "model_type", "") or "chat"),
+        context_window=int(getattr(row, "context_window", 0) or 0),
+        source=str(getattr(row, "source", "") or "manual"),
+        status=int(getattr(row, "status", 1) if getattr(row, "status", None) is not None else 1),
+    )
+
+
+def model_metas_of(rows: Iterable[Any]) -> tuple[ProviderModelMeta, ...]:
+    """一表行 → ``ProviderModelMeta`` 元组。"""
+    return tuple(model_meta_of(row) for row in rows)
+
+
+def sort_provider_metas(metas: Iterable[ProviderMeta]) -> tuple[ProviderMeta, ...]:
+    """留下启用项，按 ``ui_group`` → ``sort_order`` → ``provider`` 排。
+
+    界面上的下拉直接照这个顺序画 optgroup，不再自己排 —— 排序只有一个出处：
+    **现读库那份**和**内置兜底那份**都走这里。
+    """
+    return tuple(
+        sorted(
+            (meta for meta in metas if meta.status == 1),
+            key=lambda item: (item.ui_group, item.sort_order, item.provider),
+        )
+    )
+
+
 class Settings(BaseSettings):
     """Settings for the harness service.
 
@@ -46,6 +404,23 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # 模型连接（**按智能体**配，2026-10-13）：键见 ``MODEL_AGENT_ROWS``；启动时从业务库读
+    # 进来（见 api/app.py 的装配 `apply_model_endpoints`），界面上保存之后**下一轮**生效。
+    #
+    # **没有出厂默认**（2026-10-15 用户口径：干掉 .env 那套回落）：空 = 这一行没有模型可用，
+    # 用到它的角色会当场报错（报错文案见 ``agent/llm._config_for``）；下面那些
+    # ``<供应商>_*`` 字段只剩 **web 搜索**（GLM）在用，不再参与模型解析。
+    agent_models: dict[str, ModelConfig] = {}
+    #: 意图识别走哪一关：``jev``（优先，默认）/ ``llm``。库里 ``intent_mode`` 那一行覆盖它。
+    intent_mode: str = "jev"
+    #: 提供商目录（表 ``model_providers`` 的当前内容；启动时读进来）。空 = 用内置那份
+    #: （``PROVIDER_OPTIONS`` + ``.env`` 里的地址）—— 这样「没有种子文件 / 库是空的」时
+    #: 行为与以前完全一致。
+    providers: tuple[ProviderMeta, ...] = ()
+    #: 供应商的**模型详情**（表 ``provider_models`` 的当前内容）—— 窗口按模型查就查它。
+    #: 启动时读进来，界面上「刷新模型清单」之后当场刷新（不用重启）。
+    provider_models: tuple[ProviderModelMeta, ...] = ()
 
     # LLM — DeepSeek (primary) and Kimi (backup), both OpenAI-compatible.
     deepseek_api_key: str = ""
@@ -68,21 +443,79 @@ class Settings(BaseSettings):
     qwen_base_url: str = ""
     qwen_model_name: str = ""
 
-    # 各模型的上下文窗口（tokens），供上下文压缩按比例计算阈值（80% 触发）。
-    # glm / gpt / qwen 三家接口都**不暴露窗口**（实测 /models 只返回模型名；拿得到的
-    # 131072 / 128000 是**输出**上限，不是窗口），文档也取不到，所以取保守值：偏小只是
-    # 早一点触发压缩，偏大则会真的把请求撑溢出（窗口是硬上限，超了直接报错）。
-    deepseek_context_window: int = int(os.getenv("DEEPSEEK_CONTEXT_WINDOW", "1048576"))
-    kimi_context_window: int = int(os.getenv("KIMI_CONTEXT_WINDOW", "262144"))
-    glm_context_window: int = int(os.getenv("GLM_CONTEXT_WINDOW", "128000"))
-    gpt_context_window: int = int(os.getenv("GPT_CONTEXT_WINDOW", "128000"))
-    qwen_context_window: int = int(os.getenv("QWEN_CONTEXT_WINDOW", "1048576"))
+    # 上下文窗口（tokens）**不在这里配**（2026-10-15 删掉了逐家的 `*_CONTEXT_WINDOW`）：
+    # 窗口是**模型**的属性，口径是「那一行手填 → 按模型查（表 provider_models）→ 保守兜底值
+    # （``fallback_context_window``，默认 128k）」。压缩**不再只按窗口比例**触发 —— 窗口按
+    # 模型查之后动辄 1M，比例那条线落在 843k，等于不压；改成「比例 OR 绝对上限」两条，
+    # 取值见下面的 ``CONTEXT_SUMMARY_*`` 与 `agent/summarization.py`。
+    # 上下文压力提醒的两条线（占窗口比例）。**只是提示，不改行为**：压缩按上面那两条触发。
+    # 分两档是因为单档要么太晚（压完了才知道，来不及做任何决定），要么太早（刚开口就报警，
+    # 成了噪声）：60% 起画一条细进度条让人**有预期地看着它涨**，80% 才给警示语。
+    # 设 0 关掉对应那一档。
+    context_warn_ratio: float = float(os.getenv("CONTEXT_WARN_RATIO", "0.6"))
+    context_alert_ratio: float = float(os.getenv("CONTEXT_ALERT_RATIO", "0.8"))
+    # 窗口读不到时的保守兜底（tokens）。原来写死在 ``FALLBACK_CONTEXT_WINDOW`` 常量里，
+    # 2026-10-14 起可以在设置页改（常量仍留着当默认值与它的出处）。
+    fallback_context_window: int = FALLBACK_CONTEXT_WINDOW
 
-    # 兜底供应商：某家彻底失败（SDK 自带重试耗尽）时，临时改用这家的模型再试一次。
-    # 只有**全局一条**保底（现定 deepseek），不做链式降级；角色本来就用这家的（coder
-    # 用 deepseek）等于没有兜底，不重复兜。留空 = 关掉兜底。
-    fallback_provider: str = "deepseek"
+    # 工具裁剪（2026-10-17 用户口径：**不要常规剪裁**）：只在**压缩线**做一次应急裁剪，
+    # 保留「当前这一步」和模型工作笔记 KEEP 点名的工具返回，其余换成带身份占位符；
+    # 剪完低于压缩线就不摘要，仍高于才压。只改这一次请求（见 middleware/context_trim.py）。
+    context_trim_enabled: bool = os.getenv("CONTEXT_TRIM_TOOL_RESULTS", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # 应急裁剪时连工具**入参**一起清（write_file 的整份文件、storePlan 的一万字正文）：收益
+    # 更大，但历史 AI 消息的 args 会变空 —— 默认关。
+    context_trim_clear_inputs: bool = (
+        os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "false").strip().lower() in ("1", "true", "yes")
+    )
 
+    # 压缩（摘要）：什么时候压 / 压完留多少 / 摘要那次调用最多吃多少。三件都在这组里，
+    # **不上界面**（与上面的剪裁同属「调参」，口径见 docs/config-page-design.md 第九节）。
+    # 计数用**中英混合**口径（≈真实 token，见 middleware/context_trim.py），所以下面这几个数
+    # 就是「真 token」的量级，不是上一版那种被高估 2.5 倍的估算值。
+    context_summary_enabled: bool = os.getenv("CONTEXT_SUMMARY_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # 稳态（qa / analysis）：按窗口比例触发；这两类通常不会一次读大量文件。
+    context_steady_trigger_fraction: float = float(
+        os.getenv("CONTEXT_STEADY_TRIGGER_FRACTION", "0.70")
+    )
+    # 爆发（plan / coder / reviewer）：读文件是常态，上下文涨得快，提前压。
+    # 2026-10-19 用户口径：先按 40% 窗口验证压缩/裁剪比例，后续可调。
+    context_burst_trigger_fraction: float = float(
+        os.getenv("CONTEXT_BURST_TRIGGER_FRACTION", "0.40")
+    )
+    # 窗口解析不出来时的兜底线；有窗口时不再参与触发（避免 1M 模型被一个固定小值
+    # 长期压住）。这条设 0 会被上游的取值校验拒掉。
+    context_summary_trigger_tokens: int = int(
+        os.getenv("CONTEXT_SUMMARY_TRIGGER_TOKENS", "120000")
+    )
+    # 压完保留最近这么多 token。上游那个 ``("fraction", 0.10)`` 在 1M 窗口下等于留 100k，
+    # 与 40%/70% 的触发线相比，窗口 10% 在大窗口下仍然太大 —— 所以这里用绝对值。
+    context_summary_keep_tokens: int = int(os.getenv("CONTEXT_SUMMARY_KEEP_TOKENS", "20000"))
+    # 摘要那次调用最多吃多少 token（上游 ``trim_tokens_to_summarize``）。上游**工厂**的默认是
+    # ``None`` ＝完全不裁，等于把被逐出的全部历史再发一遍给主控那个贵模型，还可能自己溢出
+    # （溢出时它不像主调用那样有兜底，会把整轮带崩）。原始全文另有 offload
+    # （``/conversation_history/{thread_id}.md``）且摘要里带路径可回看，所以这里裁掉的是
+    # 「更早的那部分不进摘要」，不是「丢了」。
+    context_summary_input_tokens: int = int(
+        os.getenv("CONTEXT_SUMMARY_INPUT_TOKENS", "40000")
+    )
+    #: 临近压缩线时先提醒模型写工作笔记的线 = 压缩线 × 这个比例（0=关闭）。
+    #: 90% 给模型留出一次正常回复的机会，把「已读到什么、还需要什么」写成 KEEP 清单；
+    #: 到线后的应急裁剪按这份清单保留，不再只保当前步骤。
+    context_pretrim_notice_ratio: float = float(
+        os.getenv("CONTEXT_PRETRIM_NOTICE_RATIO", "0.9")
+    )
+
+    # 兜底（2026-10-15 起**只有**「兜底模型」那一行这一个来源，``FALLBACK_PROVIDER`` 作废）：
+    # 主模型重试耗尽时换它再试一次；那一行留空 = 关掉兜底。
+    #
     # 兜底的重试有代价：智能体一轮对话要跑多次模型节点（model → tools → model …），
     # 主导死着的时候**每一轮**都得先撞死一次才轮到兜底，半路断流那种还会把半截句子重复
     # 吐进流里。所以主导连续失败到阈值就开闸，冷却期内不再撞它，直接走兜底。
@@ -108,8 +541,16 @@ class Settings(BaseSettings):
         "true",
         "yes",
     )
-    # 单条命令的超时：Redis 半死时宁可降级，也不能让一轮对话卡在这里
-    redis_timeout_seconds: float = float(os.getenv("REDIS_TIMEOUT_SECONDS", "1.0"))
+    # 单条命令的超时：Redis 半死时宁可降级，也不能让一轮对话卡在这里。
+    # **远端 / 走隧道的 Redis 必须放大**：2026-10-11 实测 —— 127.0.0.1:6379 其实是 SSH 隧道
+    # （PING 中位 62ms、p95 92ms，服务端慢日志是空的），1 秒只给 16 倍余量，隧道抖一下
+    # （TCP 重传通常 ≥200ms、连丢可到 1s 以上）就把进程打到降级。默认给 5 秒。
+    redis_timeout_seconds: float = float(os.getenv("REDIS_TIMEOUT_SECONDS", "5.0"))
+    # 降级窗口：一次失败后退回进程内这么多秒，**过了就再试一次**（不是永久降级 ——
+    # 理由与实测见 redis_cache.py 的 ``RedisBacked.run``）。设 0 ＝ 永不重试（旧行为）。
+    redis_degrade_cooldown_seconds: float = float(
+        os.getenv("REDIS_DEGRADE_COOLDOWN_SECONDS", "60")
+    )
     # 运行缓冲的存活时间与容量上限（超出上限从最老的帧开始丢）
     run_buffer_ttl_seconds: int = int(os.getenv("RUN_BUFFER_TTL_SECONDS", "3600"))
     run_buffer_max_frames: int = int(os.getenv("RUN_BUFFER_MAX_FRAMES", "2000"))
@@ -119,29 +560,38 @@ class Settings(BaseSettings):
 
     # 意图分类（每轮一次）：强/弱关键字直通，其余交 LLM 判定，失败回落关键字。
     # 分类与主智能体的差别只在参数：分类必须关思考（vLLM 只认 chat_template_kwargs
-    # 那个键，实测 2.8~5.0s → 0.3s），主智能体不传该参数。同一模型两套参数，故单独
-    # 一套配置；三项必填，未配置直接报错，不回落主模型。
+    # 那个键，实测 2.8~5.0s → 0.3s），主智能体不传该参数。同一模型两套参数，所以它的
+    # **模型连接单独一行**（「意图识别（大模型）」，见 ``llm.build_classifier_model``）；
+    # ``INTENT_MODEL`` / ``INTENT_BASE_URL`` / ``INTENT_API_KEY`` 三个 .env 键 2026-10-15 作废。
     intent_llm_enabled: bool = True
-    intent_model: str = ""
-    intent_base_url: str = ""
-    intent_api_key: str = ""
     intent_timeout_seconds: float = 5.0
+    #: 低置信度澄清阈值：JEV / 大模型的 confidence 低于它时，本轮转 qa 先追问用户。
+    #: 0 = 关闭。2026-10-19 200 条实测：JEV < 0.55 的 16 条只对 43.8%，≥0.55 的 147 条
+    #: 对 91.2%；0.50 / 0.60 分别会问 6.7% / 14.1%。0.55 是“低置信准确率明显塌陷、
+    #: 追问量约 10%”的折中。
+    intent_clarify_confidence: float = 0.55
     # 分类时附带的历史用户消息条数（指代要靠它，如「就按你说的弄」）
     intent_history_turns: int = 4
+    # 影子路由器（2026-10-17 原型）：把一句话拆成正交维度并记 ``INTENT_ROUTER``，
+    # **不采用它的建议、不改变本轮形态**。默认关；打开后每轮多一次分类模型调用，
+    # 但跑在独立 task 里，不影响本轮返回。
+    intent_router_shadow: bool = (
+        os.getenv("INTENT_ROUTER_SHADOW", "false").strip().lower()
+        in ("1", "true", "yes")
+    )
+    intent_router_timeout_seconds: float = float(
+        os.getenv("INTENT_ROUTER_TIMEOUT_SECONDS", "5")
+    )
 
-    # JEV（SystemOne，决策型模型）做意图判定 —— 判定瀑布的第二关（见 server/intent.py）：
-    # 口令 → **JEV** → 大模型 → 关键字口径（没命中就是 DEFAULT_INTENT = coding）。
-    # SDK 是 `typesafe-sdk`，**懒加载**：没装这个包或没配 key 就跳过这一关，服务照起。
-    # 键名沿用官方 `TYPESAFE_*`；模型名优先看 `TYPESAFE_MODEL_NAME`（.env 里用的就是它），
-    # 再回落 SDK 的 `TYPESAFE_DEFAULT_MODEL`，最后是 SDK 默认的 `jev-latest`。
+    # JEV（SystemOne，决策型模型）做意图判定 —— 二选一里的另一侧（见 server/intent.py）：
+    # 口令 → **JEV** → 关键字口径。凭据来自界面上的「意图识别（JEV）」那一行
+    # （2026-10-15 起：`TYPESAFE_*` 三个 .env 键作废，供应商锁定 typesafe）。
+    # SDK 是 `typesafe-sdk`，**懒加载**：没装这个包或那一行没配齐就跳过 JEV，落关键字口径。
     intent_jev_enabled: bool = True
     typesafe_api_key: str = ""
     typesafe_base_url: str = ""
-    typesafe_model_name: str = (
-        os.getenv("TYPESAFE_MODEL_NAME")
-        or os.getenv("TYPESAFE_DEFAULT_MODEL")
-        or "jev-latest"
-    )
+    #: JEV 的模型名：那一行填了就用它，留空 = SDK 默认的 ``jev-latest``
+    typesafe_model_name: str = "jev-latest"
     typesafe_timeout_seconds: float = float(os.getenv("TYPESAFE_TIMEOUT_SECONDS", "10"))
 
     # Service
@@ -178,6 +628,9 @@ class Settings(BaseSettings):
     # 工具返回值写进日志时的字符上限。工具的成败常只体现在返回值里（如记忆写入被拒绝），
     # 不记就无法从日志判断「工具到底成没成」——所以单独留一个上限，比参数上限小得多。
     log_tool_result_max: int = 300
+    # 委派（task）返回值写进日志时的字符上限，比普通工具返回宽：这一行是「一个子智能体这趟
+    # 到底干成了什么」唯一的落盘记录，300 字连一份 PR 摘要都放不下；而它每轮只有几条。
+    log_delegation_result_max: int = 1000
 
     # Persistence（LangGraph checkpointer + store，PostgreSQL；经 SSH 隧道走本地）
     postgres_host: str = "127.0.0.1"
@@ -263,12 +716,15 @@ class Settings(BaseSettings):
     gitee_access_token: str = ""
     gitee_username: str = ""
     gitee_base_url: str = "https://gitee.com/api/v5"
-    gitee_base_branch: str = "master"
+    # 代码面板默认打开哪个分支。**留空 ＝ 按远程探测**（裸仓 HEAD 指着谁就是谁）；
+    # 填了就**以它为准** —— 2026-10-14 起可在设置页改（用户口径：代码缓存配置），
+    # 所以填错会让面板打开一个不存在的分支。原来的默认值是写死的 master / main。
+    gitee_base_branch: str = ""
 
     github_access_token: str = ""
     github_username: str = ""
     github_base_url: str = "https://api.github.com"
-    github_base_branch: str = "main"
+    github_base_branch: str = ""
 
     # Gitee OAuth（登录）
     gitee_oauth_client_id: str = ""
@@ -331,6 +787,74 @@ class Settings(BaseSettings):
             self.github_username if platform is Platform.GITHUB else self.gitee_username
         )
 
+    def model_secret_values(self) -> tuple[str, ...]:
+        """所有**模型凭据**（界面配的那些行 + ``.env`` 里几家 + JEV / 分类）—— 给脱敏词表用。
+
+        2026-10-13 之前词表里只有 git token（模型 key 只在 ``.env``、不进沙箱）。现在 key
+        既可能出现在界面上、也可能被模型自己复述出来，所以一并纳入；
+        ``redact.secret_terms`` 自己会滤掉空值与过短的值。
+        """
+        from_env = (
+            self.deepseek_api_key,
+            self.kimi_api_key,
+            self.glm_api_key,
+            self.gpt_api_key,
+            self.qwen_api_key,
+            self.typesafe_api_key,
+        )
+        from_rows = tuple(row.api_key or "" for row in self.agent_models.values())
+        return tuple(value for value in (*from_env, *from_rows) if value)
+
+    def provider_metas(self) -> tuple[ProviderMeta, ...]:
+        """启动时读进来的那份目录 —— 现在只当**兜底**用（见下）。
+
+        界面上的目录是**每条请求现读库**（`api/routes/model_config.py::_provider_metas`），
+        所以改库 + 刷新就生效、不用重启。这里这份在两种情况下生效：
+        库里读不出来（表坏了 / 连不上），以及压根没有种子文件的老环境 —— 退回
+        ``PROVIDER_OPTIONS`` + ``.env`` 里的地址，行为与加表之前一致。
+
+        它**不预填给未配置的智能体行**（用户口径：不给默认值）。
+        """
+        if self.providers:
+            return sort_provider_metas(self.providers)
+        return sort_provider_metas(
+            ProviderMeta(
+                provider=key,
+                display_name=label,
+                default_base_url=(getattr(self, attr, "") or "") if attr else "",
+                sort_order=index * 10,
+            )
+            for index, (key, label, attr) in enumerate(PROVIDER_OPTIONS)
+        )
+
+    def models_of_provider(self, provider: str, *, model_type: str = "") -> tuple[ProviderModelMeta, ...]:
+        """这家启用的模型（可只看某一类）—— 界面上的候选清单用它。"""
+        return tuple(
+            item
+            for item in self.provider_models
+            if item.provider == provider
+            and item.status == 1
+            and (not model_type or item.model_type == model_type)
+        )
+
+    def window_for_model(self, model: str, provider: str = "") -> int:
+        """这个模型的上下文长度（tokens）；不知道就 0。
+
+        **先按 ``(供应商, 模型)`` 精确查，再按模型名全局查一次** —— 用户自己的网关（``custom``）
+        地址对不上任何一家，但模型名通常还是同一个，同名模型的窗口是一样的。启用项才算数。
+        """
+        wanted = (model or "").strip()
+        if not wanted:
+            return 0
+        loose = 0
+        for item in self.provider_models:
+            if item.status != 1 or item.model != wanted or item.context_window <= 0:
+                continue
+            if item.provider == provider:
+                return item.context_window
+            loose = loose or item.context_window
+        return loose
+
     def api_base_for(self, platform: Platform) -> str:
         """该平台的 API 根地址。"""
         return (
@@ -361,73 +885,6 @@ class Settings(BaseSettings):
     def postgres_async_url(self) -> str:
         """SQLAlchemy 异步连接串（psycopg3 驱动，用于业务库 ORM / Alembic）。"""
         return self.postgres_url.replace("postgresql://", "postgresql+psycopg://", 1)
-
-    @property
-    def deepseek_model(self) -> ModelConfig:
-        """DeepSeek：编码链路。"""
-        return ModelConfig(
-            model=self.deepseek_model_name,
-            api_key=self.deepseek_api_key,
-            base_url=self.deepseek_base_url,
-            context_window=self.deepseek_context_window,
-        )
-
-    @property
-    def kimi_model(self) -> ModelConfig:
-        """Kimi：审查链路。温度**必须**是 1 —— 该模型不收其他取值。"""
-        return ModelConfig(
-            model=self.kimi_model_name,
-            api_key=self.kimi_api_key,
-            base_url=self.kimi_base_url,
-            context_window=self.kimi_context_window,
-            temperature=1,
-        )
-
-    @property
-    def classifier_model(self) -> ModelConfig:
-        """意图分类模型：**临时**直连主模型 deepseek（本机 vLLM 分类器没启动时的降级口径）。
-
-        ``INTENT_*`` 三项此刻被忽略、留着当回切路径：恢复分类器后把三行改回
-        ``self.intent_model or self.deepseek_model_name`` 那种写法即可。
-        """
-        return ModelConfig(
-            model=self.deepseek_model_name,
-            api_key=self.deepseek_api_key,
-            base_url=self.deepseek_base_url,
-        )
-
-    @property
-    def glm_model(self) -> ModelConfig:
-        """GLM：出方案。思考是服务端默认，不留开关（``llm.build_model`` 也不转发额外参数）。"""
-        return ModelConfig(
-            model=self.glm_model_name,
-            api_key=self.glm_api_key,
-            base_url=self.glm_base_url,
-            context_window=self.glm_context_window,
-        )
-
-    @property
-    def gpt_model(self) -> ModelConfig:
-        """GPT：问答与分析。"""
-        return ModelConfig(
-            model=self.gpt_model_name,
-            api_key=self.gpt_api_key,
-            base_url=self.gpt_base_url,
-            context_window=self.gpt_context_window,
-        )
-
-    @property
-    def qwen_model(self) -> ModelConfig:
-        """Qwen：**当前没有角色取用**（原为多智能体主控，因它在 v3 事件流下丢
-        tool_call id 而换成 glm）。配置与 ``.env`` 键保留，换回来只需改路由表一行。
-        思考在云端默认开启，同样不留开关。"""
-        return ModelConfig(
-            model=self.qwen_model_name,
-            api_key=self.qwen_api_key,
-            base_url=self.qwen_base_url,
-            context_window=self.qwen_context_window,
-        )
-
 
 @lru_cache
 def get_settings() -> Settings:

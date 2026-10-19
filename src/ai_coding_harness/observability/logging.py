@@ -54,6 +54,14 @@ _UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 # 运行日志里的「执行主角」标注：主智能体用 MAIN_AGENT，子智能体用其自身名字
 # （planner / coder / reviewer）。没标注的一律记为 _AGENT_UNSET。
 MAIN_AGENT = "main"
+
+# 主智能体在事件流里的**真名**：``agent/graph.py`` 建主智能体时传的 ``name=`` 就是它，
+# 于是主控那一路模型调用的 ``lc_agent_name`` 是这个字符串（不是上面的占位名）。
+# 判「这一笔是不是主控」时必须认它 —— 只认 MAIN_AGENT 的话，主控的账会被归到一个英文名
+# 下，而且「主控峰值输入」恒为 0，上下文压力那一整块静默失效（2026-10-12 实测踩到）。
+# 定义在这里是为了**只有一处**：graph 用它命名，run_log 用它归类。
+MAIN_AGENT_NAME = "ai-coding-harness"
+
 _AGENT_UNSET = "-"
 
 

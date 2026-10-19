@@ -189,7 +189,7 @@ def policy_for(name: str, settings: Settings | None = None) -> AgentPolicy:
 # 一回事」。
 _ROOTS: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
     # 主控（多智能体形态）：改代码、临时区、审查原文三处都要落
-    "orchestrate": (("project", "tmp", "review"), frozenset()),
+    "orchestrate": (("project", "tmp", "review"), frozenset({"edit_file", "write_file"})),
     # 主控（单智能体出方案）：与子智能体 planner 同形 —— 方案 `storePlan` 落库、结论进回复，
     # 一个文件都不落，写工具一并撤掉。它自己的提示词有两处就是这么写的（`_PLAN_WORKDIR` 的
     # 「产出：方案写入 DB，不落文件」、`_PLAN_RULES` 的「不落文件」），只有「可写范围」那段
@@ -210,7 +210,7 @@ _ROOTS: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
     # 与只读形态「交付物就是回复」这条口径直接冲突，所以撤掉 output、只留 tmp。
     # 现在 output 是**所有形态都不写**（plan 与 orchestrate 也一并撤了），这条通路只剩
     # 目录本身（`sandbox_output_dir` 与 provider 的 mkdir），留给未来有回传通路时再用。
-    "analysis": (("tmp",), frozenset()),
+    "analysis": (("tmp",), frozenset({"write_todos"})),
     # 子智能体 planner：方案写库，不再落文件（写文件等于同一件事记两遍）
     "planner": ((), frozenset({"write_file", "edit_file"})),
     # 子智能体 coder：只动工程目录与临时区
@@ -415,7 +415,7 @@ def write_targets(tool_name: str, args: Mapping[str, Any]) -> list[str] | None:
     """这个工具调用会写到的路径；``None`` 表示它不涉及写。"""
     for key in _WRITE_ARGS.get(tool_name, ()):
         value = args.get(key)
-        if isinstance(value, str) and value:
+        if value and isinstance(value, str):
             return [_norm(value)]
     if tool_name == "execute":
         command = args.get("command")

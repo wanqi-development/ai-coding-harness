@@ -172,6 +172,57 @@ class TestMainPlansBeforeItDelegates:
         assert "动手前先规划" not in QA_AGENT_PROMPT
 
 
+class TestThePlanIsNotCopiedAround:
+    """方案正文只该在库里那一份（``storePlan`` 的 ``content``）。
+
+    实测一轮（2026-10-12，阿里云短信）：主控把方案全文抄进 coder 的任务描述，而 coder
+    又自己 ``get_unexecuted_plan`` 取了一遍 —— 同一份方案在 coder 的上下文里躺着两份
+    （6,270 字那份 + 库里 10,915 字那份），之后 79 次调用每次重发：**光这一项 ≈90 万
+    input tokens**，还顺带埋了「两个版本谁为准」的隐患。
+    """
+
+    def test_the_planner_reports_a_summary_not_the_whole_plan(self):
+        assert "回报 / 答复只写摘要，不抄方案全文" in PLANNER_PROMPT
+        assert "不贴全文，也不贴步骤原文" in PLANNER_PROMPT
+
+    def test_the_main_does_not_paste_the_plan_into_the_task(self):
+        assert "不要抄方案全文" in MAIN_AGENT_PROMPT
+        assert "不要搬运长文" in MAIN_AGENT_PROMPT
+        assert "不贴方案全文" in intent_directive("coding")
+
+    def test_the_coder_knows_the_plan_has_exactly_one_source(self):
+        assert "方案正文只有这一个来源" in CODER_PROMPT
+
+    def test_the_plan_form_also_answers_with_a_summary(self):
+        # plan 形态是主控直接把方案写给用户：同样只给摘要，全文由「方案」链接承载
+        assert "回报 / 答复只写摘要，不抄方案全文" in PLAN_AGENT_PROMPT
+        assert "再把**摘要**呈给用户" in PLAN_AGENT_PROMPT
+
+
+class TestThePlanBodyStaysShortAndClean:
+    """正文限长 + 写干净：一次超长生成会写出半成品。
+
+    实测 2026-10-12（plan 41）：一次调用要吐 9.5k 字正文（输入已 54.7k），模型在里面自我
+    修补（同一节写两遍、带「更正稿」字样）、写到第 4 步（共 6 步）就断了。现在提示词给了
+    字数预算，工具那边也按同一个数硬拒（`MAX_CONTENT_CHARS`）。
+    """
+
+    def test_the_prompt_sets_a_budget(self):
+        assert "4000 字以内" in PLANNER_PROMPT
+        assert "正文精简（强要求）" in PLANNER_PROMPT
+        assert "不要在文档里追加「更正稿」" in PLANNER_PROMPT
+
+    def test_the_hard_cap_in_the_prompt_is_the_tools_cap(self):
+        """提示词里那个硬上限必须就是工具里的常量 —— 两处对不上，模型按提示词写也会被拒。"""
+        from ai_coding_harness.tools.plan import MAX_CONTENT_CHARS
+
+        assert str(MAX_CONTENT_CHARS) in PLANNER_PROMPT
+
+    def test_what_belongs_in_the_body_is_spelled_out(self):
+        assert "不该写" in PLANNER_PROMPT
+        assert "coder 自己会读码" in PLANNER_PROMPT
+
+
 class TestTodosComeAfterTheTaskIsUnderstood:
     """``write_todos`` 曾被当成开场动作：一上来先摆一份清单，摆出来的是猜的。
 
@@ -271,6 +322,48 @@ class TestQaHasNoTodoList:
             REVIEWER_PROMPT,
         ):
             assert "任务清单规则" in prompt
+
+
+class TestFindingsSurviveTheTrim:
+    """读过的东西会被裁掉，所以结论必须落在**自己的话**里 —— 这是提示词那一半。
+
+    2026-10-16 那轮 analysis 触顶（`recursion_limit=200`）的账：126 次工具调用只留得住最后
+    几条原文，模型回头要用早先读过的文件时满眼是占位符，于是重读 —— 同一个文件读 8 次、
+    同一批文件用 `execute` 各 dump 6~7 次，步数全烧在重读上。代码那一半是「占位符带身份、
+    不再劝重读」（`context_trim.trimmed_placeholder`）与当时把保留窗口从 6 抬到 12
+    （该配置 2026-10-17 已作废）；三件是一套，所以在这儿一起钉住。
+    """
+
+    def test_a_placeholder_means_it_already_read_that(self):
+        """要明说「占位符＝你读过」，否则模型只当「这里没有信息」，转头再去读一遍。"""
+        for prompt in (QA_AGENT_PROMPT, ANALYSIS_AGENT_PROMPT):
+            assert "读过就别重读" in prompt
+            assert "不等于你没读过" in prompt
+
+    def test_nothing_invites_a_reread_any_more(self):
+        """「需要时重新读一次」那句就是重读的诱因，两份只读提示词里都不能再出现。"""
+        for prompt in (QA_AGENT_PROMPT, ANALYSIS_AGENT_PROMPT):
+            assert "重新读一次" not in prompt
+
+    def test_conclusions_go_into_its_own_words(self):
+        """工具返回会被裁、AI 消息不会 —— 这条机制得讲给它听，它才知道结论该往哪儿放。"""
+        for prompt in (QA_AGENT_PROMPT, ANALYSIS_AGENT_PROMPT):
+            assert "工具返回会被裁掉，你写出来的话不会" in prompt
+
+    def test_analysis_concludes_as_it_goes(self):
+        """分析工作法第 3 步：边取证边下结论，不许攒到最后一次性下。"""
+        assert "边取证边下结论，不要攒到最后" in ANALYSIS_AGENT_PROMPT
+        assert "串成整体" in ANALYSIS_AGENT_PROMPT, "收尾是串结论，不是重读一遍材料"
+
+    def test_the_paged_reread_anti_pattern_is_named(self):
+        """那轮的重读全是「同一文件、不同 offset/limit」—— 空转刹车认不出来，只能在这儿点名。"""
+        assert "反复翻同一个文件" in ANALYSIS_AGENT_PROMPT
+        assert "再 `cat` 一遍" in ANALYSIS_AGENT_PROMPT
+
+    def test_the_discipline_stays_in_the_readonly_forms(self):
+        """这两条挂在只读形态的检索纪律里，别顺手漂到写码那几份去。"""
+        for prompt in (CODER_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT):
+            assert "读过就别重读" not in prompt
 
 
 class TestExistingFeatureIsAConflict:

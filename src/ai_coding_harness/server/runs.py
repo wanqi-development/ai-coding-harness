@@ -83,7 +83,15 @@ class RunHub:
         self._runs: dict[str, _Local] = {}
 
     # -- 启动 ---------------------------------------------------------------
-    async def start(self, session_id: str, session: Session, message: str) -> None:
+    async def start(
+        self,
+        session_id: str,
+        session: Session,
+        message: str,
+        *,
+        clarification_id: str | None = None,
+        choice: int | str | None = None,
+    ) -> None:
         """起一轮；同一会话已有在跑的轮次时抛 ``RunInProgress``。
 
         两道判定：**本地注册表**（这一轮就在这个进程里，含 task 是否已经结束）与
@@ -99,7 +107,15 @@ class RunHub:
         run = _Local()
         self._runs[session_id] = run
         run.task = asyncio.create_task(
-            self._pump(session_id, session, message, run), name=f"run:{session_id}"
+            self._pump(
+                session_id,
+                session,
+                message,
+                run,
+                clarification_id=clarification_id,
+                choice=choice,
+            ),
+            name=f"run:{session_id}",
         )
         if self._lock.cross_process:
             # 只有跨进程那份才需要盯：本进程的取消是直接 cancel，没有可盯的东西
@@ -108,7 +124,14 @@ class RunHub:
             )
 
     async def _pump(
-        self, session_id: str, session: Session, message: str, run: _Local
+        self,
+        session_id: str,
+        session: Session,
+        message: str,
+        run: _Local,
+        *,
+        clarification_id: str | None = None,
+        choice: int | str | None = None,
     ) -> None:
         """把 ``service.chat()`` 的帧搬进缓冲，直到它结束。
 
@@ -117,7 +140,15 @@ class RunHub:
         （现象是订阅者永远等下去）。
         """
         try:
-            async for frame in self._service.chat(session, message):
+            extra = {
+                key: value
+                for key, value in (
+                    ("clarification_id", clarification_id),
+                    ("choice", choice),
+                )
+                if value is not None
+            }
+            async for frame in self._service.chat(session, message, **extra):
                 await self._buffer.append(session_id, frame)
                 run.event.set()
         except asyncio.CancelledError:
@@ -164,10 +195,26 @@ class RunHub:
                 if loop.time() >= next_renew:
                     next_renew = loop.time() + self._renew_interval
                     if not await self._lock.renew(session_id):
-                        logger.warning(
-                            "会话运行权已不在本进程手里（另一个 worker 可能接手了）：%s",
-                            session_id,
-                        )
+                        # 续期失败有两种，处理完全不同：
+                        # ① **钥匙只是过期了**（Redis 抖动时续期失败最常见：隧道抖一下 →
+                        #    TTL 到点 → 钥匙没了 → 之后每次 renew 都失败）。实测 2026-10-12：
+                        #    一轮从 20:43 起就这样「无主」跑了 95 分钟，UI 的订阅还先收尾了。
+                        # ② 真被别的 worker 抢走。先试着**重新拿回**：自己的钥匙过期时这一下
+                        #    就拿回来了；拿不回来说明确实有别人在跑。
+                        if await self._lock.acquire(session_id):
+                            logger.info(
+                                "运行权已过期，本进程重新取回（Redis 抖动后常见）：%s",
+                                session_id,
+                            )
+                        else:
+                            logger.warning(
+                                "会话运行权已被别的 worker 持有，本轮收尾（不无主地继续写同一个"
+                                "会话）：%s",
+                                session_id,
+                            )
+                            run.task.cancel()
+                            await self._buffer.clear(session_id)
+                            return
             except Exception:  # pragma: no cover —— 两个实现都自己吞了，兜个底
                 logger.exception("检查运行状态时出错：public_id=%s", session_id)
 
@@ -190,13 +237,13 @@ class RunHub:
                 yield seq, frame
             if await self._buffer.is_done(session_id):
                 return
-            # 持有者已经不在（进程被 kill / 重启）＝ 不会再有帧进来：直接收尾，别让**已经接上**
-            # 的订阅者也跟着空转（理由同 ``is_running``）
-            if not await self._lock.held(session_id):
-                logger.warning("本轮已无持有者，订阅收尾：%s", session_id)
-                return
             if local is not None and not local.done:
-                # 本进程的轮次：清事件 → 再查一次 → 等事件。
+                # 本进程的轮次：**本地的 task 就是权威**，不再拿运行权判一次 —— 锁在 Redis
+                # 抖动时可能短暂消失（2026-10-12 实测：钥匙过期后 renew 永远失败，正在跑的
+                # 这一轮被自己的订阅者判成「已结束」，界面显示成跑完了）。`_watch` 那边会把
+                # 它取回来；真被别人拿走时那一轮会被收尾，届时本地 `done` 就为真了。
+                #
+                # 清事件 → 再查一次 → 等事件。
                 # 「查」在「清」之后、「等」在「查」之后：读完之后才追加的帧必然 set 过
                 # 事件，于是不会漏唤醒（原来那句「clear 与查之间没有 await」多了一份存储
                 # 之后不再成立，换成了这个顺序）。
@@ -205,9 +252,19 @@ class RunHub:
                     continue
                 await local.event.wait()
             else:
+                # 不是本进程在跑：只能靠运行权当存活信号。持有者已经不在（进程被 kill /
+                # 重启）＝ 不会再有帧进来：直接收尾，别让**已经接上**的订阅者也跟着空转
+                # （理由同 ``is_running``）
+                if not await self._lock.held(session_id):
+                    logger.warning("本轮已无持有者，订阅收尾：%s", session_id)
+                    return
                 await asyncio.sleep(self._poll)
 
     # -- 状态与清理 ---------------------------------------------------------
+    async def pending_clarification(self, session: Session) -> dict[str, Any] | None:
+        """当前会话的待澄清项（刷新页面时前端恢复弹窗用）。"""
+        return await self._service.pending_clarification(session)
+
     async def is_running(self, session_id: str) -> bool:
         """这个会话现在有没有一轮在跑（本进程的、或别的 worker 的）。"""
         local = self._runs.get(session_id)

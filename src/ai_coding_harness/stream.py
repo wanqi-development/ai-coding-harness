@@ -19,6 +19,9 @@ from typing import Any
 TODO_TOOL = "write_todos"
 # 委派子智能体的工具（``run_log`` 也认这一个名字）
 TASK_TOOL = "task"
+#: 建 PR 的工具名。收尾时要拿它的入参（base / head）去本地缓存算「这一轮改了什么」——
+#: 那是**这一轮的 PR 自己声明的**两边，比回头猜「最新那个 PR」可靠。
+CREATE_PR_TOOL = "create_pr"
 
 # 中间件自己的模型调用会带上这个 metadata 键（值是一次性随机 token，见
 # ``langchain/agents/middleware/internal_call_transformer.py``）。langchain 靠
@@ -231,6 +234,79 @@ def subagent_name(raw: Any) -> str:
 # 协议层，不反向依赖 ``agent`` 层。表里没有的角色照旧原样显示它的名字。
 _ROLE_LABELS = {"planner": "规划", "coder": "编码", "reviewer": "评审"}
 
+# 子智能体角色 → **它该挂在主清单哪一步**（按清单项里的词认）。一主三从的流程是固定的，
+# 主控写的清单项也总带着这几个词（实测：「制定…实施方案」「按方案实施代码并提交 PR」
+# 「对 PR 做代码审查」）。
+#
+# 但这只是**第二顺位**的线索：主控照 ``TODO_PROMPT`` 第 3 条写「步骤 N：这一步在动什么」时，
+# 步骤 1~7 里往往一个角色词都没有（2026-10-16 真机：8 步里只有「步骤 8：提交 PR 并回报审查」
+# 含「提交 pr」），于是 29 次 coder 委派全挂在最后一步。第一顺位是委派描述里的步骤号
+# （见 ``delegation_step``）。
+#
+# 为什么不再用「委派发生时 in_progress 那一项」（2026-10-13 改）：主控**推进清单是滞后的** ——
+# 实测两次：派 planner 时 in_progress 还停在「查询是否存在未执行的方案」，派 coder 时还停在
+# 「确认 plan_id=44 处于待执行状态」，于是子清单挂到了**前置步骤**下（用户看到的就是「树稳定
+# 挂错」）。角色是委派那一刻就确定的事实，比主控的清单推进可靠。
+_ROLE_STEP_WORDS: dict[str, tuple[str, ...]] = {
+    "planner": ("方案", "计划", "设计", "规划"),
+    "coder": ("实施", "编码", "写码", "写代码", "开发", "落地", "提 pr", "提交 pr", "改代码"),
+    "reviewer": ("审查", "评审", "复核"),
+}
+
+# 「前置动作」开头的清单项**不当父项**：主控常把「确认 / 查询 / 获取…」写成清单第一步，
+# 而那次委派其实属于**下一步**（实测：「确认 plan_id=44 处于待执行状态」+「派 coder 按方案
+# 实施」）。只有「一眼就能看出是前置」的项会被跳过，其余仍按角色词匹配。
+_PREP_PREFIXES: tuple[str, ...] = (
+    "确认", "查询", "查看", "检查", "核对", "获取", "准备", "拉取", "读取", "了解", "弄清",
+)
+
+# 「步骤 N」的两种写法：``TODO_PROMPT`` 第 3 条规定的「步骤 N：…」，与口语的「第 N 步」。
+# 刻意**不认**光秃秃的「第 N」——「第 3 次构建」这类话会被误当成步骤号。
+# 数字两种都收：实测委派描述里「步骤 2」与「步骤二」都出现过。
+_STEP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"步骤\s*([0-9]{1,3}|[零一二两三四五六七八九十]{1,3})"),
+    re.compile(r"第\s*([0-9]{1,3}|[零一二两三四五六七八九十]{1,3})\s*步"),
+)
+
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_to_int(raw: str) -> int | None:
+    """中文数字 → int，只覆盖「一 ~ 九十九」（方案步骤用不到更大）。认不出返回 ``None``。"""
+    if "十" not in raw:
+        return _CN_DIGITS.get(raw) if len(raw) == 1 else None
+    head, _, tail = raw.partition("十")
+    tens = 1 if not head else _CN_DIGITS.get(head, -1)
+    ones = 0 if not tail else _CN_DIGITS.get(tail, -1)
+    return None if tens < 0 or ones < 0 else tens * 10 + ones
+
+
+def _step_no(text: str) -> int | None:
+    """从一段文字里取「步骤 N」的 N；没有就返回 ``None``。"""
+    for pattern in _STEP_PATTERNS:
+        match = pattern.search(text or "")
+        if match is None:
+            continue
+        raw = match.group(1)
+        number = int(raw) if raw.isdigit() else _cn_to_int(raw)
+        if number is not None:
+            return number
+    return None
+
+
+def delegation_step(raw: Any) -> int | None:
+    """从 ``task`` 入参的委派描述里取步骤号（与 ``subagent_name`` 同一个来源）。
+
+    这是认亲**最可靠**的一条线索：委派描述与主清单项同出一份方案，两边都带步骤号
+    （实测：描述「按方案实施步骤 2：补齐订单持久化模型…」对清单项「步骤 2：补齐订单
+    持久化模型…」）。畸形入参不抛异常；认不出返回 ``None``，交给角色词那条路。
+    """
+    if isinstance(raw, dict):
+        return _step_no(str(raw.get("description") or ""))
+    return _step_no(str(raw))
+
+
 # ``lc_agent_name`` 里的占位值（主智能体那份是字符串 "None"，不是 None）。
 # 与 ``observability/run_log._NO_AGENT`` 同一口径 —— 但**不能 import** 那个常量：
 # ``run_log`` 反过来 import 本模块，会成环。
@@ -336,10 +412,12 @@ class V3Translator:
     def note_delegation(self, event: dict) -> None:
         """记一次 ``task`` 委派：它的子智能体那棵清单该挂在主清单的哪一项下。
 
-        挂**委派发生时主清单里 in_progress 的那一项** —— deepagents 的 write_todos
-        工具描述硬性要求「除非全部完成，否则始终至少有一项 in_progress」，所以那一项
-        就是主智能体此刻在做的事。没有就退到最后一个未完成的项；再没有（清单还没出来、
-        或已全部完成）记 ``None``，那份子清单就不进树。
+        父项认亲顺序见 ``_delegation_parent``：**委派描述里的步骤号** → **角色词** →
+        「此刻谁 in_progress」。步骤号与清单项同出一份方案，是最硬的一条线索；角色词是给
+        自由写法清单（「派 coder 按方案实施…」）留的老路 —— 单靠 in_progress 不行，主控
+        推进清单是滞后的，会把子清单挂到前置步骤下（2026-10-13 真机：coder 的六步全挂在
+        「确认 plan_id=44 处于待执行状态」底下）。三条都认不出（清单还没出来、或已全部
+        完成）记 ``None``，那份子清单就不进树。
         """
         if method_of(event) != "tools" or namespace_of(event):
             return
@@ -348,8 +426,9 @@ class V3Translator:
             return
         call_id = str(payload.get("tool_call_id") or "")
         if call_id:
-            parent = self._running_item()
-            role = subagent_name(payload.get("input"))
+            raw = payload.get("input")
+            role = subagent_name(raw)
+            parent = self._delegation_parent(role, delegation_step(raw))
             self._parents[call_id] = parent
             self._names[call_id] = role
             # 记进「待认领」表：子智能体的 namespace 用的是 langgraph 自己的 task id
@@ -488,6 +567,36 @@ class V3Translator:
             title = f"「{name}」子任务" if name else "子智能体任务"
         return {"content": title, "status": _rollup(items), "children": items}
 
+    def _delegation_parent(self, role: str, step: int | None) -> str | None:
+        """这次委派该挂在主清单的哪一项下：**先看步骤号，再看角色，最后回落到现状**。
+
+        ① **步骤号**：委派描述里的「步骤 N」去清单项里找同号那一条。已完成的步骤**不当
+           父项**（2026-10-17 用户口径）—— 那一步已经收口，新子树挂上去就成了「做完的
+           步骤还在动」。
+        ② **角色词**：清单里第一条未完成、不是前置动作开头、且含该角色词的项（多条命中取
+           最靠前的 —— 例如 coder 的「派 coder 按方案实施…」在 reviewer 的「派 reviewer
+           审查 PR」之前）。
+        ③ 回落到 ``_running_item()``：最差也只是「挂到前置步骤下」，不至于让子清单整棵消失。
+        """
+        if step is not None:
+            for item in self._main:
+                if item["status"] == "completed":
+                    continue
+                if _step_no(item["content"]) == step:
+                    return item["content"]
+        words = _ROLE_STEP_WORDS.get(role or "", ())
+        if words:
+            for item in self._main:
+                if item["status"] == "completed":
+                    continue
+                text = item["content"]
+                if text.startswith(_PREP_PREFIXES):
+                    continue
+                lowered = text.lower()
+                if any(word in lowered for word in words):
+                    return text
+        return self._running_item()
+
     def _running_item(self) -> str | None:
         for item in self._main:
             if item["status"] == "in_progress":
@@ -509,8 +618,25 @@ class V3Translator:
         delta = payload.get("delta")
         if not isinstance(delta, dict):
             return []
+        if delta.get("type") == "reasoning-delta":
+            # 思考内容单独下发，**不进 parts** —— 前端只展示，不落库。
+            # 主控与子智能体都发（2026-10-17 用户口径：先加上看效果）；
+            # 中间件内部调用在 feed 入口已经丢掉。
+            text = delta.get("reasoning")
+            if not isinstance(text, str) or not text:
+                return []
+            agent = self._reasoning_agent(namespace)
+            if not agent:
+                return []
+            return [
+                {
+                    "type": "reasoning",
+                    "content": text,
+                    "agent": agent,
+                }
+            ]
         if delta.get("type") == "text-delta":
-            # 推理走的是 reasoning-delta，天然进不来；子智能体的旁白是内部编排
+            # 子智能体的旁白仍是内部编排
             if namespace:
                 return []
             text = delta.get("text")
@@ -532,6 +658,19 @@ class V3Translator:
         # 分片里的 args 是**累加值**（bridge 已把 tool_call_chunks 按 index 拼好），
         # 不是增量 —— 整串拿来当当前值。当成增量去 += 会把前几项重复捞出来一遍。
         return self._apply(namespace, todo_items(args))
+
+    def _reasoning_agent(self, namespace: tuple[str, ...]) -> str | None:
+        """思考内容归谁：主控 ``main``，一级子智能体用角色名（取不到就 ``subagent``）。
+
+        两级以上嵌套没有对应的展示位置，返回 ``None`` 让调用方丢掉 —— 与正文/待办
+        对嵌套子智能体的口径一致。
+        """
+        if not namespace:
+            return "main"
+        call_id = delegation_id(namespace)
+        if not call_id:
+            return None
+        return self._names.get(call_id) or "subagent"
 
     def _on_block_finish(self, namespace: tuple[str, ...], payload: dict) -> list[dict]:
         if (namespace, payload.get("index")) not in self._todo_blocks:

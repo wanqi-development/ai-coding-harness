@@ -18,3 +18,5 @@ logs/
 # Claude Code 的**本机**设置（权限允许清单里是这台机器的绝对路径），工程级的
 # `.claude/launch.json` 照旧进库
 .claude/settings.local.json
+# 意图评测的真实样本可能包含用户消息 / 代码片段，默认不进库；示例文件照旧提交
+docs/intent-eval.jsonl

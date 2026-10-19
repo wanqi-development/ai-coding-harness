@@ -143,6 +143,98 @@ class SyncResult:
     branches: list[BranchInfo] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class FileChange:
+    """一处改动：路径 + 增删行数 + 状态码（``A`` / ``M`` / ``D`` / ``R``…）。"""
+
+    path: str
+    added: int
+    deleted: int
+    status: str
+
+
+# --------------------------------------------------------------------------- 比对（PR 的 diff）
+
+
+def _merge_changes(counts: str, codes: str) -> list[FileChange]:
+    """把 ``--numstat``（增删行数）与 ``--name-status``（状态码）按路径并起来。
+
+    二进制文件的增删是 ``-``（git 不数行）：记 0（界面上按「二进制」显示，不假装是 0 行改动）。
+    改名的行是 ``R100\told\tnew``：状态码取新路径那份。
+    """
+    status: dict[str, str] = {}
+    for line in codes.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            status[parts[-1]] = parts[0]
+    out: list[FileChange] = []
+    for line in counts.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        added, deleted, path = parts
+        out.append(
+            FileChange(
+                path=path,
+                added=int(added) if added.isdigit() else 0,
+                deleted=int(deleted) if deleted.isdigit() else 0,
+                status=status.get(path, "M"),
+            )
+        )
+    return out
+
+
+async def compare(settings: Settings, spec: RepoSpec, *, base: str, head: str) -> list[FileChange]:
+    """``base...head`` 之间改了哪些文件 —— **PR 的 diff 就是这个**。
+
+    三点（``...``）而不是两点：PR 讲的是「相对共同祖先改了什么」，两点式会把 base 分支上
+    别人新提交的内容也算进来。
+
+    **只在本地缓存里算，不联网、也不看沙箱**（2026-10-14 用户口径）：裸仓里有对象就够，
+    调用方负责先 ``sync()`` 把远端的新提交 fetch 下来。缓存里没有这个仓库时抛
+    ``RepoViewError``（调用方决定是提示还是先 clone）。
+    """
+    directory = await _require_cloned(settings, spec)
+    base_ref = await _resolve_ref(settings, spec, base)
+    head_ref = await _resolve_ref(settings, spec, head)
+    git = require_git(settings)
+    timeout = settings.repo_view_timeout_seconds
+    counts = await _text(
+        [git, "diff", "--numstat", f"{base_ref}...{head_ref}"],
+        cwd=directory,
+        timeout=timeout,
+        spec=spec,
+    )
+    codes = await _text(
+        [git, "diff", "--name-status", f"{base_ref}...{head_ref}"],
+        cwd=directory,
+        timeout=timeout,
+        spec=spec,
+    )
+    return _merge_changes(counts, codes)
+
+
+async def file_diff(
+    settings: Settings, spec: RepoSpec, *, base: str, head: str, path: str
+) -> str:
+    """一个文件的 diff 正文（``base...head``，只看这一个路径）。
+
+    路径先过 ``clean_path``（与读文件同一个守卫，``../`` 之类在这里就被挡掉）；正文大小由
+    调用方截断 —— 这里只负责取。
+    """
+    safe = clean_path(path)
+    directory = await _require_cloned(settings, spec)
+    base_ref = await _resolve_ref(settings, spec, base)
+    head_ref = await _resolve_ref(settings, spec, head)
+    git = require_git(settings)
+    return await _text(
+        [git, "diff", f"{base_ref}...{head_ref}", "--", safe],
+        cwd=directory,
+        timeout=settings.repo_view_timeout_seconds,
+        spec=spec,
+    )
+
+
 # --------------------------------------------------------------------------- git
 
 
@@ -422,7 +514,15 @@ async def sync(settings: Settings, spec: RepoSpec) -> SyncResult:
 
 
 async def default_branch(settings: Settings, spec: RepoSpec) -> str:
-    """仓库的默认分支 —— 裸仓的 ``HEAD`` 就指着它（clone 时 git 记下的远程默认分支）。"""
+    """代码面板默认打开哪个分支。
+
+    优先级：**设置页配的那个**（按平台分：Gitee / GitHub）→ 裸仓 ``HEAD`` 探测到的远程默认分支
+    → ``master``。2026-10-14 起可配（用户口径：代码缓存配置里的「默认分支」）—— 配置留空就回到
+    探测。**配错会打开一个不存在的分支**，所以界面上那一格写明了「留空＝按远程默认」。
+    """
+    configured = settings.default_branch_for(spec.platform).strip()
+    if configured:
+        return configured
     directory = repo_dir(settings, spec.owner, spec.repo)
     name = await _text(
         [require_git(settings), "symbolic-ref", "--short", "HEAD"],

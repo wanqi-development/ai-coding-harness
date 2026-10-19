@@ -30,6 +30,7 @@ from ai_coding_harness.agent.middleware import (
     FALLBACK_LOG_TAG,
     FallbackMiddleware,
     HistoryRepairMiddleware,
+    StreamUsageMiddleware,
 )
 from ai_coding_harness.agent.middleware import fallback as fallback_module
 from ai_coding_harness.agent.middleware.fallback import (
@@ -39,7 +40,7 @@ from ai_coding_harness.agent.middleware.fallback import (
 )
 from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM
 from ai_coding_harness.agent.subagents import build_subagents
-from ai_coding_harness.config import Settings
+from ai_coding_harness.config import ModelConfig, Settings
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.safety.policy import policy_for
 from ai_coding_harness.session.manager import SessionManager
@@ -463,64 +464,83 @@ class TestCircuitBreaker:
 
 
 def _settings(**over: Any) -> Settings:
-    """四家都给上假配置（显式给全，不受本机 .env 影响）。"""
+    """把「模型配置」那几行显式造出来（2026-10-15 起没有 .env 出厂默认，只能给行）。
+
+    兜底那一行故意配成 **kimi**（主控 review/reviewer 也在 kimi 上，用来验「与主模型同一套
+    就跳过」那条），模型名 / 温度 / 窗口都是可辨认的假值。
+    """
     base: dict[str, Any] = {
-        "deepseek_model_name": "deepseek-v4-pro",
-        "deepseek_api_key": "k-deepseek",
-        "deepseek_base_url": "https://ds.example/v1",
-        "deepseek_context_window": 1_048_576,
-        "kimi_model_name": "kimi-k2.6",
-        "kimi_api_key": "k-kimi",
-        "kimi_base_url": "https://kimi.example/v1",
-        "kimi_context_window": 262_144,
-        "glm_model_name": "glm-5.3-flash",
-        "glm_api_key": "k-glm",
-        "glm_base_url": "https://glm.example/v1",
-        "glm_context_window": 128_000,
-        "gpt_model_name": "gpt-5.6-luna",
-        "gpt_api_key": "k-gpt",
-        "gpt_base_url": "https://gpt.example/v1",
-        "gpt_context_window": 128_000,
+        "agent_models": {
+            "qa": ModelConfig(
+                model="gpt-5.6-luna", api_key="k-gpt", base_url="https://gpt.example/v1"
+            ),
+            "plan": ModelConfig(
+                model="glm-5.3-flash", api_key="k-glm", base_url="https://glm.example/v1"
+            ),
+            "review": ModelConfig(
+                model="kimi-k2.6",
+                api_key="k-kimi",
+                base_url="https://kimi.example/v1",
+                temperature=1,
+            ),
+            "coding": ModelConfig(
+                model="glm-5.3-flash", api_key="k-glm", base_url="https://glm.example/v1"
+            ),
+            "coder": ModelConfig(
+                model="deepseek-v4-pro",
+                api_key="k-deepseek",
+                base_url="https://ds.example/v1",
+                context_window=1_048_576,
+            ),
+            "fallback": ModelConfig(
+                model="deepseek-v4-pro",
+                api_key="k-deepseek",
+                base_url="https://ds.example/v1",
+                context_window=1_048_576,
+            ),
+        }
     }
     base.update(over)
     return Settings(**base)
 
 
 class TestBuildFallback:
-    def test_takes_the_provider_own_config(self):
-        """温度/窗口都得取**目标那家**的：kimi 收 0.3 直接 400，不能沿用主导的。"""
+    def test_takes_the_fallback_rows_own_config(self):
+        """温度 / 窗口取**兜底那一行**的：不能沿用主导模型的（kimi 收了 0.3 会 400）。"""
         model = build_fallback(_settings(), role="reviewer")  # reviewer 主导是 kimi
 
         assert model is not None
         assert model.model_name == "deepseek-v4-pro"
-        assert model.temperature == 0.3  # deepseek 的口径，不是 kimi 的 1
+        assert model.temperature == 0.3  # 兜底那一行的口径，不是主导 kimi 的 1
         assert model.profile == {"max_input_tokens": 1_048_576}
 
     def test_no_fallback_when_the_role_already_runs_on_it(self):
         assert build_fallback(_settings(), role="coder") is None
 
-    def test_empty_provider_turns_the_feature_off(self):
-        assert build_fallback(_settings(fallback_provider=""), role="reviewer") is None
+    def test_without_the_fallback_row_the_feature_is_off(self):
+        rows = {
+            key: value
+            for key, value in _settings().agent_models.items()
+            if key != "fallback"
+        }
 
-    def test_unknown_provider_fails_loudly(self):
-        """静默的后果是「以为有兜底，其实一直没挂」，比当场失败难查。"""
-        with pytest.raises(ValueError, match="FALLBACK_PROVIDER 不认识这家"):
-            build_fallback(_settings(fallback_provider="anthropic"), role="reviewer")
+        assert build_fallback(_settings(agent_models=rows), role="reviewer") is None
 
     def test_unregistered_role_fails_loudly(self):
         with pytest.raises(ValueError, match="未登记的角色"):
             build_fallback(_settings(), role="nobody")
 
-    def test_half_configured_provider_degrades_instead_of_breaking(
+    def test_half_configured_row_degrades_instead_of_breaking(
         self, caplog: pytest.LogCaptureFixture
     ):
         """兜底是降级功能：配坏了就告警 + 没兜底，不该把整场会话的构建拖死。"""
-        settings = _settings(fallback_provider="kimi", kimi_model_name="")
+        rows = dict(_settings().agent_models)
+        rows["fallback"] = ModelConfig(model="deepseek-v4-pro", api_key="", base_url="")
 
         with caplog.at_level(logging.WARNING):
-            assert build_fallback(settings, role="coder") is None
+            assert build_fallback(_settings(agent_models=rows), role="review") is None
 
-        assert [r for r in caplog.records if "kimi" in r.getMessage()]
+        assert [r for r in caplog.records if "兜底模型" in r.getMessage()]
 
 
 # -- 装配 --------------------------------------------------------------------
@@ -548,9 +568,10 @@ class TestWiring:
         )
 
         middleware = captured["middleware"]
-        # 最内侧：降级重试不再重跑边界与脱敏那几层
-        assert middleware[-1] is sentinel
-        assert isinstance(middleware[-2], HistoryRepairMiddleware)
+        # 兜底是倒数第二层：降级重试不重跑边界与脱敏；最内侧是流式用量开关 ——
+        # 网关不认 stream_options 的 400 要在兜底里面就地重试，不能被记成主导故障。
+        assert middleware[-2] is sentinel
+        assert isinstance(middleware[-1], StreamUsageMiddleware)
 
     def test_build_agent_without_a_fallback_changes_nothing(self, monkeypatch: Any):
         captured: dict[str, Any] = {}
@@ -568,7 +589,8 @@ class TestWiring:
             policy=policy_for(ORCHESTRATE_FORM),
         )
 
-        assert isinstance(captured["middleware"][-1], HistoryRepairMiddleware)
+        assert isinstance(captured["middleware"][-2], HistoryRepairMiddleware)
+        assert isinstance(captured["middleware"][-1], StreamUsageMiddleware)
 
     def test_subagents_take_a_fallback_each(self):
         sentinel = FallbackMiddleware(
@@ -582,7 +604,10 @@ class TestWiring:
         )
 
         by_name = {spec["name"]: spec for spec in specs}
-        assert by_name["planner"]["middleware"][-1] is sentinel
+        assert by_name["planner"]["middleware"][-2] is sentinel
+        assert isinstance(
+            by_name["planner"]["middleware"][-1], StreamUsageMiddleware
+        )
         # 缺键＝该角色没有兜底（合法状态），不是漏挂
         assert not any(
             isinstance(m, FallbackMiddleware) for m in by_name["coder"]["middleware"]

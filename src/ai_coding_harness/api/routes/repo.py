@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel
 
 from ai_coding_harness.api.schemas import (
     RepoBranch,
@@ -22,12 +23,14 @@ from ai_coding_harness.api.schemas import (
     RepoTreeEntry,
 )
 from ai_coding_harness.api.session_lookup import resolve_session
+from ai_coding_harness.redact import redact, secret_terms
 from ai_coding_harness.repo_cache import (
     GitMissingError,
     RepoSpec,
     RepoViewError,
     default_branch,
     fetched_at,
+    file_diff,
     find_git,
     is_cloned,
     list_branches,
@@ -37,6 +40,10 @@ from ai_coding_harness.repo_cache import (
 )
 
 router = APIRouter(prefix="/sessions", tags=["repo"])
+
+#: 单个文件的 diff 正文最多回这么多字符（超出截断并说明）—— 一个 lockfile 的 diff 能有几兆，
+#: 前端渲染不了、也没人看。截断是显式的，不静默丢。
+_DIFF_MAX_CHARS = 200_000
 
 
 def _settings(request: Request):
@@ -146,3 +153,54 @@ async def get_repo_file(
     except RepoViewError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RepoFile(**vars(content))
+
+
+class RepoDiff(BaseModel):
+    """一个文件在某次改动里的 diff 正文（``base...head``）。"""
+
+    path: str
+    base: str
+    head: str
+    #: 已脱敏的 diff 正文（超过 ``_DIFF_MAX_CHARS`` 时截断）
+    text: str = ""
+    #: 截断了没有（截断了前端要明说，不能让人以为改动就这么点）
+    truncated: bool = False
+
+
+@router.get("/{session_id}/repo/diff", response_model=RepoDiff)
+async def get_repo_diff(
+    session_id: str,
+    request: Request,
+    base: str = Query(..., description="改动前那一支（PR 的 base）"),
+    head: str = Query(..., description="改动后那一支（PR 的 head）"),
+    path: str = Query(..., description="仓库内相对路径"),
+) -> RepoDiff:
+    """聊天里那条「改动的文件」点开某个文件时看的东西。
+
+    与代码面板同一条路：**只碰宿主机上的裸仓缓存，不碰沙箱**（沙箱被回收之后照样能看，
+    这正是把 diff 放本地算的理由）。正文先脱敏再回（令牌/口令不该出现在聊天里），
+    超过上限显式截断并把 ``truncated`` 传出去。
+    """
+    settings = _settings(request)
+    spec = await _spec(request, session_id)
+    try:
+        raw = await file_diff(settings, spec, base=base, head=head, path=path)
+    except GitMissingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RepoViewError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # 词表与日志/记录那条口径一致：会话令牌 + 该平台的兜底令牌 + 模型凭据
+    terms = secret_terms(
+        spec.token,
+        settings.token_for(spec.platform),
+        *settings.model_secret_values(),
+    )
+    text = redact(raw, terms)
+    truncated = len(text) > _DIFF_MAX_CHARS
+    return RepoDiff(
+        path=path,
+        base=base,
+        head=head,
+        text=text[:_DIFF_MAX_CHARS],
+        truncated=truncated,
+    )

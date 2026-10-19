@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 from ai_coding_harness.api.schemas import (
+    ClarificationInfo,
     CreateSessionRequest,
     LogLineItem,
     LogPage,
@@ -19,14 +21,18 @@ from ai_coding_harness.api.schemas import (
     PullItem,
     PullList,
     RecordItem,
+    RecordPage,
     SessionDetail,
     SessionListItem,
     SessionResponse,
+    UsageActor,
+    UsageSnapshot,
 )
 from ai_coding_harness.api.session_lookup import resolve_session
 from ai_coding_harness.backends.composite import memory_path, read_memory
 from ai_coding_harness.db import dao
 from ai_coding_harness.observability.log_tail import read_session_logs
+from ai_coding_harness.observability.run_log import account_key
 from ai_coding_harness.redact import redact, secret_terms
 from ai_coding_harness.server.service import WORKSPACE_ERROR_MESSAGE, plan_payload
 from ai_coding_harness.session.manager import WORKSPACE_READY, Session, WorkspaceError
@@ -136,11 +142,14 @@ async def ensure_workspace(session_id: str, request: Request) -> SessionResponse
     return SessionResponse(session_id=session_id, workspace_status=WORKSPACE_READY)
 
 
-@router.get("/{session_id}/records", response_model=list[RecordItem])
+@router.get("/{session_id}/records", response_model=RecordPage)
 async def get_records(
-    session_id: str, request: Request, limit: int = 200
-) -> list[RecordItem]:
-    """会话时间线（记录 + 详情），供前端展示。"""
+    session_id: str,
+    request: Request,
+    limit: int = 20,
+    before_id: int | None = None,
+) -> RecordPage:
+    """会话时间线的一页（默认最近 20 条），``before_id`` 向前翻。"""
     db = request.app.state.database
     try:
         public_id = uuid.UUID(session_id)
@@ -150,18 +159,50 @@ async def get_records(
         sess = await dao.get_session_by_public_id(s, public_id)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
-        rows = await dao.list_records_with_detail(s, session_id=sess.id, limit=limit)
-    return [
-        RecordItem(
-            id=rec.id,
-            type=rec.type,
-            summary=rec.summary,
-            content=(det.content if det else None),
-            extra=(det.extra if det else None),
-            created_at=rec.created_at,
+        rows, has_more, next_before_id = await dao.list_records_page(
+            s,
+            session_id=sess.id,
+            before_id=before_id,
+            limit=max(1, min(limit, 100)),
         )
-        for rec, det in rows
-    ]
+    return RecordPage(
+        items=[
+            RecordItem(
+                id=rec.id,
+                type=rec.type,
+                summary=rec.summary,
+                content=(det.content if det else None),
+                extra=(det.extra if det else None),
+                usage=_usage_detail(det),
+                created_at=rec.created_at,
+            )
+            for rec, det in rows
+        ],
+        has_more=has_more,
+        next_before_id=next_before_id,
+    )
+
+
+def _usage_detail(detail: Any) -> dict[str, Any] | None:
+    """从记录详情里取出那一轮的 token 账；没有 / 形状不对就返回 ``None``。
+
+    单独提出来是因为它是**唯一**一个前端要按字段读的 ``extra`` 子结构（其余 extra 都是
+    各记录类型自己的私事）。形状不对**不报错**：老记录、脏数据都只该让角标不显示。
+
+    主角名顺手归一次（与聚合那条路同一个 ``account_key``）：本功能刚上线的那几轮把主控
+    记在了真名下，不归的话消息角标展开后是个英文名，与面板里那行「主控」对不上。
+    """
+    extra = getattr(detail, "extra", None) if detail is not None else None
+    usage = extra.get("usage") if isinstance(extra, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    by_actor = usage.get("by_actor")
+    if not isinstance(by_actor, dict):
+        return usage
+    return {
+        **usage,
+        "by_actor": {account_key(str(key)): item for key, item in by_actor.items()},
+    }
 
 
 @router.get("/{session_id}/plan", response_model=PlanInfo | None)
@@ -183,12 +224,151 @@ async def get_plan(session_id: str, request: Request) -> PlanInfo | None:
     return None if plan is None else PlanInfo(**plan_payload(plan))
 
 
+@router.get("/{session_id}/clarification", response_model=ClarificationInfo | None)
+async def get_pending_clarification(
+    session_id: str, request: Request
+) -> ClarificationInfo | None:
+    """当前待回答的意图澄清；刷新页面后前端据此恢复弹窗。"""
+    session = await resolve_session(request, session_id)
+    data = await request.app.state.runs.pending_clarification(session)
+    return None if data is None else ClarificationInfo(**data)
+
+
 def _pull_number(text: str) -> int:
     """编号转数字用于排序；转不出来的当 0（平台理论上只给数字，这里不冒抛异常的险）。"""
     try:
         return int(text)
     except ValueError:
         return 0
+
+
+def _usage_int(value: Any) -> int:
+    """从库里那份 usage 里取一个计数：认不出的当 0。
+
+    只读展示路径，**不冒抛异常的险** —— 一条脏记录不该把整个面板打挂。
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _aggregate_usage(rows: Iterable[Any]) -> UsageSnapshot:
+    """把各轮记录里的 ``extra["usage"]`` 汇总成一份会话级快照。
+
+    ``rows`` 是 ``dao.list_records_with_detail`` 的 ``(记录, 详情)`` 二元组序列。
+    形状不对的（老数据、别的记录类型、``extra`` 不是 dict）一律跳过，
+    但**计入 rounds**：界面要据此说「有 N 轮没有用量数据」。
+
+    ``context`` 取**压力最大**的那一份：峰值输入取最大、窗口取最小、压缩次数取最大
+    —— 用户问的是「这个会话现在有多满」，报最松的那一轮等于粉饰。
+
+    主角名走 ``observability.run_log.account_key``：写账与读账共用一个归类规则，
+    本功能刚上线的那几轮把主控记在真名下，这里顺手归一次（否则界面上会冒出个英文名）。
+    """
+    per_actor: dict[str, list[int]] = {}
+    totals = [0, 0, 0]
+    missing = 0
+    rounds = 0
+    with_usage = 0
+    interrupted = 0
+    context: dict[str, Any] | None = None
+
+    for _row, detail in rows:
+        extra = getattr(detail, "extra", None) if detail is not None else None
+        if getattr(_row, "type", "") != "assistant":
+            continue
+        rounds += 1
+        usage = extra.get("usage") if isinstance(extra, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        with_usage += 1
+        if usage.get("interrupted"):
+            interrupted += 1
+        missing += _usage_int(usage.get("missing"))
+        round_total = usage.get("totals") if isinstance(usage.get("totals"), dict) else {}
+        totals[0] += _usage_int(round_total.get("input"))
+        totals[1] += _usage_int(round_total.get("output"))
+        context = _tighter_context(context, usage.get("context"))
+        by_actor = usage.get("by_actor")
+        if not isinstance(by_actor, dict):
+            continue
+        for key, item in by_actor.items():
+            if not isinstance(item, dict):
+                continue
+            lines = per_actor.setdefault(account_key(str(key)), [0, 0, 0])
+            lines[0] += _usage_int(item.get("input"))
+            lines[1] += _usage_int(item.get("output"))
+            lines[2] += _usage_int(item.get("calls"))
+            totals[2] += _usage_int(item.get("calls"))
+
+    actors = [
+        UsageActor(
+            key=key,
+            input=lines[0],
+            output=lines[1],
+            calls=lines[2],
+            total=lines[0] + lines[1],
+        )
+        for key, lines in per_actor.items()
+        # 花得多的排前面：面板第一眼要看到「钱花在哪」，与 PR 面板「未合并排最前」同一考虑
+    ]
+    actors.sort(key=lambda item: (-item.total, item.key))
+    return UsageSnapshot(
+        totals=UsageActor(
+            key="total",
+            input=totals[0],
+            output=totals[1],
+            calls=totals[2],
+            total=totals[0] + totals[1],
+        ),
+        actors=actors,
+        rounds=rounds,
+        rounds_with_usage=with_usage,
+        rounds_interrupted=interrupted,
+        missing=missing,
+        context=context,
+    )
+
+
+def _tighter_context(current: dict[str, Any] | None, raw: Any) -> dict[str, Any] | None:
+    """在已有压力最大的那一份与新的这一份之间取**更紧**的；两份都没有就返回原值。
+
+    「更紧」＝ 峰值输入更大、窗口更小、压缩次数更多，四个字段各取各的极值 —— 它们不
+    必然来自同一轮（换过形态就换过窗口），但界面要的是「最坏情况」。
+    """
+    if not isinstance(raw, dict):
+        return current
+    fresh = {
+        "max_input": _usage_int(raw.get("max_input")),
+        "window": _usage_int(raw.get("window")),
+        "ratio": 0.0,
+        "compressed": _usage_int(raw.get("compressed")),
+        "compressed_now": bool(raw.get("compressed_now")),
+    }
+    if current is None:
+        picked = fresh
+    else:
+        picked = {
+            "max_input": max(_usage_int(current.get("max_input")), fresh["max_input"]),
+            "window": _smaller_window(_usage_int(current.get("window")), fresh["window"]),
+            "compressed": max(_usage_int(current.get("compressed")), fresh["compressed"]),
+            "compressed_now": bool(current.get("compressed_now"))
+            or fresh["compressed_now"],
+        }
+    picked["ratio"] = (
+        round(picked["max_input"] / picked["window"], 3) if picked["window"] > 0 else 0.0
+    )
+    return picked
+
+
+def _smaller_window(old: int, new: int) -> int:
+    """两个窗口取更紧的那个；0 表示「未知」，不当成最小。"""
+    if old <= 0:
+        return new
+    if new <= 0:
+        return old
+    return min(old, new)
 
 
 def _log_paths(request: Request) -> list[Path]:
@@ -205,7 +385,12 @@ def _redaction_terms(session: Session, request: Request) -> tuple[str, ...]:
     来，是因为我们手上有这个会话）。
     """
     settings = request.app.state.settings
-    return secret_terms(session.repo.token, settings.token_for(session.repo.platform))
+    return secret_terms(
+        session.repo.token,
+        settings.token_for(session.repo.platform),
+        # 模型凭据同样要脱敏（2026-10-13）：日志接口读的就是日志，词表少一格就漏一格
+        *settings.model_secret_values(),
+    )
 
 
 @router.get("/{session_id}/logs", response_model=LogPage)
@@ -300,6 +485,31 @@ async def get_pulls(session_id: str, request: Request) -> PullList:
     return PullList(
         open_count=sum(1 for item in items if item.state == PULL_OPEN), pulls=items
     )
+
+
+@router.get("/{session_id}/usage", response_model=UsageSnapshot)
+async def get_usage(session_id: str, request: Request) -> UsageSnapshot:
+    """本会话的 token 消耗（右栏「Token」标签）。
+
+    **聚合视图，不改任何数据**：数据源是各轮 assistant 记录里的 ``extra["usage"]``
+    （由 ``server/service.py`` 在轮末写入，按执行主角分类）。
+
+    两条口径都必须如实外传，界面才不会说谎：
+    - 本功能上线前的记录**没有**那份数据 —— 回 ``rounds_with_usage`` 让界面说
+      「其中 N 轮没有用量数据」，而不是把缺的轮次当 0 消耗；
+    - ``missing`` 是「平台没回用量的调用次数」。
+    """
+    db = request.app.state.database
+    try:
+        public_id = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid session_id") from None
+    async with db.session() as s:
+        sess = await dao.get_session_by_public_id(s, public_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        rows = await dao.list_records_with_detail(s, session_id=sess.id)
+    return _aggregate_usage(rows)
 
 
 @router.get("/{session_id}/memory", response_model=MemorySnapshot)

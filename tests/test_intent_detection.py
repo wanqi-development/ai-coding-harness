@@ -1,20 +1,22 @@
-"""意图判定的行为守卫：口令直通 → JEV → LLM → 回落关键字，四关各管一段。
+"""意图判定的行为守卫：口令直通 → （JEV **或** 大模型，二选一）→ 回落关键字。
 
 不联网：分类模型用假实现（回预设文本、可抛错、可拖时间）。
 
-为什么这四关的边界必须钉住：
+为什么这些边界必须钉住：
 - ``sync`` 会走**直接执行**路径（不经智能体、直接在沙箱跑命令），
   只能由关键字产出 —— 模型猜出一个直接执行，后果不是「这轮少条指令」。
-- JEV 是**外部服务**（SystemOne）：它挂了必须干净地退到大模型那一关，而不是打断本轮；
-  它回了认不出的标签同样不算数（见 ``TestTheFourGateWaterfall``）。
+- JEV 是**外部服务**（SystemOne）：**严格二选一**（2026-10-15 用户口径）——
+  选了 JEV 就只有 JEV，它挂了 / 没配齐 / 回了认不出的标签都落关键字口径，**不借大模型**；
+  选了「大模型」就整个不碰 JEV。
 - 分类失败绝不能变成新的故障点：任何异常都要退回升级前的关键字口径。
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,15 +33,46 @@ from ai_coding_harness.server import service as service_mod
 from ai_coding_harness.server.intent import (
     DEFAULT_INTENT,
     DIRECT_INTENTS,
+    PREVIOUS_REPLY_CHARS,
+    PREVIOUS_REPLY_SLACK,
+    SOURCE_CLARIFY,
     SOURCE_FALLBACK,
     SOURCE_JEV,
     SOURCE_LLM,
     TASK_TYPES,
+    IntentDecision,
+    ParsedReply,
+    _system_prompt,
+    _user_prompt,
+    active_task_override,
+    clarification_decision,
     classify,
     detect_intent,
     match_strong,
     parse_reply,
+    should_clarify,
+    tail_excerpt,
 )
+
+#: 测试里的 ``detect_intent``：**未显式给 mode 时按桩件推断** —— 传了 ``jev`` 就当在验 JEV
+#: 那一侧，否则当在验大模型那一侧。
+#:
+#: 为什么需要这一层：严格二选一（2026-10-15）之后 ``mode`` 默认是 ``jev``，而本文件里绝大多数
+#: 用例验的是**大模型**那一关（假分类器）—— 不显式选它就会直接落关键字口径，用例全红。
+#: 显式传了 ``mode=`` / ``force_llm=True`` 的一律照传，不受影响。
+_real_detect_intent = detect_intent
+
+
+async def detect_intent(
+    message: str,
+    *,
+    mode: str | None = None,
+    jev: Any = None,
+    **kw: Any,
+) -> Any:
+    return await _real_detect_intent(
+        message, mode=mode or ("jev" if jev is not None else "llm"), jev=jev, **kw
+    )
 
 
 class _FakeClassifier(BaseChatModel):
@@ -173,7 +206,9 @@ class TestReworkNeedsTheModelForNaturalPhrasing:
 
     def test_the_new_intent_is_a_task_type_and_parsable(self):
         assert "rework" in TASK_TYPES
-        assert parse_reply("rework\n按评审意见改") == ("rework", "按评审意见改")
+        assert parse_reply("rework\n按评审意见改") == ParsedReply(
+            "rework", "按评审意见改"
+        )
 
 
 class TestRefreshingMemoryIsAnAnalysisRound:
@@ -343,9 +378,10 @@ class TestIntentSpecsDrawTheQaBoundary:
 
     async def test_qa_covers_looking_things_up_in_the_repo(self):
         prompt = await self._prompt()
-        assert "查看仓库相关信息" in prompt
-        for item in ("文件", "PR", "提交", "仓库记忆"):
+        assert "对**已有数据**做问答" in prompt
+        for item in ("已具备哪些功能", "有哪些 PR", "文件", "提交", "记忆"):
             assert item in prompt, item
+        assert "计划、方案、任务完成度一律归 plan" in prompt
 
     async def test_qa_still_answers_plain_questions(self):
         prompt = await self._prompt()
@@ -385,6 +421,26 @@ class TestPlanVsCodingBoundaryIsSpelledOut:
         prompt = await self._prompt()
         for item in ("出一个…方案", "帮我规划一下", "先说怎么做", "列个步骤", "先不要动手改代码"):
             assert item in prompt, item
+
+    async def test_plan_covers_the_whole_crud_set(self):
+        """方案的**增删改查都归 plan 这一档**（2026-10-12 用户口径）。
+
+        只有 plan 形态的主控手里有 getPlan / updatePlan / updatePlanSteps / deletePlan；
+        coding 形态对方案只读 —— 让它去改方案，只能让 planner 另存一份（实测就是这么造出
+        plan 42 / 43 两份"修复版"的）。所以判据里必须把四件事都写上，而不是只说「要方案」。
+        """
+        prompt = await self._prompt()
+
+        for item in ("出方案", "查方案", "改方案", "删方案"):
+            assert item in prompt, item
+        assert "方案这个对象本身的增删改查" in prompt
+
+    async def test_the_crud_boundary_names_what_is_not_plan(self):
+        prompt = await self._prompt()
+
+        assert "查仓库里的文件 / PR / 提交归 qa" in prompt
+        assert "按方案去改代码、提 PR 归 coding" in prompt
+        assert "只管方案文本本身" in prompt
 
     async def test_coding_variants_are_listed(self):
         prompt = await self._prompt()
@@ -457,6 +513,10 @@ class TestKeywordFallbackIsUnchanged:
             ("讲讲设计模式", "coding"),
         ):
             assert classify(message) == expected, message
+
+    def test_a_meta_question_is_not_analysis_by_the_bare_why(self):
+        """「为什么不派 coder」是追问上一轮动作，不是新的排查任务。"""
+        assert classify("你为什么不派coder执行") != "analysis"
 
 
 class TestInspectIsGoneEntirely:
@@ -564,14 +624,42 @@ class TestForceLlmRejudges:
 
 class TestParseReply:
     def test_first_word_wins(self):
-        assert parse_reply("plan\n用户还没动手") == ("plan", "用户还没动手")
+        assert parse_reply("plan\n用户还没动手") == ParsedReply(
+            "plan", "用户还没动手"
+        )
 
     def test_decorations_are_stripped(self):
         for text in ("`coding`", "PLAN。", "coding：\n理由"):
             assert parse_reply(text) is not None, text
 
     def test_only_the_first_reason_line_is_kept(self):
-        assert parse_reply("qa\n第一行\n第二行") == ("qa", "第一行")
+        assert parse_reply("qa\n第一行\n第二行") == ParsedReply("qa", "第一行")
+
+    def test_four_lines_carry_confidence_and_candidates(self):
+        got = parse_reply(
+            "plan\n0.42\nplan 0.42, coding 0.31, qa 0.27\n用户还在讨论方案"
+        )
+
+        assert got is not None
+        assert got.intent == "plan"
+        assert got.confidence == 0.42
+        assert got.candidates[:2] == (("plan", 0.42), ("coding", 0.31))
+        assert got.reason == "用户还在讨论方案"
+
+    def test_three_lines_without_candidates_keep_the_reason(self):
+        got = parse_reply("qa\n0.40\n需要先确认范围")
+
+        assert got is not None
+        assert got.confidence == 0.40
+        assert got.candidates == ()
+        assert got.reason == "需要先确认范围"
+
+    def test_a_placeholder_candidate_line_keeps_the_fourth_line_as_reason(self):
+        got = parse_reply("qa\n0.40\n-\n需要先确认范围")
+
+        assert got is not None
+        assert got.candidates == ()
+        assert got.reason == "需要先确认范围"
 
     def test_unknown_word_is_rejected(self):
         for text in ("", "我也说不好", "sync\n猜的", "plan_and_coding"):
@@ -605,7 +693,7 @@ class TestServiceWiring:
         monkeypatch.setattr(service_mod.dao, "recent_user_summaries", fake_recent)
 
         svc = service_mod.HarnessService(
-            settings=Settings(intent_history_turns=2),
+            settings=Settings(intent_mode="llm", intent_history_turns=2),
             manager=None,  # type: ignore[arg-type]
             database=self._FakeDb(),  # type: ignore[arg-type]
         )
@@ -626,7 +714,7 @@ class TestServiceWiring:
         monkeypatch.setattr(service_mod.dao, "recent_user_summaries", explode)
 
         svc = service_mod.HarnessService(
-            settings=Settings(intent_history_turns=0),
+            settings=Settings(intent_mode="llm", intent_history_turns=0),
             manager=None,  # type: ignore[arg-type]
             database=self._FakeDb(),  # type: ignore[arg-type]
         )
@@ -641,19 +729,101 @@ class TestServiceWiring:
         monkeypatch.setattr(service_mod.dao, "recent_user_summaries", boom)
 
         svc = service_mod.HarnessService(
-            settings=Settings(intent_history_turns=2),
+            settings=Settings(intent_mode="llm", intent_history_turns=2),
             manager=None,  # type: ignore[arg-type]
             database=self._FakeDb(),  # type: ignore[arg-type]
         )
 
         assert await svc._intent_history(SimpleNamespace(db_id=7, public_id="p")) == []
 
+    async def test_the_previous_reply_is_read_once_with_the_same_window(self, monkeypatch):
+        """助手上一轮读一次、取尾部；窗口配成 0 时**不碰库**（与用户历史同一个开关）。"""
+        seen: dict[str, Any] = {}
+
+        async def fake_tail(db, *, session_id, chars):
+            seen.update(session_id=session_id, chars=chars)
+            return "…" * 100 + "。" + "要不要我把方案正文修复一遍再给你确认？"
+
+        monkeypatch.setattr(service_mod.dao, "latest_assistant_tail", fake_tail)
+        svc = service_mod.HarnessService(
+            settings=Settings(intent_mode="llm", intent_history_turns=4),
+            manager=None,  # type: ignore[arg-type]
+            database=self._FakeDb(),  # type: ignore[arg-type]
+        )
+
+        reply = await svc._last_reply(SimpleNamespace(db_id=7, public_id="p"))
+
+        assert reply is not None
+        assert reply.endswith("要不要我把方案正文修复一遍再给你确认？")
+        assert seen == {
+            "session_id": 7,
+            "chars": PREVIOUS_REPLY_CHARS + PREVIOUS_REPLY_SLACK,
+        }
+
+    async def test_the_window_zero_skips_the_reply_too(self, monkeypatch):
+        async def explode(*_a, **_kw):
+            raise AssertionError("窗口为 0 时不该读上一轮回复")
+
+        monkeypatch.setattr(service_mod.dao, "latest_assistant_tail", explode)
+        svc = service_mod.HarnessService(
+            settings=Settings(intent_mode="llm", intent_history_turns=0),
+            manager=None,  # type: ignore[arg-type]
+            database=self._FakeDb(),  # type: ignore[arg-type]
+        )
+
+        assert await svc._last_reply(SimpleNamespace(db_id=7, public_id="p")) is None
+
+    async def test_a_failed_reply_read_only_drops_that_context(self, monkeypatch):
+        """库读不到就只当「没有上一轮」—— 判定与这一轮都照跑。"""
+        async def boom(*_a, **_kw):
+            raise RuntimeError("库挂了")
+
+        monkeypatch.setattr(service_mod.dao, "latest_assistant_tail", boom)
+        svc = service_mod.HarnessService(
+            settings=Settings(intent_mode="llm", intent_history_turns=4),
+            manager=None,  # type: ignore[arg-type]
+            database=self._FakeDb(),  # type: ignore[arg-type]
+        )
+
+        assert await svc._last_reply(SimpleNamespace(db_id=7, public_id="p")) is None
+
+    async def test_the_detection_carries_it_into_the_classifier_prompt(self, monkeypatch):
+        model = _FakeClassifier(reply="plan\n他在回答上一轮的反问")
+        monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
+        svc = service_mod.HarnessService(
+            settings=Settings(intent_mode="llm", intent_history_turns=4),
+            manager=None,  # type: ignore[arg-type]
+            database=self._FakeDb(),  # type: ignore[arg-type]
+        )
+
+        await svc._detect_intent("修复吧", [], "要不要我把方案正文修复一遍？")
+
+        assert "要不要我把方案正文修复一遍？" in model.prompts[0]
+
+    async def test_the_rejudge_callback_still_takes_two_arguments(self, monkeypatch):
+        """``handoffTask`` 的回调契约是 ``(message, history)``：把 session 与上一轮绑进去
+        之后（``chat()`` 用 ``functools.partial`` 就是这么塞进 ``TurnState`` 的），
+        仍然按两个参数调用，且重判同样看得到上一轮那句反问。"""
+        model = _FakeClassifier(reply="plan\n他在回答上一轮的反问")
+        monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
+        svc = service_mod.HarnessService(
+            settings=Settings(intent_mode="llm", intent_history_turns=0),
+            manager=None,  # type: ignore[arg-type]
+            database=self._FakeDb(),  # type: ignore[arg-type]
+        )
+        callback = partial(svc._rejudge_intent, session=None, previous_reply="要不要我修？")
+
+        decision = await callback("修复吧", ())
+
+        assert decision.source == SOURCE_LLM
+        assert "要不要我修？" in model.prompts[0]
+
     async def test_disabled_switch_skips_the_model(self, monkeypatch):
         model = _FakeClassifier(reply="coding")
         monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
 
         svc = service_mod.HarnessService(
-            settings=Settings(intent_llm_enabled=False, intent_history_turns=0),
+            settings=Settings(intent_mode="llm", intent_llm_enabled=False, intent_history_turns=0),
             manager=None,  # type: ignore[arg-type]
             database=self._FakeDb(),  # type: ignore[arg-type]
         )
@@ -672,7 +842,7 @@ class TestServiceWiring:
         monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
 
         svc = service_mod.HarnessService(
-            settings=Settings(intent_history_turns=0),
+            settings=Settings(intent_mode="llm", intent_history_turns=0),
             manager=None,  # type: ignore[arg-type]
             database=self._FakeDb(),  # type: ignore[arg-type]
         )
@@ -688,7 +858,7 @@ class TestServiceWiring:
     async def test_rejudge_degrades_to_fallback_when_the_model_is_off(self, monkeypatch):
         """分类模型没启用时重判只能是回落 —— 工具那边据此拒绝交接。"""
         svc = service_mod.HarnessService(
-            settings=Settings(intent_llm_enabled=False, intent_history_turns=0),
+            settings=Settings(intent_mode="llm", intent_llm_enabled=False, intent_history_turns=0),
             manager=None,  # type: ignore[arg-type]
             database=self._FakeDb(),  # type: ignore[arg-type]
         )
@@ -720,15 +890,27 @@ class _FakeJev:
         intent: str | None = "plan",
         confidence: float = 0.9,
         reason: str = "p=0.90",
+        candidates: tuple[tuple[str, float], ...] = (),
         error: Exception | None = None,
     ) -> None:
         self.intent = intent
         self.confidence = confidence
         self.reason = reason
+        self.candidates = candidates
         self.error = error
         self.calls = 0
         self.histories: list[list[str]] = []
         self.hints: list[list[str]] = []
+        #: 最近一次调用拿到的用量累加器（钉「判定那一笔账真的传下来了」）
+        self.usage: dict[str, int] | None = None
+        #: 最近一次调用拿到的「助手上一轮末尾节选」
+        self.previous_reply: str | None = None
+        #: 最近一次调用拿到的「上一轮判定」
+        self.previous_intent: str | None = None
+        #: 最近一次调用拿到的「两轮对话」
+        self.dialogue: list[dict[str, str]] = []
+        #: 最近一次调用拿到的「未完成任务」
+        self.active_intent: str | None = None
 
     async def decide(
         self,
@@ -736,15 +918,238 @@ class _FakeJev:
         *,
         history: Sequence[str] = (),
         hints: Sequence[str] = (),
-    ) -> tuple[str, str, float | None] | None:
+        usage: dict[str, int] | None = None,
+        previous_reply: str | None = None,
+        previous_intent: str | None = None,
+        active_intent: str | None = None,
+        dialogue: Sequence[Mapping[str, str]] = (),
+    ) -> tuple[str, str, float | None, tuple[tuple[str, float], ...]] | None:
         self.calls += 1
+        self.usage = usage
+        self.previous_reply = previous_reply
+        self.previous_intent = previous_intent
+        self.active_intent = active_intent
+        self.dialogue = [dict(turn) for turn in dialogue]
         self.histories.append(list(history))
         self.hints.append(list(hints))
         if self.error is not None:
             raise self.error
         if self.intent is None:
             return None
-        return self.intent, self.reason, self.confidence
+        return self.intent, self.reason, self.confidence, self.candidates
+
+
+class TestClarification:
+    """低置信度只在 JEV/LLM 两条模型路上触发；口令/关键字/active 不进。"""
+
+    def test_only_low_model_confidence_is_clarified(self):
+        assert should_clarify(IntentDecision("qa", SOURCE_JEV, confidence=0.40), 0.55)
+        assert not should_clarify(
+            IntentDecision("qa", SOURCE_JEV, confidence=0.60), 0.55
+        )
+        assert not should_clarify(
+            IntentDecision("qa", SOURCE_LLM, confidence=None), 0.55
+        )
+        assert not should_clarify(
+            IntentDecision("qa", "keyword", confidence=0.40), 0.55
+        )
+        assert not should_clarify(
+            IntentDecision("qa", SOURCE_JEV, confidence=0.40), 0.0
+        )
+
+    def test_low_confidence_becomes_a_qa_clarification_decision(self):
+        got = clarification_decision(
+            IntentDecision(
+                "coding",
+                SOURCE_JEV,
+                confidence=0.40,
+                candidates=(("coding", 0.40), ("plan", 0.31)),
+            ),
+            0.55,
+        )
+
+        assert got is not None
+        assert got.intent == "qa"
+        assert got.source == SOURCE_CLARIFY
+        assert got.needs_clarification is True
+        assert got.candidates == (("coding", 0.40), ("plan", 0.31))
+        assert (
+            clarification_decision(
+                IntentDecision("coding", SOURCE_JEV, confidence=0.90), 0.55
+            )
+            is None
+        )
+
+    async def test_jev_candidates_are_kept_for_the_question(self):
+        jev = _FakeJev(
+            intent="plan",
+            confidence=0.40,
+            candidates=(("plan", 0.40), ("coding", 0.31), ("qa", 0.27)),
+        )
+
+        decision = await detect_intent("这个需求先看一下", jev=jev, mode="jev")
+
+        assert decision.intent == "plan"
+        assert decision.confidence == 0.40
+        assert decision.candidates[:2] == (("plan", 0.40), ("coding", 0.31))
+
+
+class TestThePreviousReplyIsPartOfTheContext:
+    """用户回一句「修复吧」时，指代对象只在**助手上一轮那句反问**里。
+
+    实测（2026-10-12）：助手结尾问「要不要我把方案正文修复一遍再给你确认？」，用户回
+    「修复吧」→ 判定只看这一句，判成 coding（p=0.96），于是走了编码形态去「修方案文本」
+    —— 那个形态没有写方案的工具，白折腾 25 分钟、还多造了一份方案。这一组钉住「助手上一轮
+    的末尾节选进了判定输入」，两条判定路径（JEV / 大模型）都要看到它。
+    """
+
+    def test_a_short_reply_is_returned_as_is(self):
+        assert tail_excerpt("要不要我把方案正文修复一遍？") == "要不要我把方案正文修复一遍？"
+
+    def test_the_excerpt_keeps_the_tail_not_the_head(self):
+        """取尾部：那句反问在末尾（记录的 summary 是前 200 字，正好会把它切掉）。"""
+        text = "开头一堆说明。" + "中" * 400 + "要不要我把方案正文修复一遍再给你确认？"
+
+        got = tail_excerpt(text)
+
+        assert got.endswith("要不要我把方案正文修复一遍再给你确认？")
+        assert len(got) <= PREVIOUS_REPLY_CHARS
+
+    def test_the_excerpt_starts_after_a_sentence_end(self):
+        """不留下半句：开头那段残句切掉（只在开头那一小段余量里找句末标点）。"""
+        text = "甲" * 400 + "。" + "乙" * 350
+
+        got = tail_excerpt(text)
+
+        assert got == "乙" * 350, "从句号之后开始，不留半句"
+
+    def test_a_long_sentence_without_punctuation_is_not_mangled(self):
+        """整段没有标点的长句：切开头只会把要说的话一起切没，那就原样留尾部。"""
+        assert tail_excerpt("无" * 1000) == "无" * PREVIOUS_REPLY_CHARS
+
+    def test_the_prompt_carries_it_before_the_message(self):
+        prompt = _user_prompt(
+            "修复吧",
+            ["我需要查询下最新的方案"],
+            (),
+            "…要不要我把方案正文修复一遍再给你确认？",
+        )
+
+        assert "助手上一轮回复（末尾节选）" in prompt
+        assert "要不要我把方案正文修复一遍再给你确认？" in prompt
+        assert prompt.index("助手上一轮回复") < prompt.index("本轮消息")
+
+    def test_no_previous_reply_no_section(self):
+        assert "助手上一轮" not in _user_prompt("修复吧", [], ())
+
+    def test_the_system_prompt_tells_the_classifier_how_to_read_short_answers(self):
+        assert "回答助手上一轮的那个问题" in _system_prompt()
+
+    async def test_the_jev_gate_gets_the_excerpt(self):
+        jev = _FakeJev(intent="plan")
+
+        await detect_intent(
+            "修复吧", jev=jev, model=_FakeClassifier(reply="plan"), previous_reply="要不要我修？"
+        )
+
+        assert jev.previous_reply == "要不要我修？"
+
+    async def test_the_jev_gate_gets_the_previous_intent(self):
+        """追问「为什么不派 coder」时，上一轮意图比字面里的「为什么」可靠。"""
+        jev = _FakeJev(intent="rework")
+
+        await detect_intent(
+            "你为什么不派 coder 执行", jev=jev, previous_intent="rework"
+        )
+
+        assert jev.previous_intent == "rework"
+
+    async def test_the_jev_gate_gets_two_rounds_of_dialogue(self):
+        """只看用户消息看不出「上一轮 AI 为什么这么说」，两轮对话要一起给判定器。"""
+        jev = _FakeJev(intent="rework")
+        dialogue = [
+            {"role": "user", "content": "修复 PR 的审查问题"},
+            {"role": "assistant", "content": "上一轮 AI 的回复"},
+        ]
+
+        await detect_intent("继续", jev=jev, dialogue=dialogue)
+
+        assert jev.dialogue == dialogue
+
+    async def test_the_jev_gate_gets_the_active_task(self):
+        jev = _FakeJev(intent="coding")
+
+        await detect_intent("继续吧", jev=jev, active_intent="coding")
+
+        assert jev.active_intent == "coding"
+
+    def test_the_user_prompt_carries_the_previous_intent(self):
+        text = _user_prompt(
+            "你为什么不派 coder 执行", [], [], previous_intent="rework"
+        )
+
+        assert "上一轮判定：rework" in text
+        assert "不要仅因为出现「为什么」就判 analysis" in text
+
+    def test_the_user_prompt_renders_two_rounds(self):
+        text = _user_prompt(
+            "继续",
+            [],
+            [],
+            dialogue=[
+                {"role": "user", "content": "用户第一轮"},
+                {"role": "assistant", "content": "助手第一轮"},
+            ],
+        )
+
+        assert "最近两轮对话" in text
+        assert "[用户] 用户第一轮" in text
+        assert "[助手] 助手第一轮" in text
+
+    def test_the_user_prompt_carries_the_active_task(self):
+        text = _user_prompt("继续吧", [], [], active_intent="coding")
+
+        assert "当前未完成任务：coding" in text
+
+
+class TestActiveTaskOverride:
+    """短追问只有在明确继续/短选择时才沿用未完成任务。"""
+
+    def test_continue_inherits_the_active_task(self):
+        assert active_task_override("继续吧", "analysis", "coding") == "coding"
+
+    def test_short_fix_after_plan_means_coding(self):
+        assert active_task_override("修复吧", "analysis", "plan") == "coding"
+
+    def test_short_selection_inherits_the_active_task(self):
+        assert active_task_override("B", "qa", "coding") == "coding"
+
+    def test_a_long_suggestion_is_not_an_implementation_command(self):
+        assert (
+            active_task_override(
+                "短信模板你有什么建议，只需要回答问题即可，不需要做计划",
+                "qa",
+                "plan",
+            )
+            is None
+        )
+
+    def test_a_question_does_not_inherit(self):
+        assert active_task_override("那是不是可以读一部分", "analysis", "coding") is None
+
+    def test_an_execution_intent_is_left_alone(self):
+        assert active_task_override("继续吧", "coding", "coding") is None
+
+    async def test_the_llm_gate_gets_the_excerpt_too(self):
+        jev = _FakeJev(intent=None)
+        model = _FakeClassifier(reply="plan\n先改方案文本")
+
+        # 配置选「大模型」那一档才走得到它（默认的 JEV 三关里，JEV 判不出来就落关键字）
+        await detect_intent(
+            "修复吧", jev=jev, model=model, previous_reply="要不要我修？", mode="llm"
+        )
+
+        assert "要不要我修？" in model.prompts[0]
 
 
 class TestTheFourGateWaterfall:
@@ -779,24 +1184,52 @@ class TestTheFourGateWaterfall:
         assert jev.calls == 1
         assert model.calls == 0, "JEV 判出来了就不该再问大模型"
 
-    async def test_a_dead_jev_falls_through_to_the_model(self):
-        """JEV 是外部服务：它挂了只是「这一关判不出来」，不能打断本轮。"""
+    async def test_the_jev_gate_gets_the_usage_accumulator(self):
+        """调用方给的累加器要**传进 JEV 那一关**：判定花钱，账得有人接住。
+
+        2026-10-12：以前 JEV 把用量记在自己实例上的一个 dict 里，没人读也不 reset ——
+        面板里「意图分类」那一项因此少一笔（见 ``tests/test_token_usage.py`` 的对照用例）。
+        """
+        jev = _FakeJev(intent="analysis")
+        acc: dict[str, int] = {}
+
+        await detect_intent("帮我把这块理一理", jev=jev, usage=acc)
+
+        assert jev.usage is acc, "判定器拿到的必须是调用方那一份累加器"
+
+    async def test_a_dead_jev_lands_on_the_keyword_gate(self):
+        """三关（2026-10-13 用户口径）：JEV 挂了＝这一关判不出来 → **落关键字口径**，
+        不再回退大模型。它仍是「增强不是故障点」：本轮照常跑，只是退到最保守的那一档。"""
         jev = _FakeJev(error=RuntimeError("connection refused"))
         model = _FakeClassifier(reply="plan\n要方案")
 
-        decision = await detect_intent("帮我把这块理一理", jev=jev, model=model)
+        decision = await detect_intent("帮我理一理仓库", jev=jev, model=model)
 
-        assert (decision.intent, decision.source) == ("plan", SOURCE_LLM)
-        assert jev.calls == 1 and model.calls == 1
+        assert decision.source == SOURCE_FALLBACK, "落关键字口径（来源如实标 fallback）"
+        assert jev.calls == 1
+        assert model.calls == 0, "三关：JEV 判不出来不该再问大模型"
 
-    async def test_an_unrecognized_jev_choice_falls_through(self):
-        """JEV 回了清单外的标签（服务端换词）＝判不出来，交给大模型。"""
+    async def test_an_unrecognized_jev_choice_lands_on_the_keyword_gate(self):
+        """JEV 回了清单外的标签（服务端换词）同样是「判不出来」→ 落关键字口径。"""
         jev = _FakeJev(intent=None)
         model = _FakeClassifier(reply="review\n只审不改")
 
-        decision = await detect_intent("帮我瞅瞅", jev=jev, model=model)
+        decision = await detect_intent("帮我瞅瞅这个仓库", jev=jev, model=model)
+
+        assert decision.source == SOURCE_FALLBACK
+        assert model.calls == 0
+
+    async def test_llm_mode_never_asks_jev(self):
+        """配置选「大模型」时，JEV 那一关整个不碰（三关里的第二关换人）。"""
+        jev = _FakeJev(intent="plan")
+        model = _FakeClassifier(reply="review\n只审不改")
+
+        decision = await detect_intent(
+            "帮我瞅瞅这个仓库", jev=jev, model=model, mode="llm"
+        )
 
         assert (decision.intent, decision.source) == ("review", SOURCE_LLM)
+        assert jev.calls == 0
 
     async def test_both_models_failing_lands_on_the_default(self):
         """两个模型都不行 → 回到关键字口径；关键字也不命中就是默认值（coding）。"""
@@ -823,24 +1256,28 @@ class TestTheFourGateWaterfall:
         assert jev.histories == [["上一轮在改商品模块"]]
         assert jev.hints and jev.hints[0], "弱词要作为线索交给 JEV（它自己做判断）"
 
-    async def test_force_llm_skips_the_keyword_gate_but_not_jev(self):
-        """``handoffTask`` 的重判：跳过口令那一关，先问 JEV —— 要纠正的正是口令误判。"""
+    async def test_force_llm_goes_straight_to_the_model(self):
+        """``handoffTask`` 的重判：跳过口令那一关、也**不问 JEV** —— 要纠正的正是口令误判，
+        而 JEV 与口令层判的是同一件事（同一套 criteria），再问它一次等于让原来的结论投自己
+        一票。所以重判固定走大模型（与 ``mode`` 无关）。"""
         jev = _FakeJev(intent="plan", confidence=0.8)
 
         decision = await detect_intent(
             "实施", jev=jev, model=_FakeClassifier(reply="qa"), force_llm=True
         )
 
-        assert (decision.intent, decision.source) == ("plan", SOURCE_JEV)
-        assert jev.calls == 1
+        assert (decision.intent, decision.source) == ("qa", SOURCE_LLM)
+        assert jev.calls == 0
 
-    async def test_without_jev_it_is_the_old_two_model_path(self):
-        """没配 JEV（``None``）时行为与升级前一致：口令 → 大模型 → 关键字口径。"""
+    async def test_without_jev_it_lands_on_the_keyword_gate(self):
+        """**严格二选一**（2026-10-15 用户口径）：选了 JEV 但这一侧没配齐（``None``）→
+        直接落关键字口径，**不借大模型** —— 要借就等于没做选择。"""
         model = _FakeClassifier(reply="review\n只审不改")
 
-        decision = await detect_intent("帮我瞅瞅", jev=None, model=model)
+        decision = await detect_intent("帮我瞅瞅", jev=None, model=model, mode="jev")
 
-        assert decision.source == SOURCE_LLM
+        assert decision.source == SOURCE_FALLBACK
+        assert model.calls == 0, "选了 JEV 就不该去问大模型"
 
     def test_the_real_jev_decider_builds_against_the_sdk(self):
         """真 SDK 造一次判定器（**不发请求**）：``Choice`` 与客户端能建起来。

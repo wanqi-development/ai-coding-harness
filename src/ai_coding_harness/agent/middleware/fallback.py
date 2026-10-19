@@ -91,7 +91,7 @@ class _PrimarySkipped(Exception):
 class FallbackMiddleware(ModelFallbackMiddleware):
     """主导失败时切 ``fallback``，并记 ``MODEL_FALLBACK`` / ``MODEL_CIRCUIT`` 的痕。
 
-    ``role`` 是路由表（``llm._ROLE_MODEL_ATTR``）里的角色名 —— 主控的角色名就是形态名
+    ``role`` 是路由表（``llm._AGENT_KEY``）里的角色名 —— 主控的角色名就是形态名
     （``profile.form``）；``agent`` 是日志 ``%(agent)s`` 那一列的标注（主控用
     ``MAIN_AGENT``、子智能体用角色名）。子智能体两者同值，主控不同，所以分开给：主控
     那一行既要认得出是主控（和其它运行日志一致），又要认得出是哪个形态。
