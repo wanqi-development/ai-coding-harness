@@ -161,15 +161,18 @@ class TestMainPlansBeforeItDelegates:
     """实测一轮 coding：主智能体读记忆 → 查 PR → 直接派 coder，一次 ``write_todos``
     都没调，子智能体那份清单因此没有落点、整份显示不出来。这段是补的前置约束
     （与「任务清单规则」第 1 条刻意重复：那条单独放着的时候被无视过）。
+
+    2026-10-19 起还有第二道：``DelegationGateMiddleware`` 在执行前硬拦。提示词这段仍要留，
+    模型才知道被拒之后该补什么。
     """
 
     def test_main_plans_before_it_acts(self):
-        assert "动手前先规划" in MAIN_AGENT_PROMPT
-        assert "不允许一次 `write_todos` 都没调就直接派子智能体" in MAIN_AGENT_PROMPT
+        assert "先看清这一轮要做什么" in MAIN_AGENT_PROMPT
+        assert "绝不允许一次`write_todos`都没调用就调用`task`工具" in MAIN_AGENT_PROMPT
 
     def test_only_the_multi_agent_form_gets_it(self):
         # 单智能体形态（qa 等）不挂子智能体，这条对它们没有意义
-        assert "动手前先规划" not in QA_AGENT_PROMPT
+        assert "绝不允许一次`write_todos`都没调用就调用`task`工具" not in QA_AGENT_PROMPT
 
 
 class TestThePlanIsNotCopiedAround:
@@ -227,26 +230,24 @@ class TestTodosComeAfterTheTaskIsUnderstood:
     """``write_todos`` 曾被当成开场动作：一上来先摆一份清单，摆出来的是猜的。
 
     这份清单同时是给用户看的进度（界面上就这一份），条目得是他话里的对象。
-    这几条 2026-09-21 从「通用规则」整段挪进 ``TODO_PROMPT`` —— qa 形态摘掉它，
-    其余形态照旧拼上去（断言的落点跟着挪）。
+    2026-10-19 起 ``TODO_PROMPT`` 收敛成三条（先看清再落清单 / 推进状态 / 收尾），
+    qa 与 analysis 两个只读形态都摘掉它，其余形态照旧拼上去。
     """
 
     def test_the_rule_orders_analysis_before_the_list(self):
+        assert "先看清这一轮要做什么" in TODO_PROMPT
         assert "判断请求类型、读清需求之后才调 `write_todos`" in TODO_PROMPT
-        assert "一上来就写，写出来的是一份猜的清单" in TODO_PROMPT
 
     def test_the_rule_says_the_list_is_for_the_user(self):
-        assert "这份清单是给用户看的" in TODO_PROMPT
-        assert "条目就用他话里的对象" in TODO_PROMPT
-        assert "也不把工具名当条目" in TODO_PROMPT
+        assert "任务清单要贴合用户这一轮的意图，也贴合他的说法" in TODO_PROMPT
+        assert "用户看到的清单以最后一次调用为准" in TODO_PROMPT
 
     def test_the_write_it_first_wording_is_gone(self):
         assert "每个任务都必须先使用 `write_todos` 工具生成" not in BASE_PROMPT
 
     def test_orchestrator_analyzes_then_writes_the_list(self):
-        assert "先把这一轮要做什么分析清楚（判断请求类型、读清需求），再用 `write_todos`" in (
-            MAIN_AGENT_PROMPT
-        )
+        assert "判断请求类型、读清需求之后才调 `write_todos`" in MAIN_AGENT_PROMPT
+        assert "绝不允许一次`write_todos`都没调用就调用`task`工具" in MAIN_AGENT_PROMPT
         assert "先自己用 `write_todos` 写出本轮清单再动手" not in MAIN_AGENT_PROMPT
 
 
@@ -259,29 +260,29 @@ class TestTheListCarriesThePlanSteps:
     改密钥存储」本身就是一次复述，而「清单只写你自己的动作 / 不复述方案」是二值禁令，
     模型只能二选一（`scripts/check_prompts.py` 的 C1 扫的就是这对）。
 
-    现在合成一条：粒度（一步一条、不许塌成占位）与措辞（用你自己的话、一条一行、不搬
-    goal / done_criteria 原文）写在同一句里，示例对两条都成立。
+    现在这条口径只留在 ``CODER_PROMPT``（``TODO_PROMPT`` 是八个形态共用的三条通用规则，
+    不替 coder 管方案步骤）：粒度（一步一条、不许塌成占位）与措辞（用你自己的话、
+    不搬方案原文）写在同一句里，示例对两条都成立。
     """
 
-    def test_the_rule_says_one_item_per_step(self):
-        assert "一项对应方案的一步" in TODO_PROMPT
-        assert "把方案的每一步各列一条" in TODO_PROMPT
+    def test_coder_maps_one_item_to_one_plan_step(self):
+        assert "一项对应方案的一步" in CODER_PROMPT
+        assert "如「步骤 2：改密钥存储」" in CODER_PROMPT
 
     def test_the_one_liner_placeholder_is_named_as_the_anti_pattern(self):
-        assert "不要只留一条「执行计划中」这样的占位" in TODO_PROMPT
+        assert "不要只留一条「执行计划中」这样的占位" in CODER_PROMPT
 
     def test_the_rule_still_forbids_copying_the_plan_text(self):
         """`不加这条就会整段照抄` —— 它 2026-09-21 被误删过一次，这次钉住。"""
-        assert "用你自己的话写这一步在动什么" in TODO_PROMPT
-        assert "方案原文与逐步状态在方案面板上" in TODO_PROMPT
-        assert "不要整段搬方案里那一步的 goal / done_criteria 原文" in TODO_PROMPT
+        assert "条目用你自己的话写这一步在动什么" in CODER_PROMPT
+        assert "方案原文与每一步的状态在方案面板上" in CODER_PROMPT
+        assert "同一步的方案原文不必再搬一遍" in CODER_PROMPT
 
     def test_the_two_halves_are_not_two_opposite_orders(self):
         """相反要求不许回来：既说「一步一条」又说「只写你自己的动作 / 不复述方案」。"""
-        for prompt in (TODO_PROMPT, CODER_PROMPT):
-            assert "把方案的每一步各列一条" in prompt
-            assert "清单只写你自己的动作" not in prompt
-            assert "不复述方案" not in prompt
+        assert "一项对应方案的一步" in CODER_PROMPT
+        assert "清单只写你自己的动作" not in CODER_PROMPT
+        assert "不复述方案" not in CODER_PROMPT
 
     def test_coder_says_the_same(self):
         """与通用规则刻意重复：单放在通用规则里的话被无视过。"""
@@ -296,21 +297,21 @@ class TestTheListCarriesThePlanSteps:
 
 
 class TestQaHasNoTodoList:
-    """qa 形态不需要 `write_todos`：一轮问答没有多步进度可报，清单只会多出一份
-    「查一下、答一下」的空转。
+    """qa 与 analysis 都不需要 `write_todos`：一轮问答没有多步进度可报；analysis 的进度
+    由 `code-tracing-analysis` skill 的取证台账承载，再挂一份清单只是同一件事记两遍。
 
-    两条一起留：提示词里那段摘掉（劝它别选），工具本身也从 qa 的边界里撤掉
-    （`safety/policy.py` 的 qa 行，见 `test_boundary.py`）—— 后者是真边界。
+    两条一起留：提示词里那段摘掉（劝它别选），工具本身也从两个形态的边界里撤掉
+    （`safety/policy.py`，见 `test_boundary.py`）—— 后者是真边界。
     """
 
     def test_qa_prompt_never_mentions_the_tool(self):
         assert "write_todos" not in QA_AGENT_PROMPT
         assert "任务清单规则" not in QA_AGENT_PROMPT
 
-    def test_analysis_keeps_the_list(self):
-        """一轮分析常是四五步取证，条条要报进度 —— 摘的是问答，不是全部只读形态。"""
-        assert "write_todos" in ANALYSIS_AGENT_PROMPT
-        assert "任务清单规则" in ANALYSIS_AGENT_PROMPT
+    def test_analysis_also_drops_the_list(self):
+        """2026-10-17 口径：analysis 的进度靠取证台账，不再挂清单。"""
+        assert "write_todos" not in ANALYSIS_AGENT_PROMPT
+        assert "任务清单规则" not in ANALYSIS_AGENT_PROMPT
 
     def test_every_other_form_keeps_it(self):
         for prompt in (
@@ -893,7 +894,9 @@ class TestSkillRulesBelongToTheFormThatDoesTheWork:
             assert "在 PR 上回复" not in prompt, name
 
     def test_taking_back_the_review_text_is_only_the_orchestrators_job(self):
-        assert "先取回审查原文" in MAIN_AGENT_PROMPT
+        """取回审查原文是 rework 指令的一段，只有主控形态会拼上它。"""
+        assert "先取回审查原文" in intent_directive("rework")
+        assert "先取回审查原文" not in ANALYSIS_AGENT_PROMPT
 
     def test_the_review_skill_is_named_where_the_review_happens(self):
         assert "`code-review` skill" in REVIEWER_PROMPT
