@@ -32,6 +32,7 @@ provider 对历史的要求是「带 tool_calls 的 assistant 消息后面必须
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import Any
@@ -55,9 +56,25 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
+from ai_coding_harness.agent.middleware.guard import TurnStop
+from ai_coding_harness.observability.logging import MAIN_AGENT
+from ai_coding_harness.redact import redact
+from ai_coding_harness.tools.context import get_redact_terms
+
+logger = logging.getLogger(__name__)
+
 INVALID = "invalid_tool_call"
 TOOL_CALL = "tool_call"
 
+#: 异常正文写进日志的字符上限：够放一句上游的错误原文，又不至于把整段 traceback 灌进
+#: agent.log。**给模型的那条响应不截断** —— 它要照着这句话决定下一步。
+_ERROR_LOG_LIMIT = 500
+
+
+def _clip(text: str) -> str:
+    """截断到日志上限。调用方**先脱敏再进来**（与 ``run_log._safe`` 同一口径：顺序反了
+    会留下横跨截断点的半截令牌，既躲过打码又没了上下文）。"""
+    return text[:_ERROR_LOG_LIMIT] + ("…" if len(text) > _ERROR_LOG_LIMIT else "")
 
 def _new_call_id() -> str:
     """与端点自己给的 id 同形（``call_`` + 24 位 hex，实测长度 29），便于并排比对。"""
@@ -224,7 +241,20 @@ class ToolErrorGuardMiddleware(AgentMiddleware):
 
     正文里的异常文本同样要过脱敏：``RedactionMiddleware`` 排在本中间件**外侧**，
     拿到的是这条响应，会照常打码。
+
+    **这里还要记一条 WARNING**（署名 ``agent``）：这条响应是「工具为什么失败」唯一的记录，
+    而它进不了运行日志 —— 委派（``task``）失败时连 ``tool-finished`` 事件都没有，日志里
+    那行「子智能体完成」根本不会出现（2026-10-16 真机：28 次派发 0 条收尾行）。主控读到的
+    只有一句「工具 task 执行失败」，于是换个说法再派一次，4 分钟连派 20 次，谁都查不出原因。
+
+    ``TurnStop`` **不吞**：它是循环守卫「本轮到此为止」的语义，压成一条错误响应之后主控
+    只会接着派（那轮 20 连发就是这么来的）。让它冒到 service 层 —— 那一层收下并补一条
+    中断记录，用户当场看到中止原因。
     """
+
+    def __init__(self, *, agent: str = MAIN_AGENT) -> None:
+        #: 这一份守卫替谁兜（主控还是某个子智能体角色），只用于日志署名。
+        self._agent = agent
 
     async def awrap_tool_call(
         self,
@@ -236,10 +266,20 @@ class ToolErrorGuardMiddleware(AgentMiddleware):
         except GraphBubbleUp:
             # 中断不是错误：它要靠异常穿过工具节点冒到图上去
             raise
+        except TurnStop:
+            # 循环守卫的中止也不是工具错误：吞了它，主控只会「换个说法再派一次」
+            raise
         except Exception as exc:  # noqa: BLE001
             call = request.tool_call
+            detail = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "工具 %s 执行失败：%s",
+                call.get("name") or "unknown",
+                _clip(redact(detail, get_redact_terms())),
+                extra={"agent": self._agent},
+            )
             return ToolMessage(
-                content=f"工具 {call.get('name')} 执行失败：{type(exc).__name__}: {exc}",
+                content=f"工具 {call.get('name')} 执行失败：{detail}",
                 name=call.get("name") or "unknown",
                 # 空 id 也只能写成空串（None 会让 ToolMessage 校验失败），
                 # 这条配对由下一轮的整表修复接上
