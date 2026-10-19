@@ -8,8 +8,23 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Text, Uuid, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    Uuid,
+    func,
+)
+from sqlalchemy import (
+    true as sa_true,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -219,4 +234,233 @@ class SessionRecordDetail(Base):
     )
     extra: Mapped[dict | list | None] = mapped_column(
         JSONB, nullable=True, comment="结构化附加（方案步骤 / findings / PR 链接等）"
+    )
+
+
+class ModelEndpoint(Base):
+    """模型连接表：**按智能体**存一套连接（2026-10-13）。
+
+    ``agent`` 是稳定键，与代码里的形态名对齐：
+
+    * ``qa`` / ``analysis`` / ``plan`` / ``review`` / ``coding``：五个主控形态；
+      三个子智能体（``planner`` / ``coder`` / ``reviewer``）**跟 ``coding`` 那一行**
+      （它们只在 coding 形态下被派出去）；
+    * ``unified``：所有智能体共用它（填了就它优先）；
+    * ``fallback``：主模型重试耗尽后换它再试一次（留空＝没有兜底）；
+    * ``classifier``：意图识别里「大模型」那一关用的模型；
+    * ``intent_mode``：**不装连接**，只在 ``model_name`` 里存 ``jev`` / ``llm``
+      （意图识别走哪一关；见 ``server/intent.py``）。
+
+    **明文存 ``api_key``**：与 ``sessions`` 表那两个 git token 同口径（本地场景、单机自用）。
+    接口只回打码值，写回时留空＝不修改；DB 里的 key 会一并进脱敏词表（``redact.secret_terms``）。
+
+    ``context_window`` 为 0 ＝ 用户没填：解析时按「先读到的 → 128k 保守值」兜
+    （见 ``agent/llm.resolve_window``）。
+    """
+
+    __tablename__ = "model_endpoints"
+    # 用元组包一层：与 ``plans`` 那张表同形，也免得 dict 默认值引出 RUF012（既有告警别新增）
+    __table_args__ = (
+        {"comment": "模型连接表：按智能体存 base_url / 模型 / key / 窗口"},
+    )
+
+    agent: Mapped[str] = mapped_column(
+        String(32), primary_key=True, comment="智能体键（形态名 / unified / fallback / …）"
+    )
+    base_url: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="OpenAI 兼容入口（留空＝用出厂默认）"
+    )
+    model_name: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="模型名（留空＝用出厂默认）"
+    )
+    api_key: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="令牌（明文，与 git token 同口径；接口只回打码值）"
+    )
+    context_window: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="上下文窗口（tokens）；0 ＝ 没填，按「读到 / 128k」兜",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class ModelProvider(Base):
+    """模型提供商目录（界面「提供商」那一栏，2026-10-13 加）。
+
+    **配置的轴仍然是智能体**（见 ``ModelEndpoint``）：这张表只管「界面上挑哪一家、选中带出
+    哪个地址、拉模型列表时去哪拉、怎么鉴权、拉不到时给什么候选」——它不决定谁在用哪个模型。
+
+    启动时读进 ``Settings.providers``；**表为空时**用 ``config/model_providers.toml`` 灌一次
+    （之后以库为准 —— 改种子文件不会覆盖已有行，要重新灌走 ``POST /model-config/providers/reload``）。
+    """
+
+    __tablename__ = "model_providers"
+    __table_args__ = (
+        {"comment": "模型提供商目录：界面「提供商」那一栏 + 拉模型列表的方式"},
+    )
+
+    provider: Mapped[str] = mapped_column(
+        String(32), primary_key=True, comment="稳定键（deepseek / kimi / custom …）"
+    )
+    display_name: Mapped[str] = mapped_column(Text, nullable=False, comment="界面显示名")
+    default_base_url: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="选中它时带出的地址（可改；空＝要用户自己填）"
+    )
+    ui_group: Mapped[str | None] = mapped_column(Text, nullable=True, comment="下拉里的分组名")
+    sort_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="组内排序（小的在前）"
+    )
+    status: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="1 启用 / 0 停用（界面不出现）"
+    )
+    is_dynamic_model_list: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=sa_true(),
+        comment="true＝界面给「测试连接」按钮去拉实时列表；false＝直接用候选清单",
+    )
+    models_path: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="拉列表的路径（默认 /models；有的网关是 /v1/models）"
+    )
+    auth_header: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="鉴权头名（默认 Authorization）"
+    )
+    auth_prefix: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="鉴权头前缀（默认 'Bearer '）"
+    )
+    default_models: Mapped[list | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="**已废弃**（2026-10-15）：内置候选清单不再被读写，列留着免得迁移（模型名以「刷新清单」拉到的那份为准）",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class AppSetting(Base):
+    """**可以改完立刻生效**的运行期配置（2026-10-14 加）。
+
+    键与类型是固定的那一小撮，定义只在 ``config.RUNTIME_SETTINGS`` 一处（界面上的分组、
+    中文名、落到 ``Settings`` 哪个字段都在那儿）—— 这张表只存值，不认识的东西不进库。
+
+    值的语义：**整行覆盖**。库里没有这一行 ＝ 用 ``.env`` / 代码默认值；有这一行就用它
+    （取回来时会赋到 ``Settings`` 实例上，读那些字段的地方一行都不用改）。
+    """
+
+    __tablename__ = "app_settings"
+    __table_args__ = ({"comment": "运行期配置：键值对，改完立刻生效（不用重启）"},)
+
+    key: Mapped[str] = mapped_column(
+        String(64), primary_key=True, comment="稳定键（见 config.RUNTIME_SETTINGS）"
+    )
+    value: Mapped[Any | None] = mapped_column(
+        JSONB, nullable=True, comment="值（字符串 / 整数 / 小数；类型由键的定义决定）"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class ProviderModel(Base):
+    """**供应商的模型详情**（2026-10-14 加）：这家有哪些模型、各是哪一类、上下文多长。
+
+    为什么单开一张表而不是在供应商那行塞一串名字（原来那个 ``default_models``）：**上下文长度
+    是模型的属性，不是供应商的属性**（同一家 ``glm-5.3`` 是 1M、``glm-4.6`` 是 128k），
+    窗口按模型查才不会把压缩线推错地方；而且名字一旦有了属性（类型 / 窗口 / 启停），它就是个实体。
+
+    数据从哪来：① 「刷新模型清单」按供应商去调它的清单接口（``source=probe``）；
+    ② 界面手填 / 手改（``source=manual``）；③ 供应商种子文件里那串名字灌进来（``source=seed``）。
+    **只有点了按钮才刷**（用户口径：不主动刷新、保存时也不刷）。
+    """
+
+    __tablename__ = "provider_models"
+    __table_args__ = ({"comment": "供应商的模型详情：名字 / 类型 / 上下文长度"},)
+
+    provider: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("model_providers.provider", ondelete="CASCADE"),
+        primary_key=True,
+        comment="归属供应商（稳定键，指向 model_providers.provider）",
+    )
+    model: Mapped[str] = mapped_column(Text, primary_key=True, comment="模型名（请求里用的那个串）")
+    model_type: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="chat",
+        comment="类型：chat / embedding / rerank / image / video / audio / other（见 model_types.py）",
+    )
+    context_window: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="上下文长度（tokens）；0 ＝ 还不知道"
+    )
+    source: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="manual",
+        comment="这个窗口/类型哪来的：probe（刷新时读到的）/ manual / seed",
+    )
+    status: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="1 启用 / 0 停用（界面下拉不列停用的）"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class Clarification(Base):
+    """一条**待回答**的意图澄清（每个会话最多一条）。
+
+    只服务“qa 先问、前端弹选项”这一条窄路径：
+
+    - ``original_message`` 是触发歧义的那句用户原话；用户选中候选后要用它去执行，
+      不能拿“第一个”去执行；
+    - ``options`` 是 qa 输出的结构化候选（intent/label/description）；
+    - 任何新的用户消息都会先删掉本会话这一行；结构化选择则由服务层消费。
+
+    不存 ``consumed_at``：消费就是删除。这样不会出现“已消费但忘记过滤”的脏状态。
+    """
+
+    __tablename__ = "clarifications"
+    __table_args__ = (
+        {"comment": "待回答的意图澄清：每个会话最多一条，下一条用户消息即失效"},
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, comment="澄清 ID（uuid 字符串，前端回传）"
+    )
+    session_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        comment="所属会话 ID（外键 → sessions.id；一个会话最多一条）",
+    )
+    original_message: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="触发澄清的用户原话（选中后用它执行）"
+    )
+    question: Mapped[str] = mapped_column(Text, nullable=False, comment="qa 生成的澄清问题")
+    options: Mapped[list] = mapped_column(
+        JSONB, nullable=False, comment="候选：[{intent,label,description}]，顺序即展示顺序"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
     )
