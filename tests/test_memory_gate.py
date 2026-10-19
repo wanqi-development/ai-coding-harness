@@ -753,7 +753,13 @@ def _patch_dao(monkeypatch) -> None:
     async def no_summaries(*args: Any, **kwargs: Any) -> list[str]:
         return []
 
-    for name in ("add_record", "get_latest_plan", "set_session_title_if_empty"):
+    for name in (
+        "add_record",
+        "get_latest_plan",
+        "set_session_title_if_empty",
+        # 判定会读「助手上一轮末尾」当上下文（2026-10-12 加）：验接线就别碰库
+        "latest_assistant_tail",
+    ):
         monkeypatch.setattr(service_mod.dao, name, nothing)
     monkeypatch.setattr(service_mod.dao, "recent_user_summaries", no_summaries)
 
@@ -822,7 +828,14 @@ class TestTheBackfillTrigger:
         monkeypatch.setattr(HarnessService, "_refresh_repo_memory", spy)
         svc = _service(backend)
 
-        async def classify(message: str, history: list[str]) -> IntentDecision:
+        async def classify(
+            message: str,
+            history: list[str],
+            previous_reply: str | None = None,
+            previous_intent: str | None = None,
+            active_intent: str | None = None,
+            dialogue: list[dict[str, str]] | None = None,
+        ) -> IntentDecision:
             return IntentDecision(intent=intent, source="fallback")
 
         svc._detect_intent = classify  # type: ignore[method-assign]

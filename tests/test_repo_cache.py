@@ -19,8 +19,10 @@ from ai_coding_harness.repo_cache import (
     RepoViewError,
     _scrub,
     clean_path,
+    compare,
     default_branch,
     fetched_at,
+    file_diff,
     is_cloned,
     list_branches,
     read_file,
@@ -153,6 +155,50 @@ class TestSync:
 
         with pytest.raises(RepoViewError):
             await sync(settings, spec)
+
+
+class TestCompare:
+    """PR 的 diff：``base...head`` 改了哪些文件、某个文件具体改了什么（全在本地缓存里算）。"""
+
+    async def test_it_lists_the_files_a_pull_request_touches(self, settings, spec):
+        await sync(settings, spec)
+
+        changes = await compare(settings, spec, base="master", head="feature/x")
+
+        by_path = {change.path: change for change in changes}
+        assert set(by_path) == {"feature.md", "readme.md"}
+        assert by_path["feature.md"].status == "A"
+        assert by_path["feature.md"].added == 1 and by_path["feature.md"].deleted == 0
+        assert by_path["readme.md"].status == "M"
+        assert by_path["readme.md"].added == 2
+
+    async def test_the_same_ref_on_both_sides_is_empty(self, settings, spec):
+        await sync(settings, spec)
+
+        assert await compare(settings, spec, base="master", head="master") == []
+
+    async def test_a_repo_that_was_never_synced_says_so(self, settings, spec):
+        """没同步过就把话说清楚，而不是让 git 抛一句认不出的错。"""
+        with pytest.raises(RepoViewError, match="同步"):
+            await compare(settings, spec, base="master", head="feature/x")
+
+    async def test_the_file_diff_shows_only_that_file(self, settings, spec):
+        await sync(settings, spec)
+
+        text = await file_diff(
+            settings, spec, base="master", head="feature/x", path="feature.md"
+        )
+
+        assert "+feature only" in text
+        assert "readme.md" not in text, "只看这一个路径"
+
+    async def test_a_traversal_path_is_rejected(self, settings, spec):
+        await sync(settings, spec)
+
+        with pytest.raises(RepoViewError):
+            await file_diff(
+                settings, spec, base="master", head="feature/x", path="../../etc/passwd"
+            )
 
 
 class TestBranches:

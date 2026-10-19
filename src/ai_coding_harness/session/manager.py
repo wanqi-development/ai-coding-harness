@@ -27,10 +27,14 @@ from opensandbox.models.sandboxes import Volume
 
 from ai_coding_harness.agent.circuit import CircuitStore
 from ai_coding_harness.agent.graph import build_agent
-from ai_coding_harness.agent.middleware import FallbackMiddleware, build_memory_middleware
+from ai_coding_harness.agent.middleware import (
+    FallbackMiddleware,
+    build_memory_middleware,
+)
 from ai_coding_harness.agent.profiles import AgentProfile
 from ai_coding_harness.agent.prompts import build_main_prompt
 from ai_coding_harness.agent.subagents import build_subagents
+from ai_coding_harness.agent.summarization import build_summarization
 from ai_coding_harness.backends.composite import build_composite_backend
 from ai_coding_harness.backends.opensandbox_backend import OpenSandboxBackend
 from ai_coding_harness.codeplatform import Platform, RepoSpec, parse_repo_url
@@ -98,12 +102,15 @@ class CreatedSession:
 
 @dataclass
 class SessionRuntime:
-    """会话的运行时资源：沙箱 + 文件后端 + 主智能体（按 profile 按需构建并缓存）。"""
+    """会话的运行时资源：沙箱 + 文件后端。
+
+    **不再缓存主智能体**（2026-10-14 用户口径：「热生效，每次都创建一个新的 agent，不缓存 agent」）：
+    模型 / 上下文窗口这些值是**建实例时读**的，缓存住就换不动 —— 于是设置页里改完要重启才生效。
+    改成每轮现建之后，改完下一轮就是新的（代价是每轮多一次装配，实测这点开销换来的是「热生效」）。
+    """
 
     sandbox: OpenSandboxProxy
     backend: BackendProtocol
-    # 按 profile.form 缓存：同一会话换意图（qa → coding）会换一套装配，但 thread 不变
-    agents: dict[str, CompiledStateGraph] = field(default_factory=dict)
 
 
 @dataclass
@@ -350,17 +357,17 @@ class SessionManager:
     def get_agent(
         self, runtime: SessionRuntime, session: Session, profile: AgentProfile
     ) -> CompiledStateGraph:
-        """取（或按需构建并缓存）本会话的主智能体 —— 按 profile 分别缓存。
+        """构建本会话的主智能体 —— **每次现建，不缓存**。
 
         工具与子智能体按形态裁剪（``agent/profiles.py``）：只有 ``coding`` 挂子智能体，
         其余形态连 `task` 都没有；qa / analysis 另拿不到写工具。**模型也挂在同一个轴
-        上**（形态名就是角色名）—— 缓存键是形态名，于是换形态必然连模型一起换掉，不会
-        出现「用着 qa 的工具、跑着 plan 的模型」。thread 与 checkpointer 仍按会话共享，
-        所以换形态后用户看到的历史是连续的。
+        上**（形态名就是角色名），于是换形态必然连模型一起换掉，不会出现「用着 qa 的工具、
+        跑着 plan 的模型」。thread 与 checkpointer 仍按会话共享，所以换形态后用户看到的历史是
+        连续的。
+
+        **为什么不缓存**（2026-10-14 用户口径）：模型与上下文窗口是建实例时读的，缓存住之后
+        在设置页改完要重启才生效。每轮现建的代价是一次装配（毫秒级），换来的是「改完立刻生效」。
         """
-        agent = runtime.agents.get(profile.form)
-        if agent is not None:
-            return agent
         plan_ctx = PlanContext(
             session_db_id=session.db_id,
             owner=session.repo.owner,
@@ -384,6 +391,9 @@ class SessionManager:
                 form=profile.form,
             ),
         )
+        # 主控的模型只建一次：压缩中间件要用**同一个实例** —— 触发线是按它 profile 上
+        # 那个窗口算的（``agent/llm.py::_model_from`` 写进去的那一格）
+        main_model = self._model_for(profile.form)
         subagents = build_subagents(
             tools_by_role={
                 role: build_subagent_tools(
@@ -406,9 +416,14 @@ class SessionManager:
             memory_factory=lambda: build_memory_middleware(
                 self._settings, session.repo, runtime.backend
             ),
+            # 压缩（含压缩线处的应急裁剪）：每个角色按**它自己那个模型**的窗口算触发线。
+            # 上游那份已在 ``agent/graph.py`` 里按类排掉，所以这里不给就是「这个角色不压缩」
+            summarization_for=lambda role, model: build_summarization(
+                model, runtime.backend, self._settings, agent=role
+            ),
         )
-        runtime.agents[profile.form] = build_agent(
-            model=self._model_for(profile.form),
+        agent = build_agent(
+            model=main_model,
             backend=runtime.backend,
             tools=main_tools,
             store=self._store,
@@ -426,6 +441,14 @@ class SessionManager:
             memory=build_memory_middleware(
                 self._settings, session.repo, runtime.backend, profile.form
             ),
+            # 压缩（同一根开关，含压缩线处的应急裁剪）：上游那份已排掉，不传就是不压
+            summarization=build_summarization(
+                main_model,
+                runtime.backend,
+                self._settings,
+                agent=MAIN_AGENT,
+                form=profile.form,
+            ),
             subagents=subagents,
             skills=[self._settings.sandbox_skills_dir],
         )
@@ -434,7 +457,7 @@ class SessionManager:
             session.public_id,
             profile.form,
         )
-        return runtime.agents[profile.form]
+        return agent
 
     async def destroy_session(self, *, public_id: str, db_id: int) -> None:
         """销毁会话：软取消在飞的构建 → 终止工作区 → 库里标记 destroyed。

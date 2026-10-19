@@ -27,6 +27,110 @@ async def _drain(hub: RunHub, session_id: str, after: int = 0) -> list[tuple[int
     return [(seq, frame) async for seq, frame in hub.subscribe(session_id, after)]
 
 
+class _FlakyLock:
+    """续期失败、但**能不能重新拿回**由构造参数决定的运行权。
+
+    模拟 2026-10-12 真机上那次：SSH 隧道抖了一下 → 续期失败 → 钥匙 TTL 到点消失 → 之后
+    每次 `renew` 都失败（`renew` 只查+续，不会重建），而 `acquire`（SET NX）还能拿回来。
+    """
+
+    cross_process = True
+
+    def __init__(self, *, reacquire: bool, held: bool = True) -> None:
+        self._reacquire = reacquire
+        self._held = held
+        self.acquires = 0
+        self.renews = 0
+
+    async def acquire(self, session_id: str) -> bool:
+        self.acquires += 1
+        if self.acquires == 1:
+            return True  # start() 的那一次：这一轮本来就持有它
+        return self._reacquire
+
+    async def renew(self, session_id: str) -> bool:
+        self.renews += 1
+        return False
+
+    async def release(self, session_id: str) -> None:
+        return None
+
+    async def held(self, session_id: str) -> bool:
+        return self._held
+
+
+async def test_a_lapsed_lock_is_taken_back_and_the_run_keeps_going(caplog) -> None:
+    """钥匙过期（Redis 抖动）时先**重新拿回**，这一轮继续跑。
+
+    实测那次：从 20:43:50 起 `renew` 每 30 秒失败一次、一直失败到轮次结束 —— 那 95 分钟里
+    这一轮是「无主」跑的，UI 的订阅还先收尾了（界面显示成跑完了）。
+    """
+    lock = _FlakyLock(reacquire=True)
+    # 一帧都不放行：这一轮停在「跑到一半」，好让续期那一步真的发生
+    hub = RunHub(
+        GatedService([{"type": "ai", "content": "a"}]),
+        lock=lock,
+        renew_interval=0.01,
+        poll_interval=0.01,
+    )
+    caplog.set_level("INFO", logger="ai_coding_harness.server.runs")
+    await hub.start("s", StubSession(), "hi")
+
+    await settle()
+    await asyncio.sleep(0.05)
+
+    assert lock.renews >= 1 and lock.acquires >= 1, "续期失败后必须尝试重新拿回"
+    assert await hub.is_running("s") is True, "拿回来了就该继续跑"
+    assert any("重新取回" in r.getMessage() for r in caplog.records)
+    await hub.shutdown()
+
+
+async def test_a_lock_stolen_by_another_worker_ends_this_run(caplog) -> None:
+    """真被别人拿走时**干净收尾**：别在没有所有权的情况下继续写同一个会话。"""
+    lock = _FlakyLock(reacquire=False)
+    service = GatedService([{"type": "done"}])
+    hub = RunHub(service, lock=lock, renew_interval=0.01, poll_interval=0.01)
+    caplog.set_level("WARNING", logger="ai_coding_harness.server.runs")
+    await hub.start("s", StubSession(), "hi")
+
+    await asyncio.sleep(0.05)
+
+    assert await hub.is_running("s") is False, "被抢走就不该再报在跑"
+    assert any("已被别的 worker 持有" in r.getMessage() for r in caplog.records)
+    await hub.shutdown()
+
+
+async def test_a_lock_blip_does_not_close_a_live_local_subscription() -> None:
+    """本进程正在跑的轮次：锁短暂消失不该让**订阅**收尾。
+
+    收尾了界面就会显示成「跑完了」，而这一轮其实还在跑（真机上就是这么发生的）。
+    """
+    service = GatedService([{"type": "ai", "content": "a"}, {"type": "done"}])
+    hub = RunHub(
+        service,
+        lock=_FlakyLock(reacquire=True, held=False),
+        renew_interval=30.0,
+        poll_interval=0.01,
+    )
+    await hub.start("s", StubSession(), "hi")
+
+    got: list[tuple[int, dict]] = []
+
+    async def drain() -> None:
+        got.extend(await _drain(hub, "s"))
+
+    subscriber = asyncio.create_task(drain())
+    await settle()
+
+    assert subscriber.done() is False, "本地这一轮还在跑，订阅不该收尾"
+
+    await service.advance(2)
+    await subscriber
+
+    assert _texts(got) == ["a", None]
+    await hub.shutdown()
+
+
 def _texts(got: list[tuple[int, dict]]) -> list[Any]:
     return [frame.get("content") for _, frame in got]
 

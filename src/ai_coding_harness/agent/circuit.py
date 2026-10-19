@@ -68,9 +68,20 @@ class RedisCircuitStore(RedisBacked):
     """Redis 上的熔断状态：一个模型一个 HASH，带 TTL（坏模型不留痕太久）。"""
 
     def __init__(
-        self, client: Any, *, prefix: str = "harness:", ttl_seconds: int = 3600
+        self,
+        client: Any,
+        *,
+        prefix: str = "harness:",
+        ttl_seconds: int = 3600,
+        cooldown_seconds: float = 60.0,
+        guard_seconds: float = 15.0,
     ) -> None:
-        super().__init__(client, what="熔断状态")
+        super().__init__(
+            client,
+            what="熔断状态",
+            cooldown_seconds=cooldown_seconds,
+            guard_seconds=guard_seconds,
+        )
         self._prefix = prefix
         self._ttl = ttl_seconds
         self._fallback = MemoryCircuitStore()

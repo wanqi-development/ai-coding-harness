@@ -182,8 +182,15 @@ class RedisRunBuffer(RedisBacked):
         prefix: str = "harness:",
         ttl_seconds: int = 3600,
         max_frames: int = 2000,
+        cooldown_seconds: float = 60.0,
+        guard_seconds: float = 15.0,
     ) -> None:
-        super().__init__(client, what="运行缓冲")
+        super().__init__(
+            client,
+            what="运行缓冲",
+            cooldown_seconds=cooldown_seconds,
+            guard_seconds=guard_seconds,
+        )
         self._prefix = prefix
         self._ttl = ttl_seconds
         self._max = max_frames
@@ -352,8 +359,15 @@ class RedisRunLock(RedisBacked):
         prefix: str = "harness:",
         ttl_seconds: int = 120,
         owner: str | None = None,
+        cooldown_seconds: float = 60.0,
+        guard_seconds: float = 15.0,
     ) -> None:
-        super().__init__(client, what="会话运行权")
+        super().__init__(
+            client,
+            what="会话运行权",
+            cooldown_seconds=cooldown_seconds,
+            guard_seconds=guard_seconds,
+        )
         self._prefix = prefix
         self._ttl = ttl_seconds
         self._owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"

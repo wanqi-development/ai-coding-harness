@@ -6,8 +6,17 @@
 的东西其实各 worker 一份，比启动失败更糟）。
 
 **降级纪律**：任何一次 Redis 调用出错，这个包装就**整体**退回进程内实现，并记一条
-warning —— 一轮对话不该因为旁路状态存不进去而失败。第一次失败即永久降级（不再每次
-重试），否则 Redis 半死时每一帧都要白等一次超时。
+warning（带「这条命令花了多久才失败」）—— 一轮对话不该因为旁路状态存不进去而失败。
+失败后有一段**冷却窗口**（``REDIS_DEGRADE_COOLDOWN_SECONDS``，默认 60s）：窗口内不再
+试 Redis（否则 Redis 半死时每一帧都要白等一次超时），**窗口过了再试一次**，成功即恢复。
+窗口设 0 ＝ 退回旧纪律「一次失败即永久降级」。
+
+> 「冷却后重试」是 2026-10-11 改的（原来是「第一次失败即永久降级」）。触发点是一次实测：
+> ``127.0.0.1:6379`` 其实是 **SSH 隧道**（PING 中位 62ms / p95 92ms），一次 TCP 重传就把
+> 一条命令顶过 1 秒的超时；而「永久」意味着这个进程此后彻底失去跨进程能力、要重启才回来。
+
+另外每条命令外面还有一层**兜底超时**（``command_guard_seconds``＝socket 超时的 3 倍）：
+``socket_timeout`` 只管读，隧道半死时**写**能一直阻塞（实测 556 秒才由 TCP 放弃）。
 
 本模块**不在导入期 import redis**：没装这个包（或没配 Redis）的部署与单测照常跑，
 只有真要连的时候才 import。
@@ -15,7 +24,9 @@ warning —— 一轮对话不该因为旁路状态存不进去而失败。第�
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
@@ -26,43 +37,116 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+#: 「一条命令最多等多久」＝ socket 超时的几倍。
+#:
+#: ``socket_timeout`` 只管**读**：隧道半死时**写**会一直阻塞，实测一条命令等了
+#: **556 秒**才由 TCP 自己放弃（2026-10-12，SSH 隧道被重建的那一刻）。所以外面再套一层
+#: 整条调用的兜底超时：超了就按失败处理，交给冷却纪律重试，而不是让这一条拖住九分钟。
+#: 倍数取 3 —— 一条命令可能是「取号 + 入列 + 过期」这种几次往返，但都在隧道量级。
+COMMAND_GUARD_FACTOR = 3
+
+
+def command_guard_seconds(settings: Settings) -> float:
+    """一条 Redis 命令的兜底超时（秒）：由配置的 socket 超时推出来，不另设一个键。
+
+    为什么跟着 socket 超时走：配置放大超时（远端 / 慢隧道）的人，需要兜底也一起放大 ——
+    写死一个常数会让「30 秒的 socket 超时」被 15 秒的兜底先掐掉，与配置的意图相反。
+    ``REDIS_TIMEOUT_SECONDS=0``（redis-py 语义＝不超时）时返回 0 ＝ 不兜底。
+    """
+    return max(0.0, settings.redis_timeout_seconds) * COMMAND_GUARD_FACTOR
+
 
 class RedisBacked:
-    """持有 Redis 客户端与「一次失败就整体降级」的状态。
+    """持有 Redis 客户端与「失败后退回进程内、冷却一段时间再试」的状态。
 
     子类只管写 Redis 那半（``primary``），进程内那半（``fallback``）由子类在每次调用时
     顺带传进来 —— 这样两个实现的语义在同一个方法里对照着看，不会各自漂移。
     """
 
-    def __init__(self, client: Any, *, what: str) -> None:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        what: str,
+        cooldown_seconds: float = 60.0,
+        guard_seconds: float = 15.0,
+    ) -> None:
         self._redis = client
         self._what = what
-        self._degraded = False
+        #: 降级窗口长度。一次失败之后这么多秒内不再试 Redis（避免半死时每一帧都白等一次
+        #: 超时），但**过了这段就再试一次** —— 见 ``run``。
+        self._cooldown = max(0.0, cooldown_seconds)
+        #: 降级窗口的截止时刻（``time.monotonic``）；0 ＝ 没在降级
+        self._degraded_until = 0.0
+        #: 降级之后还没试成功过 —— 只记一次「已恢复」
+        self._recovering = False
+        #: 整条命令的兜底超时（见 ``command_guard_seconds``）：``socket_timeout`` 管不到
+        #: 写阻塞，这一层保证「一条命令」不会把整轮对话拖住。0 ＝ 不兜底。
+        self._guard = max(0.0, guard_seconds)
 
     @property
     def degraded(self) -> bool:
-        """已经退回进程内实现了吗（测试与日志用）。"""
-        return self._degraded
+        """**现在**处于降级窗口吗（测试与日志用）。"""
+        return time.monotonic() < self._degraded_until
 
     async def run(
         self,
         primary: Callable[[], Awaitable[T]],
         fallback: Callable[[], Awaitable[T]],
     ) -> T:
-        """先在 Redis 上做；出错就永久退回进程内那套。"""
-        if not self._degraded:
-            try:
-                return await primary()
-            # 旁路状态：任何错都只该降级，不该往上冒
-            except Exception as exc:  # noqa: BLE001
-                self._degraded = True
+        """先在 Redis 上做；失败就退回进程内那套，**冷却一段时间后再试一次**。
+
+        为什么不是「一次失败即永久降级」：那条纪律的初衷是「Redis 半死时别让每一帧都白等一次
+        超时」，在**本机 Redis** 的假设下没问题。但 Redis 走隧道 / 在远端时（2026-10-11 实测：
+        ``127.0.0.1:6379`` 其实是 SSH 隧道，PING 中位 62ms / p95 92ms，服务端慢日志是空的），
+        一次瞬时抖动（TCP 重传）就能把一条命令顶过超时 —— 那会儿「永久」意味着**这个进程此后
+        彻底失去跨进程能力、要重启才回来**，代价与收益完全不成比例。所以：失败 → 冷却 N 秒 →
+        再试一次；试成功即恢复，再失败就重新进冷却。
+
+        日志里带上**这条命令花了多久才失败**：只说「不可用」看不出是服务端慢还是链路抖，
+        而 62ms 的基线与 1000ms 的超时之间差的是一个 TCP 重传。
+
+        ``cooldown_seconds`` 设成 0（或负数）＝ 退回旧纪律「一次失败即永久降级」，
+        留给「宁可不要跨进程能力也别每帧白等」的部署。
+        """
+        if self.degraded:
+            return await fallback()
+        started = time.perf_counter()
+        try:
+            call = primary()
+            # 兜底超时：``socket_timeout`` 只管读，写阻塞能拖到 TCP 自己放弃（实测 556 秒）。
+            # 超时按失败处理 —— 下面同一个 except 会把这条命令记成降级并走进程内。
+            result = await (asyncio.wait_for(call, timeout=self._guard) if self._guard else call)
+        # 旁路状态：任何错都只该降级，不该往上冒
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if self._cooldown > 0:
+                self._degraded_until = time.monotonic() + self._cooldown
+                self._recovering = True
                 logger.warning(
-                    "Redis 上的 %s 不可用，本进程后续退回进程内实现：%s: %s",
+                    "Redis 上的 %s 不可用（这条命令花了 %.0f ms 才失败），接下来 %.0f 秒退回"
+                    "进程内，过了会再试一次：%s: %s",
                     self._what,
+                    elapsed_ms,
+                    self._cooldown,
                     type(exc).__name__,
                     exc,
                 )
-        return await fallback()
+            else:
+                self._degraded_until = float("inf")
+                logger.warning(
+                    "Redis 上的 %s 不可用（这条命令花了 %.0f ms 才失败），本次退回进程内且不再"
+                    "重试（降级窗口被设成了 0）：%s: %s",
+                    self._what,
+                    elapsed_ms,
+                    type(exc).__name__,
+                    exc,
+                )
+            return await fallback()
+        if self._recovering:
+            self._recovering = False
+            logger.info("Redis 上的 %s 已恢复（冷却结束后的重试成功）", self._what)
+        return result
 
 
 def normalize_url(raw: str) -> str:

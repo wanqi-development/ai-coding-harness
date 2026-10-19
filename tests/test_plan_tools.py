@@ -134,6 +134,138 @@ class TestUpdatePlanStepValidation:
         assert "非法步骤序号：0" in msg
 
 
+class TestContentChecks:
+    """正文自检：坏正文不许落库。
+
+    实测 2026-10-12（plan 41）：9,521 字的正文写到第 4 步（共 6 步）就断了、里面还带着
+    「### 步骤 3（更正稿）：」这种自我修补片段 —— 它「合法」，于是原样落库，下游 coder
+    拿到的就是一份坏方案。``steps`` 早就在校验，正文一个检查都没有。
+    """
+
+    @staticmethod
+    def _steps(count: int = 6) -> list[dict]:
+        return [{"index": i, "goal": f"第 {i} 步", "status": "pending"} for i in range(1, count + 1)]
+
+    def test_a_clean_body_passes(self):
+        body = "# 方案\n\n## 一、目标\n\n把登出接上黑名单。\n\n## 二、步骤\n\n" + "".join(
+            f"### 步骤 {i}：改 {i} 处\n- 改哪个文件、怎么改、怎么验。\n\n" for i in range(1, 7)
+        )
+        body += "## 三、验收\n\n401 + A0403 命中，未命中放行。"
+
+        assert plan_mod._check_content(body, self._steps()) is None
+
+    def test_a_too_short_body_is_rejected(self):
+        assert "太短" in plan_mod._check_content("就这样。", self._steps())
+
+    def test_an_overlong_body_is_rejected(self):
+        body = "甲" * (plan_mod.MAX_CONTENT_CHARS + 1)
+
+        message = plan_mod._check_content(body, self._steps())
+
+        assert "超过上限" in message and str(plan_mod.MAX_CONTENT_CHARS) in message
+
+    def test_a_half_sentence_tail_is_rejected(self):
+        """结尾是半句（真机那次是「…修改 `wanqi-m」+ 「（更正稿见正文）」）。"""
+        body = "甲" * 200 + "\n\n- 结尾写着（"
+
+        assert "半句" in plan_mod._check_content(body, self._steps())
+
+    def test_self_patching_markers_are_rejected(self):
+        body = "甲" * 200 + "\n\n### 步骤 3（更正稿）：\n\n### 歨骤 3 更正稿（以此为准）：\n" + "乙" * 100
+
+        assert "自我修补" in plan_mod._check_content(body, self._steps())
+
+    def test_a_body_that_stops_short_of_the_steps_is_rejected(self):
+        """用了「步骤 N」小节标题，就得覆盖到 steps 的最后一步（那次断在第 4 步）。"""
+        body = "# 方案\n\n" + "".join(
+            f"### 步骤 {i}：改 {i} 处\n- 细节写得足够长。\n\n" for i in range(1, 5)
+        )
+        body += "甲" * 120
+
+        assert "没写完" in plan_mod._check_content(body, self._steps())
+
+    def test_prose_mentions_of_step_numbers_do_not_trigger_it(self):
+        """正文里顺口提到「步骤 3」不算编号小节：这条判据只认**标题行**，免得不该拒的被拒。"""
+        body = "# 方案\n\n正文里提到步骤 3 是拦截器那一步，但不写编号小节。\n" + "甲" * 200
+
+        assert plan_mod._check_content(body, self._steps()) is None
+
+    async def test_store_plan_refuses_a_bad_body_and_writes_nothing(self, monkeypatch):
+        calls: list[tuple] = []
+
+        async def fake_store(*args, **kwargs):
+            calls.append(("store", kwargs.get("content")))
+            return _plan(id=9)
+
+        monkeypatch.setattr(plan_mod.dao, "store_plan", fake_store)
+        tool = next(
+            t
+            for t in build_plan_tools(None, _ctx())  # database=None 就是在断言「不碰库」
+            if t.name == "storePlan"
+        )
+
+        msg = await tool.ainvoke(
+            {
+                "content": "甲" * 200 + "（更正稿见正文）",
+                "steps": [{"goal": f"第 {i} 步"} for i in range(1, 7)],
+            }
+        )
+
+        assert "正文不合法" in msg and "方案未写入" in msg
+        assert calls == []
+
+
+class TestPlanExists:
+    """``planExists``：按 id 判「还能不能拿去实施」，**只回一个布尔、不拉正文**。
+
+    2026-10-13 用户口径：主控在派 coder 之前只要确认「这份方案还在、还没被执行」，
+    方案正文是大对象（一份一万字），不该为了判存在性把它整个读回来。
+    """
+
+    class _Db:
+        @asynccontextmanager
+        async def session(self):
+            yield None
+
+    async def _call(self, monkeypatch, status: str | None, plan_id: int = 7):
+        seen: dict = {}
+
+        async def fake_status(db, *, session_id, plan_id):
+            seen.update(session_id=session_id, plan_id=plan_id)
+            return status
+
+        async def no_full_read(*_a, **_kw):
+            raise AssertionError("判存在性不该拉正文（那是大对象）")
+
+        monkeypatch.setattr(plan_mod.dao, "plan_status", fake_status)
+        monkeypatch.setattr(plan_mod.dao, "get_plan", no_full_read)
+        tool = next(
+            t for t in build_plan_tools(self._Db(), _ctx()) if t.name == "planExists"
+        )
+        return await tool.ainvoke({"plan_id": plan_id}), seen
+
+    async def test_a_pending_plan_is_true(self, monkeypatch):
+        assert await self._call(monkeypatch, "pending") == (True, {"session_id": 1, "plan_id": 7})
+
+    async def test_a_closed_plan_is_false(self, monkeypatch):
+        """软删（closed）＝ 用户已经把它删了，不能再拿去实施。"""
+        result, _ = await self._call(monkeypatch, "closed")
+
+        assert result is False
+
+    async def test_a_done_plan_is_false(self, monkeypatch):
+        """执行完的也不能再派 coder（那会重复实施）。"""
+        result, _ = await self._call(monkeypatch, "done")
+
+        assert result is False
+
+    async def test_a_missing_plan_is_false(self, monkeypatch):
+        """不存在 / 不属于本会话：``plan_status`` 返回 None。"""
+        result, _ = await self._call(monkeypatch, None, plan_id=999)
+
+        assert result is False
+
+
 class TestPlanCrud:
     """方案对象的增删改查：plan 形态主控手里那一套（假 dao，不碰真库）。"""
 
@@ -199,8 +331,9 @@ class TestPlanCrud:
         assert "未找到方案 7" in msg
 
     async def test_update_passes_both_fields(self, monkeypatch):
+        body = "新" * 120  # 正文自检要求它像一份方案（≥100 字），占位短串会被拒
         msg, calls = await self._call(
-            monkeypatch, "updatePlan", plan=_plan(), plan_id=7, content="新正文", title="新标题"
+            monkeypatch, "updatePlan", plan=_plan(), plan_id=7, content=body, title="新标题"
         )
 
         assert "正文、标题已更新" in msg
@@ -217,7 +350,11 @@ class TestPlanCrud:
 
     async def test_update_is_refused_after_delete(self, monkeypatch):
         msg, calls = await self._call(
-            monkeypatch, "updatePlan", plan=_plan(status="closed"), plan_id=7, content="新正文"
+            monkeypatch,
+            "updatePlan",
+            plan=_plan(status="closed"),
+            plan_id=7,
+            content="新" * 120,
         )
 
         assert "已删除（closed），不再修改" in msg
@@ -276,11 +413,12 @@ class TestPlanCrud:
         assert "还没有方案" in msg
 
 
-def test_exports_all_eight_tools():
+def test_exports_all_nine_tools():
     names = [t.name for t in build_plan_tools(None, _ctx())]
     assert names == [
         "storePlan",
         "getPlan",
+        "planExists",
         "updatePlan",
         "updatePlanSteps",
         "deletePlan",

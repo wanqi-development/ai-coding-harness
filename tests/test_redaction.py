@@ -51,7 +51,7 @@ from ai_coding_harness.server import service as service_mod
 from ai_coding_harness.server.intent import IntentDecision
 from ai_coding_harness.server.service import HarnessService
 from ai_coding_harness.tools.git import GiteeRepo
-from tests.v3_events import FakeAgent, RunLogFeed, tool_finish, tool_start
+from tests.v3_events import FakeAgent, RunLogFeed, reasoning, tool_finish, tool_start
 from tests.v3_events import text as text_delta
 
 # 合成凭据：不带任何真实前缀，所以只有「值匹配」能盖住它 —— 便于隔离两条腿
@@ -455,6 +455,7 @@ class TestServiceOutputs:
 
         monkeypatch.setattr(service_mod.dao, "add_record", fake_add_record)
         events = [
+            reasoning(f"思考里带了 {FAKE}"),
             text_delta(f"读到 {FAKE}"),
             tool_start("execute", call_id="e1", input={}),
             tool_finish(call_id="e1", output=f"stdout {FAKE}"),
@@ -474,8 +475,14 @@ class TestServiceOutputs:
         ]
 
         assert FAKE not in "\n".join(e.get("content", "") for e in out)
-        assert REDACTED in out[0]["content"]
+        ai_events = [e for e in out if e["type"] == "ai"]
+        assert ai_events and REDACTED in ai_events[0]["content"]
+        thoughts = [e for e in out if e["type"] == "reasoning"]
+        assert thoughts, "思考应当作为独立事件下发"
+        assert FAKE not in thoughts[0]["content"]
+        assert REDACTED in thoughts[0]["content"]
         assert FAKE not in recorded[-1]["content"]
+        assert "思考里带了" not in str(recorded[-1].get("extra"))
 
     async def test_direct_intent_output_is_masked(self, monkeypatch):
         """sync 不经智能体，中间件够不着 —— 这条最容易被漏掉。"""
@@ -644,7 +651,8 @@ class TestEntryRejection:
         ]
 
         assert manager.requested == 1
-        assert [e["type"] for e in out] == ["ai", "done"]
+        # 跑完一轮的最后两帧是「本轮的账」（usage）与 done
+        assert [e["type"] for e in out] == ["ai", "usage", "done"]
         assert spy.titles == [message]
         assert spy.records[0]["content"] == message
 

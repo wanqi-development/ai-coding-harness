@@ -96,6 +96,64 @@ class TestStatusAndSync:
         assert again.json()["cloned_now"] is False
 
 
+class TestDiffForAFile:
+    """聊天里那条「改动的文件」点开某个文件时走的口子：`base...head` 加一个路径。
+
+    与代码面板同一条纪律：**只碰本地缓存、不碰沙箱**（沙箱回收之后照样能看）。"""
+
+    async def _synced(self, app: FastAPI) -> None:
+        async with _client(app) as client:
+            await client.post("/sessions/s-1/repo/sync")
+
+    async def test_it_returns_that_file_diff(self, app):
+        await self._synced(app)
+
+        async with _client(app) as client:
+            resp = await client.get(
+                "/sessions/s-1/repo/diff",
+                params={"base": "master", "head": "feature/x", "path": "feature.md"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "+feature only" in body["text"]
+        assert "readme.md" not in body["text"]
+        assert body["truncated"] is False
+
+    async def test_a_missing_branch_is_a_readable_409(self, app):
+        await self._synced(app)
+
+        async with _client(app) as client:
+            resp = await client.get(
+                "/sessions/s-1/repo/diff",
+                params={"base": "master", "head": "没有这支分支", "path": "feature.md"},
+            )
+
+        assert resp.status_code == 409
+        assert "同步" in resp.json()["detail"]
+
+    async def test_before_syncing_it_says_the_cache_is_missing(self, app):
+        async with _client(app) as client:
+            resp = await client.get(
+                "/sessions/s-1/repo/diff",
+                params={"base": "master", "head": "feature/x", "path": "feature.md"},
+            )
+
+        assert resp.status_code == 409
+        assert "同步" in resp.json()["detail"]
+
+    async def test_a_traversal_path_is_rejected(self, app):
+        await self._synced(app)
+
+        async with _client(app) as client:
+            resp = await client.get(
+                "/sessions/s-1/repo/diff",
+                params={"base": "master", "head": "feature/x", "path": "../../etc/passwd"},
+            )
+
+        assert resp.status_code == 409
+
+
 class TestTreeAndFile:
     async def _synced(self, app: FastAPI) -> None:
         async with _client(app) as client:

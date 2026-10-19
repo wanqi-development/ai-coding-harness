@@ -41,6 +41,12 @@ def get_intent() -> str | None:
     return get_configurable("intent")
 
 
+def get_clarification() -> dict[str, Any] | None:
+    """低置信度澄清信息（configurable.clarification）；不是澄清轮就是 ``None``。"""
+    value = get_configurable("clarification")
+    return value if isinstance(value, dict) else None
+
+
 def get_redact_terms() -> tuple[str, ...]:
     """获取本次请求的脱敏词表（configurable.redact_terms，由 server 层注入）。
 

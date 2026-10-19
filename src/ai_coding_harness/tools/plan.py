@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from langchain_core.tools import BaseTool, tool
@@ -33,6 +34,68 @@ class PlanContext:
 
 # 步骤状态：pending 待办 / running 进行中 / done 完成 / failed 失败
 _STEP_STATUSES = ("pending", "running", "done", "failed")
+
+#: 正文的硬上限（字符）。这不是审美要求，是**生成稳定性**要求：实测一份 9.5k 字的正文
+#: 会在里面自我修补（同一节写两遍、带「更正稿」字样）并在中途断掉（2026-10-12，plan 41）。
+#: 提示词里要的是 4000 字以内，这里留一半余量当兜底。
+MAX_CONTENT_CHARS = 6000
+
+#: 正文里出现这些字样，说明模型在**修补自己写坏的东西**而不是写一份干净的方案。
+_PATCH_MARKERS = ("更正稿", "以此为准", "（更正）", "(更正)")
+
+#: 「半句结尾」的判据：正文以这些字符收尾，说明它是在一句话中间断掉的。
+_DANGLING_TAILS = ("（", "(", "、", "，", ",", "：", ":", "…")
+
+#: 正文里的步骤小节标题：``### 步骤 3：…``（只认**标题行**，正文里顺口提到的「步骤 3」不算）。
+_STEP_HEADING = re.compile(r"^#{2,}\s*步骤\s*(\d+)")
+
+
+def _check_content(content: str, steps: list[dict]) -> str | None:
+    """落库前给**正文**做一次结构自检；不合格返回可读理由（由调用方回给模型重写）。
+
+    为什么正文也要校验：``steps`` 早就在校验（非空、每项要有 goal），正文却一个检查都没有 ——
+    2026-10-12 实测一份 9,521 字的正文写到第 4 步（共 6 步）就断了、里面还带着「步骤 3（更正稿）」
+    这种自我修补片段，因为「合法」而原样落库，下游 coder 拿到的就是一份坏方案。
+
+    检查的都是**能确定性判断**的东西（不猜语义）：
+
+    1. 不能空、不能太短（少于 100 字的正文不可能是方案）；
+    2. 不能带自我修补字样（「更正稿」「以此为准」）；
+    3. 结尾不能是半句（以「（」「、」「：」这类字符收尾）；
+    4. 用了「步骤 N」编号就得覆盖到 ``len(steps)`` —— 断在最前面几步正是那次的现象；
+    5. 不能超长（见 ``MAX_CONTENT_CHARS``）。
+
+    顺序是**先结构、后长度**：既超长又带修补片段时，让模型先看到「重写一份干净的」（那也
+    自然会把正文压下来），而不是只收到一句「压缩」。
+    """
+    body = content.strip()
+    if len(body) < 100:
+        return "正文太短（少于 100 字），看不出是一份方案。"
+    for marker in _PATCH_MARKERS:
+        if marker in body:
+            return (
+                f"正文里出现「{marker}」这类自我修补字样：请重新写一份**干净**的正文"
+                "（同一节只写一次），不要在文档里追加更正片段。"
+            )
+    tail = body.rstrip()
+    if tail.endswith(_DANGLING_TAILS):
+        return "正文结尾像半句话（以标点/括号收尾），说明写到一半断了 —— 请补完再重新调用。"
+    headings = [
+        int(match.group(1))
+        for line in body.splitlines()
+        if (match := _STEP_HEADING.match(line.strip()))
+    ]
+    if headings and max(headings) < len(steps):
+        return (
+            f"正文只写到第 {max(headings)} 步，而 steps 有 {len(steps)} 步 —— 正文没写完"
+            "（或步骤编号与 steps 对不上）。请补齐后重新调用。"
+        )
+    if len(body) > MAX_CONTENT_CHARS:
+        return (
+            f"正文 {len(body)} 字，超过上限 {MAX_CONTENT_CHARS} 字。只写 coder 需要的东西"
+            "（每步的关键实现点、要动的文件、验收口径），读码过程与背景复述不要写进正文。"
+        )
+    return None
 
 
 def _normalize_steps(raw: object) -> tuple[list[dict] | None, str | None]:
@@ -108,6 +171,9 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
         normalized, error = _normalize_steps(steps)
         if error:
             return f"步骤列表不合法：{error}请修正后重新调用 storePlan（方案未写入）。"
+        content_error = _check_content(content, normalized)
+        if content_error:
+            return f"正文不合法：{content_error}（方案未写入，请重写后重新调用 storePlan。）"
         async with database.session() as db:
             row = await dao.store_plan(
                 db,
@@ -142,6 +208,25 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
         return _format_plan(plan)
 
     @tool
+    async def planExists(plan_id: int) -> bool:
+        """按 id 判定这份方案**还能不能拿去实施**：存在、且状态是 pending → ``True``。
+
+        方案正文是大对象（实测一份一万字），而主控在派 coder 之前要确认的只有一件事：
+        这份方案还在、还没被执行过。所以这个工具**只回一个布尔、不拉正文** ——
+        正文让 coder 自己用 `get_unexecuted_plan` 取（那才是唯一权威的那份）。
+
+        ``False`` 的三种情形：方案不存在 / 不属于本会话、已软删（closed）、已执行完（done）。
+
+        Args:
+            plan_id: 方案 ID（上一轮对话里出现过的编号、或 `storePlan` 的返回）。
+        """
+        async with database.session() as db:
+            status = await dao.plan_status(
+                db, session_id=ctx.session_db_id, plan_id=plan_id
+            )
+        return status == "pending"
+
+    @tool
     async def updatePlan(
         plan_id: int,
         content: str | None = None,
@@ -162,6 +247,13 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
                 return f"未找到方案 {plan_id}（或它不属于本会话）。"
             if plan.status == "closed":
                 return f"方案 {plan_id} 已删除（closed），不再修改。"
+            if content is not None:
+                # 改正文与写正文同一套自检：坏正文从哪条路进来都不该落库
+                content_error = _check_content(content, list(plan.steps or []))
+                if content_error:
+                    return (
+                        f"正文不合法：{content_error}（方案未改动，请重写后重新调用 updatePlan。）"
+                    )
             await dao.update_plan_content(
                 db,
                 plan_id=plan_id,
@@ -288,6 +380,7 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
     return [
         storePlan,
         getPlan,
+        planExists,
         updatePlan,
         updatePlanSteps,
         deletePlan,

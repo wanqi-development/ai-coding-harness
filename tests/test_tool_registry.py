@@ -108,6 +108,7 @@ def test_main_can_read_and_post_pr_comments():
         "comment_pr",
         "close_pr",
         "get_unexecuted_plan",
+        "planExists",
         "save_repo_memory",
     ]
 
@@ -148,6 +149,16 @@ def test_plan_form_owns_the_plan_crud_tools():
 
     for name in ("storePlan", "getPlan", "updatePlan", "updatePlanSteps", "deletePlan"):
         assert name in names, name
+
+
+def test_plan_exists_is_the_cheap_lookup():
+    """``planExists`` 是只回布尔的轻量查询：两个形态都该拿到它（2026-10-13 用户口径）。
+
+    plan 形态用它代替「为了判存在性把一万字正文读回来」，coding 形态用它做「派 coder 之前
+    确认那份方案还能实施」—— 正文让 coder 自己用 ``get_unexecuted_plan`` 取。
+    """
+    assert "planExists" in _main_with_handoff(PLAN_FORM)
+    assert "planExists" in _main_with_handoff(ORCHESTRATE_FORM)
 
 
 @pytest.mark.parametrize("form", [ORCHESTRATE_FORM, QA_FORM, ANALYSIS_FORM, REVIEW_FORM])
