@@ -9,10 +9,10 @@
 ## 架构
 
 - **接口**：FastAPI，SSE 流式。一轮对话分两段：`POST /chat/{id}` 起一轮并就地订阅，`GET /chat/{id}/stream` 供刷新后接回（帧带自增 id 作游标）。暂无鉴权。
-- **LLM**：按**角色**选模型（路由表见 `agent/llm.py`）—— orchestrate / plan / planner → 智谱 glm；qa / analysis → gpt；review / reviewer → kimi；coder → DeepSeek。全部走 OpenAI 兼容协议（`langchain-openai`）。主导彻底失败时切**兜底供应商**（`FALLBACK_PROVIDER`）；连续失败到阈值开**熔断**，冷却期内不再撞主导，直接走兜底。
-- **意图判定**（`server/intent.py`）：口令级强关键字直通 → 分类模型判定（附最近若干条用户消息，供指代消解）→ 模型不可用时回落关键字。判定来源（`intent_source`）进日志与业务记录；`sync` 只能从口令层产出。
+- **LLM**：按**角色 → 设置页里的一行**选模型（映射只有一份：`agent/llm.py::_AGENT_KEY`，行清单见 `config.MODEL_AGENT_ROWS`）。**没有 `.env` 出厂默认**（2026-10-15 起）：一行没配，用到这个角色的那一轮就当场报错并指认是哪一行。解析顺序 **① 该行的配置 → ②「统一模型」那一行（只兜底没配的行）**。全部走 OpenAI 兼容协议（`langchain-openai`）。主模型重试耗尽时切设置页「兜底模型」那一行；连续失败到阈值开**熔断**，冷却期内不再撞主导。
+- **意图判定**（`server/intent.py`）：口令级强关键字直通 → **JEV 或 大模型（严格二选一，设置页里选）** → 关键字口径。选中的那一侧没配齐 / 判不出来时直接落关键字口径（不借另一侧）。判定来源（`intent_source`）进日志与业务记录；`sync` 只能从口令层产出。低置信度时 qa 输出 `<CLARIFY>` 固定协议，后端落 `clarifications` 表并发 SSE `clarification`，前端用弹窗选项；点选项确定性执行原始消息，点“其他”/自由输入才重新判定。
 - **形态**（`agent/profiles.py`）：**唯一的装配轴**，一处定下三件事 —— 挂哪些子智能体、给哪些主工具（`tools/register.py`）、用哪套角色提示词（`agent/prompts.py`）。五种形态：`qa` / `analysis`（只读自答）、`plan`（自己出方案并落库）、`review`（自己审、自己回评）、`orchestrate`（**唯一挂子智能体的形态**：planner / coder / reviewer）。`coding` 与 `rework` 都落 `orchestrate`（`FORM_ALIASES` 显式登记共用装配，差别只在记忆闸门）；`sync` 走直接执行，不经智能体。
-- **中间件**（`agent/middleware/`，装配点在 `agent/graph.py` 与 `agent/subagents.py`，逐角色各建实例）：
+- **中间件**（`agent/middleware/` 与 `agent/summarization.py`，装配点在 `agent/graph.py` 与 `agent/subagents.py`，逐角色各建实例）：
 
 | 模块 | 作用 |
 |---|---|
@@ -22,14 +22,16 @@
 | `boundary` | 按智能体的活动范围：从可见工具里摘掉越界的，执行前再判一次 |
 | `guard` | 本轮**空转刹车**：同一工具同一参数反复调用时，先劝、再停 |
 | `fallback` | 主导失败时切兜底，并留一条 `MODEL_FALLBACK` 的痕 |
+| `summarization` | 压缩（摘要）。按角色分档：`qa` / `analysis` / 主控 `orchestrate` 稳态（窗口 70%），主控 `plan` / `review` 与子智能体 `planner` / `coder` / `reviewer` 爆发（窗口 40%）。到线先做一次**应急工具裁剪**：保留当前步骤 + 模型工作笔记 `KEEP:` 点名的结果，其余换成带身份的占位符——**只改这一次请求**；剪完低于线就不摘要，仍高于才压。另留 `CONTEXT_PRETRIM` / `CONTEXT_SUMMARY` 两条账 |
 
 - **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
 - **文件后端**：混合 `CompositeBackend` —— default 走自定义 OpenSandbox 后端，`/memories/` 走 `StoreBackend`。
-- **Redis（可选）**：多 worker 时的**跨进程旁路状态** —— 一轮对话的帧缓冲（刷新/断线后落到哪个 worker 都能带 `after` 游标接回）、会话运行权（同一会话不许两个 worker 同时跑）、模型熔断状态。帧号由 `INCR` 发，缓冲有上限与 TTL。**不配 `REDIS_URL` 就全部留在进程内**（单 worker 的行为，默认）；配了但连不上会退回进程内并记 warning，`REDIS_REQUIRED=true` 则直接拒绝启动。注意：**沙箱句柄仍在各 worker 里**（同一会话落到别的 worker 会另建容器，工作区靠命名卷共享），所以真要横向扩容还得配 sticky 路由或「谁持锁谁干活」的约束。
+- **Redis（可选）**：多 worker 时的**跨进程旁路状态** —— 一轮对话的帧缓冲（刷新/断线后落到哪个 worker 都能带 `after` 游标接回）、会话运行权（同一会话不许两个 worker 同时跑）、模型熔断状态。帧号由 `INCR` 发，缓冲有上限与 TTL。**不配 `REDIS_URL` 就全部留在进程内**（单 worker 的行为，默认）；配了但连不上会退回进程内并记 warning，`REDIS_REQUIRED=true` 则直接拒绝启动。单条命令失败后退回进程内是**「冷却一段时间再试一次」而不是永久降级**（默认 60s）—— 走隧道 / 在远端的 Redis 一次瞬时抖动，不该让这个进程此后彻底失去跨进程能力。注意：**沙箱句柄仍在各 worker 里**（同一会话落到别的 worker 会另建容器，工作区靠命名卷共享），所以真要横向扩容还得配 sticky 路由或「谁持锁谁干活」的约束。
 - **右侧栏「代码」面板**（`repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机自己 `git clone --bare` 一份只读缓存（按 `owner/repo`，`REPO_VIEW_DIR` 默认 **`~/.ai-coding-harness/repo_cache`**，即用户个人目录，不写进项目目录），切分支只是换个 ref，读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
 - **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流；token 请求优先、平台配置兜底。**两个平台的 OAuth 登录后端都已就绪**（`/auth/gitee/*` 与 `/auth/github/*`，换回的 token 随 `create_session` 的 `gitee_token` / `github_token` 带上）；**前端还没接登录入口**，所以眼下实际用的仍是 `.env` 里的 `GITEE_ACCESS_TOKEN` / `GITHUB_ACCESS_TOKEN`（见 CHANGELOG 遗留项）。
 - **安全**：危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
-- **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。
+- **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（到压缩线后的应急裁剪：剪了几条、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。
+- **思考展示**：模型思考以 `reasoning` 帧单独下发，主控与子智能体按角色分段显示；它只存在于前端与 RunHub 的临时帧缓冲，**不落业务库**。流式期间正文按纯文本显示，任务结束后一次性 Markdown 化。
 
 ## 意图与形态
 
@@ -65,14 +67,27 @@ GET    /sessions                    ?limit=50                                   
 GET    /sessions/{id}                                                           # 会话详情（含 running，刷新后据此决定是否接回直播）
 DELETE /sessions/{id}                                                           # 销毁会话
 POST   /sessions/{id}/workspace                                                 # 准备 / 取代码工作区
-GET    /sessions/{id}/records                                                   # 历史记录（正文 + 待办树）
+GET    /sessions/{id}/records?limit=20&before_id=<id>                           # 历史一页（最近 20 条；before_id 向前翻）
+GET    /sessions/{id}/clarification                                             # 当前待回答的意图澄清（刷新恢复弹窗）
 GET    /sessions/{id}/plan                                                      # 最新方案（没有则 null）
 POST   /sessions/{id}/cancel                                                    # 终止当前这一轮
 GET    /sessions/{id}/repo                                                      # 右侧栏「代码」：本机缓存状态 + 分支（不联网）
 POST   /sessions/{id}/repo/sync                                                 # 下载（首次 clone）或更新（之后 fetch）这份缓存
 GET    /sessions/{id}/repo/tree             ?ref=<分支>&path=<目录>             # 列一层目录
 GET    /sessions/{id}/repo/file             ?ref=<分支>&path=<文件>             # 读一个文件（太大 / 二进制只回标记）
+GET    /sessions/{id}/memory                                                    # 右侧栏「记忆」：仓库记忆全文（只读）
+GET    /sessions/{id}/pulls                                                     # 右侧栏「PR」：本仓库 PR 列表与状态
+GET    /sessions/{id}/logs                  ?limit=300&q=<关键字>&with_http=false # 右侧栏「日志」：本会话日志（默认滤掉 HTTP 噪声）
+GET    /sessions/{id}/logs/download                                             # 下载整份日志（按时间线合并成一份）
+GET    /sessions/{id}/usage                                                     # 右侧栏「Token」：本会话消耗（按执行主角聚合）
+GET    /model-config                                                            # 模型配置：每行「库里填了什么」+「现在真的用谁」（effective）
+PUT    /model-config   {"rows": {"qa": {"base_url":…, "model":…, "api_key":…}}, "intent_mode": "jev"}  # 保存（留空＝不改）
+POST   /model-config/probe  {"base_url":…, "api_key":…}                          # 测试连接：拉厂商 /models（顺带读窗口）
+DELETE /model-config/{agent}                                                    # 清空这一行（界面上叫「清空这一行」）
+GET    /model-config/providers                                                  # 提供商目录全量（含停用）：设置页「提供商」栏用它
+PUT    /model-config/providers/{provider}                                       # 写一行提供商（整行覆盖；键不可改）
 POST   /chat/{id}                   {"message": "..."}                          # 起一轮（SSE 流式）
+                                     # 澄清选项：再加 {"clarification_id":"...","choice":0}
 GET    /chat/{id}/stream            ?after=<帧号>                               # 续订阅（刷新后接回）
 GET    /auth/gitee/authorize                                                    # 跳转 Gitee 授权页（带自签 state）
 GET    /auth/gitee/callback             ?code=...&state=...                     # 授权回调，验 state 后拿 code 换 token
@@ -138,9 +153,9 @@ npm --prefix frontend run dev          # 前端 http://localhost:5173
 
 `.env` 关键配置：
 
-- **模型**：`DEEPSEEK_*` / `KIMI_*` / `GLM_*` / `GPT_*`（各自配 key / base_url / 模型名）；上下文窗口 `*_CONTEXT_WINDOW` 供压缩按比例触发。
-- **兜底与熔断**：`FALLBACK_PROVIDER`、`FALLBACK_CIRCUIT_THRESHOLD`、`FALLBACK_CIRCUIT_COOLDOWN_SECONDS`。
-- **意图分类**：`INTENT_JEV_ENABLED` + `TYPESAFE_*`（JEV / SystemOne，瀑布第二关；`TYPESAFE_API_KEY` / `TYPESAFE_BASE_URL` / `TYPESAFE_MODEL_NAME` / `TYPESAFE_TIMEOUT_SECONDS`），以及 `INTENT_LLM_ENABLED` / `INTENT_MODEL` / `INTENT_BASE_URL` / `INTENT_API_KEY` / `INTENT_TIMEOUT_SECONDS` / `INTENT_HISTORY_TURNS`（第三关那套大模型；两项都缺就只剩关键字口径）。
+- **模型**：**不在 `.env` 里配了**（2026-10-15 起）—— 谁用哪个模型在设置页 →「模型配置」里按智能体填，存表 `model_endpoints`、**下一轮生效**。唯一还用 `.env` 的是 `GLM_API_KEY` / `GLM_BASE_URL`（web 搜索那条工具）；`DEEPSEEK_*` / `KIMI_*` / `GPT_*` / `QWEN_*` / `*_CONTEXT_WINDOW` / `FALLBACK_PROVIDER` / `INTENT_MODEL|BASE_URL|API_KEY` / `TYPESAFE_API_KEY|BASE_URL|MODEL_NAME` 均已作废（`.env.example` 里逐条标注）。压缩（摘要）按角色分两档：**稳态** `qa` / `analysis` / 主控 `orchestrate` 按窗口 **70%** 触发，**爆发** 主控 `plan` / `review` 与子智能体 `planner` / `coder` / `reviewer` 按窗口 **40%** 触发；压完保留最近 20k，摘要那次调用最多吃 40k（`CONTEXT_STEADY_TRIGGER_FRACTION` / `CONTEXT_BURST_TRIGGER_FRACTION`，窗口解析不出来时才用 `CONTEXT_SUMMARY_TRIGGER_TOKENS` 兜底）。**平时不再做 40k 常规剪裁**，到压缩线的提醒线（默认 90%）先提醒模型写工作笔记与 `KEEP:` 清单，到线后的应急裁剪保留当前步骤 + KEEP 点名的工具返回，剪完低于线就不摘要。压缩那份中间件的取值由我们自己构造，上游那份按类排掉（`agent/summarization.py`）。两条**只提醒不改行为**的线不变：`CONTEXT_WARN_RATIO`（默认 0.6，输入框上方画细进度条）/ `CONTEXT_ALERT_RATIO`（默认 0.8，给警示语）。
+- **兜底与熔断**：兜底只有设置页「兜底模型」那一行（留空＝关掉）；`FALLBACK_CIRCUIT_THRESHOLD` / `FALLBACK_CIRCUIT_COOLDOWN_SECONDS` 仍从 `.env` 读。
+- **意图分类**：**严格二选一**（设置页 →「模型配置」→ 意图识别里选）—— JEV 那一行（供应商锁 `typesafe`，填 base_url + api_key）或「意图识别（大模型）」那一行。`INTENT_JEV_ENABLED` / `INTENT_LLM_ENABLED`（关掉某一侧）、`INTENT_TIMEOUT_SECONDS` / `INTENT_HISTORY_TURNS` / `TYPESAFE_TIMEOUT_SECONDS` 仍在 `.env`。
 - **运行约束**：`AGENT_RECURSION_LIMIT`、`LOOP_GUARD_REPEATS`（`0` = 关掉空转刹车）、`HANDOFF_RESULT_MAX`。
 - **业务**：`GLM_*`（智谱，web 搜索也用它）、`OPENSANDBOX_*` + `SANDBOX_*`（沙箱镜像 / 资产 / 工作区卷）、`GITEE_*` / `GITHUB_*`（两个平台的 PR 兜底 token、OAuth 登录凭据，GitHub 侧要先建 OAuth App 并把回调地址填成 `GITHUB_OAUTH_REDIRECT_URI`）、`POSTGRES_*`（业务库）。
-- **Redis（可选，多 worker 才需要）**：`REDIS_URL`（留空 = 进程内）、`REDIS_PREFIX`、`REDIS_REQUIRED`、`REDIS_TIMEOUT_SECONDS`，以及运行缓冲/运行权的 `RUN_BUFFER_TTL_SECONDS`、`RUN_BUFFER_MAX_FRAMES`、`RUN_LOCK_TTL_SECONDS`、`RUN_POLL_INTERVAL_SECONDS`。
+- **Redis（可选，多 worker 才需要）**：`REDIS_URL`（留空 = 进程内）、`REDIS_PREFIX`、`REDIS_REQUIRED`、`REDIS_TIMEOUT_SECONDS`（默认 5s；**Redis 走隧道 / 在远端时必须放大**）、`REDIS_DEGRADE_COOLDOWN_SECONDS`（一次失败后退回进程内多久再试一次，默认 60s；设 0 = 旧的「永久降级」），以及运行缓冲/运行权的 `RUN_BUFFER_TTL_SECONDS`、`RUN_BUFFER_MAX_FRAMES`、`RUN_LOCK_TTL_SECONDS`、`RUN_POLL_INTERVAL_SECONDS`。
