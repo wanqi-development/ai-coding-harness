@@ -51,7 +51,7 @@ class TestPolicyTable:
     @pytest.mark.parametrize(
         ("name", "roots", "hidden"),
         [
-            # 主控多智能体形态：改码、临时区、审查原文三处都要落
+            # 主控多智能体形态：写码一律派 coder，主控自己不给写文件的工具
             (
                 ORCHESTRATE_FORM,
                 (
@@ -59,14 +59,15 @@ class TestPolicyTable:
                     "/ai_coding/tmp",
                     "/ai_coding/review",
                 ),
-                (),
+                ("edit_file", "write_file"),
             ),
             # 出方案：与子智能体 planner 同形 —— 方案 storePlan 落库、结论进回复，一个文件都不落
             (PLAN_FORM, (), ("edit_file", "write_file")),
             # 问答：一个文件都不落（与 planner 同形），清单工具也一并撤掉（提示词里那段也摘了）
             (QA_FORM, (), ("write_todos", "write_file", "edit_file")),
-            # 分析：与 qa 同形，结论进回复，只留 tmp 放取证的中间产物（技能里也是这么写的）
-            (ANALYSIS_FORM, ("/ai_coding/tmp",), ()),
+            # 分析：与 qa 同形，结论进回复，只留 tmp 放取证的中间产物；进度靠取证台账，
+            # 清单工具一并撤掉
+            (ANALYSIS_FORM, ("/ai_coding/tmp",), ("write_todos",)),
             (REVIEW_FORM, ("/ai_coding/review",), ()),
             # 子智能体 planner 不写文件，写工具一并撤掉
             ("planner", (), ("edit_file", "write_file")),
@@ -428,7 +429,7 @@ class TestHideTools:
 
     async def test_request_is_untouched_when_nothing_is_hidden(self):
         """没命中就别造新对象：状态无谓更新会连带下游一堆重算。"""
-        original = _model_request([{"name": "write_file"}])
+        original = _model_request([{"name": "execute"}])
         seen: list[ModelRequest] = []
 
         async def handler(request: ModelRequest) -> Any:

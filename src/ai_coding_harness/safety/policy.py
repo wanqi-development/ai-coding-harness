@@ -188,7 +188,8 @@ def policy_for(name: str, settings: Settings | None = None) -> AgentPolicy:
 # 名字在整个仓库里唯一，分两张表只会让人猜「主控的 plan 和子智能体的 planner 是不是
 # 一回事」。
 _ROOTS: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
-    # 主控（多智能体形态）：改代码、临时区、审查原文三处都要落
+    # 主控（多智能体形态）：写码一律派 coder，主控不给 edit_file / write_file；
+    # project / tmp / review 三个写根留给 execute（git 操作、临时产物）与审查原文。
     "orchestrate": (("project", "tmp", "review"), frozenset({"edit_file", "write_file"})),
     # 主控（单智能体出方案）：与子智能体 planner 同形 —— 方案 `storePlan` 落库、结论进回复，
     # 一个文件都不落，写工具一并撤掉。它自己的提示词有两处就是这么写的（`_PLAN_WORKDIR` 的

@@ -19,11 +19,36 @@
 | api/ HTTP 接口 | ✅ 完成 |
 | safety/ 安全 | ✅ 完成（全局底线 + 按智能体的工具 / 目录边界） |
 | observability/ 可观测 | ✅ 完成 |
-| tests/ 测试 | ✅ 完成（1546 条；1533 过 / 13 条既有失败） |
+| tests/ 测试 | ✅ 完成（1546 条全过） |
 
 ## 修改记录
 
 ### 2026-10-19
+
+#### 收口：13 条既有失败 —— 测试对齐当前提示词与策略
+
+- **动机**：PR #1 的全量结果是 1533 passed / 13 failed。13 条都不是新引入的：10 条是
+  `TODO_PROMPT` 重写成「先看清 / 推进 / 收尾」三条之后、测试仍在断言旧文案；3 条是
+  2026-10-17 明确改过工具面（orchestrate 隐藏 `edit_file/write_file`、analysis 隐藏
+  `write_todos`）之后没同步。合并前必须让分支回到全绿。
+- **改动**：
+  - `tests/test_prompts.py`：断言改到当前契约。主控的前置约束改成「先看清这一轮要做什么 +
+    没写清单不许 `task`」；清单规则改到三条新版；**方案步骤粒度只归 `CODER_PROMPT`**
+    （通用段不替 coder 规定）；analysis 改成「与 qa 一样不挂清单」；「先取回审查原文」
+    改到 `intent_directive("rework")`（它本来就只拼在主控的 rework 轮）。
+  - `tests/test_boundary.py`：orchestrate 的隐藏工具补 `edit_file / write_file`，analysis 补
+    `write_todos`；「没有隐藏工具时不改请求对象」那条改用 `execute`（原用例拿 `write_file`
+    在 orchestrate 下已经会被隐藏，前提不成立）。
+  - `src/ai_coding_harness/agent/prompts.py`：修 `TODO_PROMPT` 错字（「推推荐」→「任务状态
+    要及时更新」）；删掉 `CODER_PROMPT` 里指向「任务清单规则第 3 条」的失效引用（第 3 条
+    现在是收尾规则）；同步段前注释。
+  - `src/ai_coding_harness/safety/policy.py`：orchestrate 行的注释改成「写码一律派 coder」，
+    与「隐藏写工具」的实际行为一致。
+- **验证**：`pytest tests/test_prompts.py tests/test_boundary.py` **198 passed**；
+  `scripts/check_prompts.py` **0 条冲突**；全量 `pytest` **1546 passed**；`ruff check`
+  改动的 4 个文件全清。
+- **遗留**：analysis 不再有进度清单（靠 `code-tracing-analysis` 的取证台账）。真机上若
+  仍需要可见进度，再单独评估，不在本次把旧断言改回去。
 
 #### 委派闸门从循环守卫里拆出来
 
