@@ -13,6 +13,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
 from ai_coding_harness.agent.graph import build_agent
+from ai_coding_harness.agent.middleware.context_inject import clarification_block
 from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM
 from ai_coding_harness.safety.policy import policy_for
 
@@ -25,6 +26,10 @@ class _Recorder(BaseChatModel):
     """最小假模型：记录每次调用收到的消息，不做生成。"""
 
     seen: list[list[BaseMessage]] = Field(default_factory=list)
+
+    def _get_ls_params(self, **kwargs: object) -> dict[str, str]:
+        """报 ``openai`` provider —— 与线上一致，harness profile 才会关掉默认子智能体。"""
+        return {"ls_provider": "openai"}
 
     @property
     def _llm_type(self) -> str:
@@ -47,7 +52,12 @@ def _first_system_text(model: _Recorder) -> str:
     return first.text
 
 
-async def _run(intent: str | None, subagents: list[dict] | None = None) -> _Recorder:
+async def _run(
+    intent: str | None,
+    subagents: list[dict] | None = None,
+    *,
+    clarification: dict[str, Any] | None = None,
+) -> _Recorder:
     model = _Recorder()
     agent = build_agent(
         model=model,
@@ -60,7 +70,10 @@ async def _run(intent: str | None, subagents: list[dict] | None = None) -> _Reco
         subagents=subagents,
         skills=None,
     )
-    config: dict[str, Any] = {"configurable": {} if intent is None else {"intent": intent}}
+    configurable: dict[str, Any] = {} if intent is None else {"intent": intent}
+    if clarification is not None:
+        configurable["clarification"] = clarification
+    config: dict[str, Any] = {"configurable": configurable}
     await agent.ainvoke(
         {"messages": [{"role": "user", "content": "帮我做点什么"}]}, config=config
     )
@@ -123,3 +136,59 @@ class TestIntentMiddleware:
         text = _first_system_text(await _run("plan", subagents=subagents))
         assert "SUBAGENT-哨兵" in text, "子智能体描述没进系统消息"
         assert "`task`" in text, "意图指令被子智能体中间件挤掉了"
+
+    async def test_rework_capability_says_task_is_available(self):
+        """rework 这轮要把「有 task、可派三从」写死，压住上一轮 analysis 的只读结论。"""
+        subagents = [
+            {"name": "planner", "description": "计划", "system_prompt": "p", "tools": []},
+            {"name": "coder", "description": "编码", "system_prompt": "c", "tools": []},
+            {"name": "reviewer", "description": "评审", "system_prompt": "r", "tools": []},
+        ]
+
+        text = _first_system_text(await _run("rework", subagents=subagents))
+
+        assert "## 本轮能力" in text
+        assert "`task`：有" in text
+        assert "planner / coder / reviewer" in text
+        assert "不要沿用上一轮" in text
+
+    async def test_analysis_capability_says_task_is_not_available(self):
+        text = _first_system_text(await _run("analysis"))
+
+        assert "`task`：没有" in text
+        assert "可派子智能体：无" in text
+
+    async def test_clarification_intent_injects_the_ask_block(self):
+        text = _first_system_text(
+            await _run(
+                "qa",
+                clarification={
+                    "confidence": 0.42,
+                    "candidates": [["plan", 0.42], ["coding", 0.31]],
+                },
+            )
+        )
+
+        assert "本轮先澄清意图" in text
+        assert "plan 0.42 / coding 0.31" in text
+        assert "不要直接执行" in text
+
+
+def test_clarification_block_ranks_candidates_and_forbids_execution():
+    text = clarification_block(
+        {
+            "confidence": 0.42,
+            "candidates": [("plan", 0.42), ("coding", 0.31), ("qa", 0.27)],
+        }
+    )
+
+    assert "判定置信度：0.42" in text
+    assert "plan 0.42 / coding 0.31 / qa 0.27" in text
+    assert "不要直接执行" in text
+    assert "<CLARIFY>" in text
+    assert '"options"' in text
+    assert "qa / analysis / plan / review / coding / rework" in text
+
+
+def test_no_clarification_means_no_block():
+    assert clarification_block(None) == ""
