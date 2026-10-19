@@ -19,7 +19,11 @@ from langchain_core.messages import AIMessage
 
 from ai_coding_harness.agent import profiles as profiles_module
 from ai_coding_harness.agent.graph import build_agent
-from ai_coding_harness.agent.middleware import BLOCKING_FORMS, REFRESH_FORMS
+from ai_coding_harness.agent.middleware import (
+    BLOCKING_FORMS,
+    REFRESH_FORMS,
+    DelegationGateMiddleware,
+)
 from ai_coding_harness.agent.profiles import FORM_ALIASES
 from ai_coding_harness.agent.prompts import (
     ANALYSIS_FORM,
@@ -207,6 +211,7 @@ class TestMainToolSubsets:
             "get_pr_info",
             "storePlan",
             "getPlan",
+            "planExists",
             "updatePlan",
             "updatePlanSteps",
             "deletePlan",
@@ -258,6 +263,7 @@ class TestMainToolSubsets:
             "comment_pr",
             "close_pr",
             "get_unexecuted_plan",
+            "planExists",
             "save_repo_memory",
         ]
 
@@ -268,9 +274,20 @@ class TestMainToolSubsets:
         ) == []
 
 
-def _fake_model_for(role: str) -> SimpleNamespace:
-    """假模型工厂：只把「为谁取的」记下来，不真建模型（本文件不关心模型怎么来的）。"""
-    return SimpleNamespace(role=role)
+class _RoleModel(GenericFakeChatModel):
+    """假模型：是**真的** ``BaseChatModel``，同时带着 ``role`` 让断言认得出「为谁取的」。
+
+    不能再用 ``SimpleNamespace``：子智能体装配会**真造**一份压缩中间件
+    （``agent/summarization.py``，2026-10-15 起我们自己构造那一份），而上游 ``__init__``
+    第一件事就是 ``model.with_retry()`` —— 假得太彻底就撑不到断言那一步。
+    """
+
+    role: str = ""
+
+
+def _fake_model_for(role: str) -> _RoleModel:
+    """假模型工厂：把「为谁取的」记在实例上（本文件不关心模型怎么来的）。"""
+    return _RoleModel(messages=iter([AIMessage(content="ok")]), role=role)
 
 
 class TestSubagentSubset:
@@ -300,6 +317,15 @@ class TestSubagentSubset:
         但装配层的能力不该跟着形态变。"""
         assert [s["name"] for s in self._specs("reviewer")] == ["reviewer"]
         assert [s["name"] for s in self._specs("planner")] == ["planner"]
+
+    def test_subagents_do_not_mount_the_delegation_gate(self):
+        """闸门只服务主控：子智能体没有 ``task`` 可调，挂上去只是多一层空包装。"""
+        specs = self._specs("planner", "coder", "reviewer")
+        assert not any(
+            isinstance(middleware, DelegationGateMiddleware)
+            for spec in specs
+            for middleware in spec["middleware"]
+        )
 
     def test_coding_mounts_three_in_table_order(self):
         """顺序跟 ``_ROLES`` 走（deepagents 照此写 `task` 的工具描述）。"""
@@ -606,39 +632,51 @@ class TestMainAgentModelFollowsForm:
         assert calls[0]["model"].role == profile.form
 
 
-class TestAgentCacheIsPerProfile:
-    """同一会话换意图 = 换一套装配，但 thread 不变（历史连续）。缓存键是形态名。"""
+class TestAgentsAreBuiltPerCall:
+    """**不缓存主智能体**（2026-10-14 用户口径：「每次都创建一个新的 agent」）。
 
-    def test_same_profile_is_built_once(self, monkeypatch):
+    模型与上下文窗口都是**建实例时读**的，缓存住之后在设置页改完要重启才生效；每轮现建
+    就是「改完立刻生效」的另一半。形态仍然决定装配（工具 / 子智能体 / 提示词），只是不再留着复用。
+    """
+
+    def test_every_call_builds_a_new_agent(self, monkeypatch):
         manager, calls = _manager(monkeypatch)
         runtime, session = _runtime(), _session()
         first = manager.get_agent(runtime, session, profiles_module.profile_for("plan"))
         second = manager.get_agent(runtime, session, profiles_module.profile_for("plan"))
-        assert first is second
-        assert len(calls) == 1
 
-    def test_cache_key_is_the_form(self, monkeypatch):
-        manager, _ = _manager(monkeypatch)
+        assert first is not second, "同一形态也现建：缓存住就换不动模型与窗口"
+        assert len(calls) == 2
+
+    def test_the_form_still_decides_the_assembly(self, monkeypatch):
+        """形态这根轴没变：六个意图里 rework 与 coding 共用一个形态，其余各一个。"""
+        manager, calls = _manager(monkeypatch)
         runtime, session = _runtime(), _session()
         for intent in ("qa", "analysis", "plan", "review", "coding", "rework"):
             manager.get_agent(runtime, session, profiles_module.profile_for(intent))
-        assert set(runtime.agents) == {
+
+        assert [call["model"].role for call in calls] == [
             QA_FORM,
             ANALYSIS_FORM,
             PLAN_FORM,
             REVIEW_FORM,
             ORCHESTRATE_FORM,
-        }
+            ORCHESTRATE_FORM,
+        ]
+        assert [call["system_prompt"] for call in calls] == [
+            build_main_prompt(session.repo_url, form=form)
+            for form in (QA_FORM, ANALYSIS_FORM, PLAN_FORM, REVIEW_FORM, ORCHESTRATE_FORM, ORCHESTRATE_FORM)
+        ]
 
-    def test_rework_and_coding_share_one_cached_agent(self, monkeypatch):
-        """同一个形态 ⇒ 同一个缓存键 ⇒ 同一份装配：rework 轮不会另建一个主智能体。"""
+    def test_rework_and_coding_use_the_same_assembly(self, monkeypatch):
+        """rework 就是 coding 形态：两次装配的形态一致（只是各建一份，不再共用一份实例）。"""
         manager, calls = _manager(monkeypatch)
         runtime, session = _runtime(), _session()
         coding = manager.get_agent(runtime, session, profiles_module.profile_for("coding"))
         rework = manager.get_agent(runtime, session, profiles_module.profile_for("rework"))
 
-        assert rework is coding
-        assert len(calls) == 1
+        assert coding is not rework
+        assert [call["model"].role for call in calls] == [ORCHESTRATE_FORM, ORCHESTRATE_FORM]
 
     def test_qa_and_analysis_each_get_their_own_agent(self, monkeypatch):
         """装配相同但提示词不同：共用一个键会让后一轮接到前一轮的角色段。"""
@@ -658,7 +696,7 @@ class TestAgentCacheIsPerProfile:
         readonly = manager.get_agent(runtime, session, profiles_module.profile_for("qa"))
         coding = manager.get_agent(runtime, session, profiles_module.profile_for("coding"))
         assert readonly is not coding
-        assert set(runtime.agents) == {QA_FORM, ORCHESTRATE_FORM}
+        assert [call["model"].role for call in calls] == [QA_FORM, ORCHESTRATE_FORM]
         assert len(calls) == 2
 
     def test_readonly_agent_gets_pr_read_tools_but_no_write_side(self, monkeypatch):

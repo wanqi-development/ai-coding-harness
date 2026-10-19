@@ -7,16 +7,22 @@
 - ``tool_integrity``：工具调用配对自洽 —— 空 id 归一、工具异常兜底、历史整表修复；
 - ``boundary``：按智能体的活动范围 —— 隐藏越界的工具、拦下越界的调用；
 - ``guard``：本轮空转刹车 —— 同一工具同一参数反复调用时先劝、再停；
+- ``delegation_gate``：主控的委派前置条件 —— 本轮没成功写过 ``write_todos`` 就不许
+  调用 ``task``；
 - ``memory``：仓库记忆 —— 每轮开始把它注入系统提示；plan / orchestrate 主控那份还按 Gitee
   的真实 PR 状态先对账，再按**本轮意图**判闸门（plan / coding 有未合入的 PR 就拦，rework
   反过来：没有待合并的 PR 才拦）；
 - ``fallback``：主导模型彻底失败时切兜底，并留一条 ``MODEL_FALLBACK`` 的痕。
+- ``stream_usage``：流式响应也要 token 用量；网关不认 ``stream_options`` 时按地址自动降级。
+- ``context_trim``：压缩线处的**应急裁剪**辅助函数（保留当前步骤 + 模型工作笔记
+  ``KEEP:`` 点名的结果，**只改这一次请求**）；真正的挂载与判断在
+  ``agent/summarization.py``。
 
 这里只做重新导出，装配点（``graph.py`` / ``subagents.py``）从这里拿类并实例化。
 中间件是 ``AgentMiddleware`` 子类，实例无状态，每次构建新实例即可 —— 例外是
 ``BoundaryMiddleware``、``FallbackMiddleware`` 与 ``MemoryMiddleware``：前者持有该智能体的
 策略、中者持有该角色的角色名与兜底模型、后者按轮暂存要注入的记忆块，所以这三类
-**每个角色要各 new 一个**。
+**每个角色要各 new 一个**。``HarnessSummarizationMiddleware`` 同理（它持有日志要用的角色标注）。
 """
 
 from __future__ import annotations
@@ -27,6 +33,12 @@ from ai_coding_harness.agent.middleware.context_inject import (
     current_time_block,
     now_stamp,
 )
+from ai_coding_harness.agent.middleware.context_trim import (
+    PRETRIM_KEEP_RECENT_TOOL_RESULTS,
+    keep_items_from_messages,
+    pretrim_tool_results,
+)
+from ai_coding_harness.agent.middleware.delegation_gate import DelegationGateMiddleware
 from ai_coding_harness.agent.middleware.fallback import (
     FALLBACK_LOG_TAG,
     FallbackMiddleware,
@@ -56,6 +68,10 @@ from ai_coding_harness.agent.middleware.redaction import (
     ModelRedactionMiddleware,
     RedactionMiddleware,
 )
+from ai_coding_harness.agent.middleware.stream_usage import (
+    STREAM_USAGE_LOG_TAG,
+    StreamUsageMiddleware,
+)
 from ai_coding_harness.agent.middleware.tool_integrity import (
     HistoryRepairMiddleware,
     ToolCallIdMiddleware,
@@ -73,8 +89,11 @@ __all__ = [
     "MEMORY_BLOCK_TITLE",
     "NOTHING_TO_FIX_MARKER",
     "NO_TARGET_ABORT_REASON",
+    "PRETRIM_KEEP_RECENT_TOOL_RESULTS",
     "REFRESH_FORMS",
+    "STREAM_USAGE_LOG_TAG",
     "BoundaryMiddleware",
+    "DelegationGateMiddleware",
     "FallbackMiddleware",
     "HistoryRepairMiddleware",
     "IntentMiddleware",
@@ -83,12 +102,15 @@ __all__ = [
     "ModelRedactionMiddleware",
     "RedactionMiddleware",
     "Refreshed",
+    "StreamUsageMiddleware",
     "ToolCallIdMiddleware",
     "ToolErrorGuardMiddleware",
     "TurnState",
     "TurnStop",
     "build_memory_middleware",
     "current_time_block",
+    "keep_items_from_messages",
     "now_stamp",
+    "pretrim_tool_results",
     "refresh_memory",
 ]
