@@ -160,9 +160,9 @@
 
 ## 三、更早的遗留（跨批沿用，未动）
 
-- **前端登录入口未接**：Gitee / GitHub 的 OAuth 后端都已就绪（`/auth/gitee/*`、
-  `/auth/github/*`），前端还没接；眼下实际用的是 `.env` 里的 `GITEE_ACCESS_TOKEN` /
-  `GITHUB_ACCESS_TOKEN`（见 `README.md` 与 CHANGELOG）。
+- ~~**前端登录入口未接**~~：已作废 —— 2026-10-20 用户口径「取消授权登录」，OAuth 那套
+  （`/auth/*`、`*_OAUTH_*` 六个键、`tests/test_auth_routes.py`）整块删掉；令牌与 git
+  用户名改成设置页「代码平台」那一栏配置项（`app_settings` + `RUNTIME_SETTINGS`）。
 - **沙箱测试数据的配置外置**：曾做过 `.env.sandbox.d/<owner>__<repo>.env`，按用户口径
   **回退**（那是用户的测试库与测试数据，不该由平台维护、更不该进代码仓）。方向是
   「放远端配置中心、平台去拉」；Nacos 作为候选已确认 Python / Go / JS-TS 都有客户端，

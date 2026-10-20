@@ -71,6 +71,33 @@
 - **遗留**：改版之前的历史记录里 `context` 仍是峰值口径（`max_input`）；环图对老记录
   按原样显示，不重算。
 
+#### 代码平台令牌进配置，取消 OAuth 登录
+
+- **动机**：OAuth 登录后端做完之后前端一直没接，令牌散在 `.env` 里、改一次要重启；
+  改为**配置项**并**取消授权登录**。
+- **改动**：
+  - `config.RUNTIME_SETTINGS` 新增「代码平台」一组四格：`gitee_access_token` /
+    `gitee_username` / `github_access_token` / `github_username`；`RuntimeSetting.kind`
+    新增 `secret`（与 `str` 同型，只是接口层按凭据对待）。
+  - `api/routes/app_settings.py`：`secret` 的读取口径 —— **打开设置页回掩码**、
+    **保存之后的响应不再回显**（`value` 空、只带 `has_value`）；提交值等于当前掩码＝
+    不改，删空再保存＝清除。打码函数收敛到 `safety/redact.mask_secret`。
+  - 删除：`api/routes/auth.py`、`tests/test_auth_routes.py`、`config.py` 六个
+    `*_oauth_*` 字段、`.env.example` 的两段 OAuth 说明、`vite.config.ts` 的 `/auth` 代理。
+  - `create_session` 不再接受请求级令牌，统一取 `Settings.token_for` / `username_for`；
+    两家令牌进脱敏词表（`Settings.code_platform_secret_values`）。
+  - 前端设置页：`secret` 用密码框、未配置/已配置走占位提示；保存后用 **PUT 的响应**
+    铺界面（不再顺手 GET 一次 —— 那会把掩码又摆回来）。
+- **关键决策**：
+  - 令牌在**建会话那一刻**快照进库，改配置只影响之后新建的会话；`sessions.gitee_token`
+    那一列保留，不做迁移。
+  - `git 用户名` 一并进配置：OAuth 删掉之后没有「自动 oauth2」那条路，PAT 场景必须能填
+    真实用户名，否则 Gitee 认证会失败。
+- **验证**：`tests/test_app_settings.py`、`tests/test_session_reuse.py` 全过；
+  `npm --prefix frontend run build` 通过。
+- **遗留**：`sessions.gitee_token` / `gitee_username` 两列的名字仍按 Gitee 命名（实际也存
+  GitHub 的），改名要迁移，暂不动。
+
 #### 第二批：三个大文件按功能拆包
 
 - **动机**：第一层只整理了目录；三个核心文件仍然过长（`db/dao.py` 703 行、

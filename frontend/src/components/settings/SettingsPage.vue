@@ -113,15 +113,24 @@ function runtimeValue(item: RuntimeSettingItem): string {
 
 async function loadRuntime() {
   try {
-    const fresh = await getAppSettings()
-    appSettings.value = fresh
-    // 草稿在加载时就填好（不在渲染里写状态：那是渲染期的副作用）
-    runtimeDrafts.value = Object.fromEntries(
-      fresh.items.map((item) => [item.key, item.value === null ? '' : String(item.value)]),
-    )
+    applySnapshot(await getAppSettings())
   } catch (e: any) {
     error.value = e?.message ?? '读取失败'
   }
+}
+
+/**
+ * 把一份快照铺到界面：草稿在这里一次填好（不在渲染里写状态：那是渲染期的副作用）。
+ *
+ * **保存后的响应也要走这里，而不是再 GET 一次** —— 令牌那几格的口径是「只有打开设置页时
+ * 回掩码，保存之后不再回显」（用户口径 2026-10-20）：PUT 的响应里 `value` 就是空串，
+ * 再 GET 一遍会把掩码又摆回来。
+ */
+function applySnapshot(fresh: RuntimeSettingsSnapshot) {
+  appSettings.value = fresh
+  runtimeDrafts.value = Object.fromEntries(
+    fresh.items.map((item) => [item.key, item.value === null ? '' : String(item.value)]),
+  )
 }
 
 /** 只提交**改过**的键（与模型配置那栏同一口径：不传＝不改）。 */
@@ -142,8 +151,7 @@ async function saveRuntime() {
   error.value = ''
   notice.value = ''
   try {
-    appSettings.value = await putAppSettings(changed)
-    await loadRuntime()
+    applySnapshot(await putAppSettings(changed))
     notice.value = '已保存，立刻生效。'
   } catch (e: any) {
     error.value = e?.message ?? '保存失败'
@@ -704,7 +712,16 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                 </span>
                 <input
                   class="input set-control"
-                  :class="item.kind === 'str' ? 'input-wide' : 'input-num'"
+                  :class="item.kind === 'int' || item.kind === 'float' ? 'input-num' : 'input-wide'"
+                  :type="item.kind === 'secret' ? 'password' : 'text'"
+                  :placeholder="
+                    item.kind === 'secret'
+                      ? item.has_value
+                        ? '已配置（不动就留空；把掩码删空再保存＝清除）'
+                        : '未配置'
+                      : ''
+                  "
+                  autocomplete="off"
                   :value="runtimeValue(item)"
                   @input="runtimeDrafts[item.key] = ($event.target as HTMLInputElement).value"
                 />

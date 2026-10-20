@@ -601,8 +601,10 @@ export interface RuntimeSettingItem {
   label: string
   group: string
   /** 值的类型：界面据此选输入框与校验 */
-  kind: 'str' | 'int' | 'float' | string
+  kind: 'str' | 'int' | 'float' | 'secret' | string
   value: string | number | null
+  /** 这一格是否已配置值（仅 secret 有意义：保存之后 value 为空、靠它说「配过了」） */
+  has_value?: boolean
   source: string
 }
 
