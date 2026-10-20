@@ -20,6 +20,7 @@ from ai_coding_harness.agent.middleware import (
     LoopGuardMiddleware,
     MemoryMiddleware,
     ModelRedactionMiddleware,
+    ReadGuardMiddleware,
     RedactionMiddleware,
     StreamUsageMiddleware,
     ToolCallIdMiddleware,
@@ -114,6 +115,8 @@ def build_subagents(
                     BoundaryMiddleware(policies[role], safety),
                     # 各角色一份新实例：它们可能在同一回合里并发跑（见上面的 ``memory_factory``）
                     *([memory_factory()] if memory_factory is not None else []),
+                    # 读文件红线：policies / project 不许整文件读（与主控同一份规则）
+                    ReadGuardMiddleware(),
                     # 循环守卫按角色分账（``agent=role``）：``TurnState`` 是每轮一份、经
                     # configurable 注入的，而上游会把它原样传进子智能体 —— 不署名的话三个
                     # 角色与主控共用一本账，一个角色用满额度，下一个角色第一次调用就被中止

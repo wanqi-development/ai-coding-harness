@@ -28,6 +28,7 @@ from ai_coding_harness.agent.middleware import (
     LoopGuardMiddleware,
     MemoryMiddleware,
     ModelRedactionMiddleware,
+    ReadGuardMiddleware,
     RedactionMiddleware,
     StreamUsageMiddleware,
     ToolCallIdMiddleware,
@@ -111,6 +112,9 @@ def build_agent(
             # 紧接着的这块答的是「本轮看不看得到仓库记忆」：闸门那条路在 before_agent
             # 就抛 TurnStop 结束本轮，它一响，下面这些中间件与模型都不会被碰到
             *([memory] if memory is not None else []),
+            # 读文件红线：policies / project 不许整文件读。放在委派闸门与循环计数外侧，
+            # 被它拦下的调用不占重复额度。
+            ReadGuardMiddleware(),
             # 主控派子智能体之前必须先落一份清单。放在循环计数外侧：被它拦下的 `task`
             # 不该占重复额度，补完 `write_todos` 后第一次派发仍是第 1 次
             DelegationGateMiddleware(),

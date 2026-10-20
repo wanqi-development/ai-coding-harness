@@ -117,9 +117,6 @@ class TurnState:
         #: 没有它就拒绝交接：拿关键字口径去猜，正是要纠正的那个错。
         self.rejudge = rejudge
         self._counts: dict[str, int] = {}
-        #: 本轮**成功执行过**的工具（按角色分账）；``delegation_gate`` 只认这个，
-        #: 不认“调用过”。
-        self._successful_tools: dict[str, set[str]] = {}
         self._handoffs = 0
         #: 被守卫记下的中止（守卫抛出的那个异常对象本身）。service 层在流结束后再看一眼：
         #: 万一某层把异常吃成了 ToolMessage，这一轮也得落下来。
@@ -142,13 +139,6 @@ class TurnState:
         count = self._counts.get(key, 0) + 1
         self._counts[key] = count
         return count
-
-    def mark_tool_success(self, name: str, agent: str = "") -> None:
-        """记一次**成功**的工具执行；``delegation_gate`` 用这个而不是 ``note_call``。"""
-        self._successful_tools.setdefault(agent, set()).add(name)
-
-    def has_successful_tool(self, name: str, agent: str = "") -> bool:
-        return name in self._successful_tools.get(agent, set())
 
     def abort(self, name: str, count: int) -> TurnStop:
         """记下中止并返回异常对象，由守卫抛出。"""

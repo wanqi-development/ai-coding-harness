@@ -23,6 +23,7 @@ from ai_coding_harness.agent.middleware import (
     BLOCKING_FORMS,
     REFRESH_FORMS,
     DelegationGateMiddleware,
+    ReadGuardMiddleware,
 )
 from ai_coding_harness.agent.profiles import FORM_ALIASES
 from ai_coding_harness.agent.prompts import (
@@ -325,6 +326,14 @@ class TestSubagentSubset:
             isinstance(middleware, DelegationGateMiddleware)
             for spec in specs
             for middleware in spec["middleware"]
+        )
+
+    def test_every_subagent_mounts_the_read_guard(self):
+        """读文件红线对三个角色都生效（它们才是读码的大头）。"""
+        specs = self._specs("planner", "coder", "reviewer")
+        assert all(
+            any(isinstance(middleware, ReadGuardMiddleware) for middleware in spec["middleware"])
+            for spec in specs
         )
 
     def test_coding_mounts_three_in_table_order(self):
