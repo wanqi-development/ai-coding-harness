@@ -56,7 +56,7 @@ _MAIN_NAMES = frozenset({MAIN_AGENT, MAIN_AGENT_NAME})
 #: 「主控」名下会把这笔开销藏起来 —— 实测单次就是 7 万~8 万输入 tokens。
 INTERNAL_ACTOR = "internal"
 
-#: 意图分类那次调用的归类名。它跑在事件流之外（``server/service.py`` 直接调），
+#: 意图分类那次调用的归类名。它跑在事件流之外（``server/turn/intent.py`` 直接调），
 #: 用量由 service 并进同一份账，所以归类名在这里定义、两处共用。
 INTENT_ACTOR = "intent"
 

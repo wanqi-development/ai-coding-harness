@@ -697,7 +697,7 @@ class TestThroughTheGraph:
         assert caught.value.marker.startswith(GATE_MARKER)
 
 
-# -- 轮末打底（``server/service.py``）---------------------------------------
+# -- 轮末打底（``server/turn/records.py``）---------------------------------
 
 
 class _FakeDb:
@@ -735,7 +735,7 @@ def _patch_pr_client(monkeypatch, *, pulls=(), error: Exception | None = None) -
             return list(pulls)
 
     monkeypatch.setattr(
-        service_mod, "build_git_client", lambda *a, **k: _Client(*a, **k)
+        service_mod.turn_records, "build_git_client", lambda *a, **k: _Client(*a, **k)
     )
     return calls
 

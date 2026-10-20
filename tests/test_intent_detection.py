@@ -681,7 +681,7 @@ class TestServiceWiring:
         它们只该各跑一次，且吃的是同一份历史。
         """
         model = _FakeClassifier(reply="coding\n接着上一轮的方案")
-        monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
+        monkeypatch.setattr(service_mod.turn_intent, "build_classifier_model", lambda settings: model)
 
         seen: dict[str, Any] = {}
 
@@ -789,7 +789,7 @@ class TestServiceWiring:
 
     async def test_the_detection_carries_it_into_the_classifier_prompt(self, monkeypatch):
         model = _FakeClassifier(reply="plan\n他在回答上一轮的反问")
-        monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
+        monkeypatch.setattr(service_mod.turn_intent, "build_classifier_model", lambda settings: model)
         svc = service_mod.HarnessService(
             settings=Settings(intent_mode="llm", intent_history_turns=4),
             manager=None,  # type: ignore[arg-type]
@@ -805,7 +805,7 @@ class TestServiceWiring:
         之后（``chat()`` 用 ``functools.partial`` 就是这么塞进 ``TurnState`` 的），
         仍然按两个参数调用，且重判同样看得到上一轮那句反问。"""
         model = _FakeClassifier(reply="plan\n他在回答上一轮的反问")
-        monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
+        monkeypatch.setattr(service_mod.turn_intent, "build_classifier_model", lambda settings: model)
         svc = service_mod.HarnessService(
             settings=Settings(intent_mode="llm", intent_history_turns=0),
             manager=None,  # type: ignore[arg-type]
@@ -820,7 +820,7 @@ class TestServiceWiring:
 
     async def test_disabled_switch_skips_the_model(self, monkeypatch):
         model = _FakeClassifier(reply="coding")
-        monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
+        monkeypatch.setattr(service_mod.turn_intent, "build_classifier_model", lambda settings: model)
 
         svc = service_mod.HarnessService(
             settings=Settings(intent_mode="llm", intent_llm_enabled=False, intent_history_turns=0),
@@ -839,7 +839,7 @@ class TestServiceWiring:
         任何意义，形态也永远换不掉。
         """
         model = _FakeClassifier(reply="plan\n他要的是方案，不是改代码")
-        monkeypatch.setattr(service_mod, "build_classifier_model", lambda settings: model)
+        monkeypatch.setattr(service_mod.turn_intent, "build_classifier_model", lambda settings: model)
 
         svc = service_mod.HarnessService(
             settings=Settings(intent_mode="llm", intent_history_turns=0),

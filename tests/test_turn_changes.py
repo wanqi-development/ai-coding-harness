@@ -136,7 +136,7 @@ class TestCollectingTheChanges:
     async def test_the_file_list_is_capped(self, monkeypatch):
         """一轮改上百个文件更像事故：只列前 N 个，另带总数。"""
         monkeypatch.setattr(service_mod.repo_cache, "is_cloned", lambda *a: True)
-        monkeypatch.setattr(service_mod, "_CHANGES_MAX_FILES", 2)
+        monkeypatch.setattr(service_mod.turn_changes, "_CHANGES_MAX_FILES", 2)
 
         async def fake_compare(settings, spec, *, base, head):
             return [_change(f"f{i}.py") for i in range(5)]
