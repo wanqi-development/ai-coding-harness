@@ -913,9 +913,11 @@ class TestReadonlyBoundarySplitsTheTwoCases:
 
         「只有只读工具」这句不能再写 —— `analysis` 保留了 `/ai_coding/tmp/` 的写根，
         手里确实有 `write_file` / `edit_file`，说「只有只读工具」是句假话。
+        2026-10-20 起边界从「不与仓库发生写入」改成「不修改仓库里的代码」：
+        跑测试 / 构建是允许的，写源码仍然不行。
         """
         for prompt in (QA_AGENT_PROMPT, ANALYSIS_AGENT_PROMPT):
-            assert "不与仓库发生写入" in prompt
+            assert "不修改仓库里的代码" in prompt
             assert "没有 `task`" in prompt
             assert "只有只读工具" not in prompt
 
@@ -1042,6 +1044,25 @@ class TestSkillRulesBelongToTheFormThatDoesTheWork:
         assert "coding-requirement-completer" not in MAIN_AGENT_PROMPT
         assert "有歧义就别猜" in MAIN_AGENT_PROMPT
 
+class TestVerificationForReadOnlyForms:
+    """2026-10-20 用户口径：qa / analysis 允许跑测试拿结果，但仍不许改任务代码。"""
+
+    def test_both_forms_can_run_tests(self):
+        for name, prompt in (
+            ("qa", QA_AGENT_PROMPT),
+            ("analysis", ANALYSIS_AGENT_PROMPT),
+        ):
+            assert "可以执行验证" in prompt, name
+            assert "npm ci" in prompt and "/tmp" in prompt, name
+            assert "不许改任务代码" in prompt, name
+
+    def test_the_install_has_to_land_in_tmp(self):
+        """装依赖允许，但要在副本里装：项目目录不留 node_modules / lockfile 改动。"""
+        assert "`cp -a /ai_coding/project /tmp/verify-<repo>`" in QA_AGENT_PROMPT
+        assert "不要往 `/ai_coding/project` 里装" in ANALYSIS_AGENT_PROMPT
+
+    def test_the_coding_prompt_does_not_carry_the_readonly_boundary(self):
+        assert "可以执行验证" not in MAIN_AGENT_PROMPT
 
 class TestGitWriteCommandsOnlyReachTheCoder:
     """``GIT_PROMPT`` 原来把 clone / 建分支 / commit / push 的写法放在写侧共用段里，
