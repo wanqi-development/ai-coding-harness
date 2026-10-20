@@ -413,8 +413,8 @@ class SessionManager:
                 if (fb := self._fallback_middleware(role, role)) is not None
             },
             # 子智能体也各挂一份记忆中间件（每次调用现给一个实例：它们可能并发跑）
-            memory_factory=lambda: build_memory_middleware(
-                self._settings, session.repo, runtime.backend
+            memory_factory=lambda role: build_memory_middleware(
+                self._settings, session.repo, runtime.backend, role=role
             ),
             # 压缩（含压缩线处的应急裁剪）：每个角色按**它自己那个模型**的窗口算触发线。
             # 上游那份已在 ``agent/graph.py`` 里按类排掉，所以这里不给就是「这个角色不压缩」

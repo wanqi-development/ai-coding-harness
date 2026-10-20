@@ -481,7 +481,8 @@ class TestMainPromptForms:
         assert "**本轮不落沙箱文件**" in prompt
         assert "写文件的工具已撤掉" in prompt
         assert "**只有方案那一处**" in prompt
-        assert "save_repo_memory" not in prompt
+        # 基础规则里会提到记忆工具（那是共用段），但本轮指令必须明说「不写」
+        assert "不写仓库记忆" in prompt
         assert "（分析产物）可写" not in prompt
         assert "除了这一个目录，出方案阶段不落任何文件" not in prompt
 
@@ -499,8 +500,8 @@ class TestMainPromptForms:
         assert "收尾时写回仓库记忆" in prompt, "review 轮的写回职责要写在角色段里"
 
     def test_the_reviewer_subagent_keeps_the_memory_read_only(self):
-        """写回是主控的事：reviewer 子智能体那份仍是只读（它没有 save_repo_memory）。"""
-        assert "仓库记忆只读" in REVIEWER_PROMPT
+        """2026-10-20 起 reviewer 干脆不注入记忆：审 diff + policies 就够。"""
+        assert "本轮不注入仓库记忆" in REVIEWER_PROMPT
 
     def test_the_shared_directory_table_points_at_the_per_form_list(self):
         """共用段不再逐目录声称「可写」：那是按形态给的，写错模型就去写一个会被拒的目录。"""

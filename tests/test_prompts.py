@@ -566,7 +566,7 @@ class TestMemoryWritebackGate:
         """
         for intent in ("coding", "review", "rework"):
             directive = intent_directive(intent)
-            assert "开工前平台已经替你核过" in directive
+            assert "开工前平台已经核过" in directive
             assert "不要自己再查一遍" in directive
             assert "不要对用户断言「仓库没有未合并的 PR」" in directive
 
@@ -575,7 +575,7 @@ class TestMemoryWritebackGate:
         for intent in ("coding", "review", "rework"):
             directive = intent_directive(intent)
             assert "文件头" in directive and "盖章" in directive
-            assert "**状态**" in directive, "状态那一格归平台改（2026-09-26 起）"
+            assert "状态" in directive, "状态那一格归平台改（2026-09-26 起）"
             assert "需求列表" not in directive
 
     def test_the_unfinished_features_are_asked_for(self):
@@ -584,20 +584,22 @@ class TestMemoryWritebackGate:
             directive = intent_directive(intent)
             assert "未完成的功能" in directive
             assert "按模块" in directive
-        assert "「当前缺口」更新成**按模块列出所有未完成的功能**" in intent_directive("coding")
+        assert 'section="gaps"' in intent_directive("coding")
 
     def test_the_changelog_entry_carries_the_pr_status(self):
         """变更记录每条要写 PR 与**状态**（写回时一律「待合并」，之后人工改）。
 
         2026-09-26 的用户口径：写码与提 PR 是同一条流程，一轮改动一定带着一个 PR ——
-        所以提示词里既要有「状态先填待合并」，也要有「PR 没建成时不写这条变更记录」。
+        2026-10-20 起改成按节增量写：状态与条数由平台的工具负责，提示词只交代
+        「用 `section="change"` 追加」与「PR 没建成时不写」。
         """
         for intent in ("coding", "review", "rework"):
             directive = intent_directive(intent)
-            assert "状态一律先填「待合并」" in directive, intent
+            assert 'section="change"' in directive, intent
             assert "PR 没建成" in directive, intent
         # 同一件事在基础提示词的「仓库记忆文件规则」里也要说（子智能体读的是那一份）
-        assert "写回时一律填「待合并」" in BASE_PROMPT
+        assert 'section="change"' in BASE_PROMPT
+        assert "只留最近 8 条" in BASE_PROMPT
         assert "没有 PR" not in BASE_PROMPT
 
     def test_the_pr_number_must_come_from_this_rounds_receipt(self):
@@ -612,7 +614,7 @@ class TestMemoryWritebackGate:
             directive = intent_directive(intent)
             assert "create_pr" in directive and "回执" in directive, intent
             assert "不许凭印象编号" in directive, intent
-            assert "收尾自检：本轮的 PR 必须落到「变更记录」里" in directive, intent
+            assert "收尾自检" in directive and "没有对应条目" in directive, intent
 
     def test_refreshing_memory_rides_on_the_analysis_round(self):
         """用户点名刷新记忆：**不新开意图**，就在 analysis 里 —— 拉列表 → 补缺 → 写回 → 给账。
@@ -643,17 +645,17 @@ class TestMemoryWritebackGate:
         assert "不要写仓库记忆" in CODER_PROMPT
 
     def test_memory_is_written_at_most_once_per_round(self):
-        """写回是整篇覆盖，一轮里反复微调等于反复全量写盘（实测多写了 3 次）。"""
+        """一轮里反复微调等于反复写盘（实测多写了 3 次）。"""
         for intent in ("coding", "review", "rework", "analysis"):
             directive = intent_directive(intent)
-            assert "本轮只写一次" in directive
-            assert "不要为措辞、空格、排版微调反复写回" in directive
+            assert "不要为措辞反复写" in directive or "每轮最多写一次" in directive
 
-    def test_the_block_is_claimed_to_exist_for_every_agent(self):
-        """这段曾经写反过：旧措辞谎称记忆「由运行时注入」，模型据此以为读不到就不读了。
-        注入现在是真的，措辞也必须说全 —— 只说「某些形态有」，其余形态的模型就会白读一遍文件。"""
+    def test_the_block_is_scoped_by_form(self):
+        """2026-10-20：注入按形态分档，提示词必须说清哪档有、哪档没有。"""
         assert "由运行时注入" not in BASE_PROMPT
-        assert "**每个智能体、每个形态**每轮开始时" in BASE_PROMPT
+        assert "按形态分档" in BASE_PROMPT
+        assert "qa / analysis 注入全文" in BASE_PROMPT
+        assert "review 主控与 reviewer 子智能体一律不注入" in BASE_PROMPT
         assert "不要再 `read_file` 读它" in BASE_PROMPT
 
     def test_subagents_are_told_not_to_reread_the_memory(self):

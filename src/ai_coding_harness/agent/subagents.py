@@ -56,7 +56,7 @@ def build_subagents(
     policies: Mapping[str, AgentPolicy],
     safety: CommandSafety | None = None,
     fallbacks: Mapping[str, FallbackMiddleware] | None = None,
-    memory_factory: Callable[[], MemoryMiddleware] | None = None,
+    memory_factory: Callable[[str], MemoryMiddleware] | None = None,
     summarization_for: Callable[[str, BaseChatModel], AgentMiddleware | None] | None = None,
 ) -> list[SubAgent]:
     """按角色装配子智能体：只产出 ``tools_by_role`` 里给了条目（含空表）的角色。
@@ -114,7 +114,7 @@ def build_subagents(
                     # 与主控同序：边界在最外侧，记忆紧随其后
                     BoundaryMiddleware(policies[role], safety),
                     # 各角色一份新实例：它们可能在同一回合里并发跑（见上面的 ``memory_factory``）
-                    *([memory_factory()] if memory_factory is not None else []),
+                    *([memory_factory(role)] if memory_factory is not None else []),
                     # 读文件红线：policies / project 不许整文件读（与主控同一份规则）
                     ReadGuardMiddleware(),
                     # 循环守卫按角色分账（``agent=role``）：``TurnState`` 是每轮一份、经

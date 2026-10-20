@@ -60,9 +60,15 @@
 - **沙箱资产建会话时整棵推入**：`sandbox/policies`、`sandbox/skills`、`sandbox/maven`、
   `sandbox/deploy/sandbox/*` 改完要**新建会话**才保证生效。脚本类的资产有编码要求：
   `start.bat` 是 **GBK**，改动必须保住原编码，不能拿 UTF-8 直接覆盖（否则中文乱码）。
-- **仓库记忆的写入口径**：平台只维护文件头（`最后更新` / `最近 PR`）并摘掉老模板的
-  「需求列表」「功能列表」两张表；正文只在 **coding 与 review 的收尾**由主控写；
-  `plan` 形态与三个子智能体都不写记忆。
+- **仓库记忆的写入口径**（2026-10-20 起是**按节增量写**）：`save_repo_memory(section, payload)`
+  只收 `change` / `gaps` / `decisions` / `basic` 四节，平台负责合并、去重、渲染与限长
+  （基本信息 2000 / 缺口 1500 / 长期约束 1500 / 全文 6000 字，变更记录只留最近 8 条）。
+  **整篇覆盖写已经取消**；模型往「基本信息」塞本次改动会被白名单拒掉。
+  平台维护文件头（最后更新 / 最近 PR）、PR 状态格，并摘掉老模板的两张表。
+  正文只在 **coding / review / analysis 的收尾**由主控写；`plan` 与三个子智能体都不写。
+  **注入按形态分档**（`memory_sections_for`）：qa / analysis 全文；coding / plan 主控与
+  planner / coder 只给「基本信息 + 当前缺口 + 长期约束」；review 主控与 reviewer 子智能体
+  **不注入**（`MemoryMiddleware(sections=())`，连读都不读）。
 - **拦截一律是代码拦，不是提示词**：`BoundaryMiddleware` 管「这个角色能用哪些工具、能写哪些
   目录」，`MemoryMiddleware` 管「仓库还有 open PR 就拦下 plan / orchestrate」（review **不**拦：
   它要审的那个 PR 本身就是 open 的），`LoopGuardMiddleware` 管空转。提示词只做前置劝阻。

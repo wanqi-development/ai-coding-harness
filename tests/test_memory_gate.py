@@ -50,9 +50,13 @@ from ai_coding_harness.agent.middleware import (
     TurnStop,
     build_memory_middleware,
 )
+from ai_coding_harness.agent.middleware.memory_sections import DIGEST_KEYS
 from ai_coding_harness.agent.profiles import (
+    ANALYSIS_FORM,
     ORCHESTRATE_FORM,
     PLAN_FORM,
+    QA_FORM,
+    REVIEW_FORM,
 )
 from ai_coding_harness.agent.subagents import build_subagents
 from ai_coding_harness.backends.composite import memory_path
@@ -500,7 +504,7 @@ class TestTheAssemblyPoint:
         """子智能体各拿一份新实例：同一回合它们可能并发跑，共用一个会互相覆盖注入块。"""
         made: list[MemoryMiddleware] = []
 
-        def factory() -> MemoryMiddleware:
+        def factory(role: str) -> MemoryMiddleware:
             made.append(_injector(_Backend(STALE)))
             return made[-1]
 
@@ -520,6 +524,69 @@ class TestTheAssemblyPoint:
         assert len(memories) == 2, "两个角色各挂一个"
         assert memories[0] is not memories[1], "不能共用同一个实例"
         assert memories[0]._all_prs is None, "子智能体这份不查 PR"
+
+
+class TestInjectionScope:
+    """2026-10-20 用户口径：qa / analysis 全文；coding / plan / planner / coder 节选；
+    review 主控与 reviewer 子智能体**一律不注入**。"""
+
+    FULL = """# 仓库记忆：acme/demo
+
+> 最后更新：2026-10-19 08:00　｜　最近 PR：#12
+
+## 一、仓库基本信息
+- **技术栈**：Java 21
+
+## 二、变更记录（最新在上）
+### 2026-10-19 · 新增 · 商品列表分页
+- **PR**：#12　｜　**状态**：待合并
+
+## 三、当前缺口（按模块）
+- **订单**：退款未实现
+
+## 四、长期约束
+- **约束**：不引入新依赖　｜　**原因**：沙箱离线　｜　**影响**：新增依赖先问
+"""
+
+    @pytest.mark.parametrize("form", [QA_FORM, ANALYSIS_FORM])
+    def test_qa_and_analysis_get_the_full_text(self, form):
+        middleware = build_memory_middleware(Settings(), REPO, _Backend(self.FULL), form)
+        assert middleware._sections is None
+
+    @pytest.mark.parametrize("form", [ORCHESTRATE_FORM, PLAN_FORM])
+    def test_coding_and_plan_get_the_digest(self, form):
+        middleware = build_memory_middleware(Settings(), REPO, _Backend(self.FULL), form)
+        assert middleware._sections == DIGEST_KEYS
+
+    @pytest.mark.parametrize("role", ["planner", "coder"])
+    def test_planner_and_coder_get_the_digest(self, role):
+        middleware = build_memory_middleware(Settings(), REPO, _Backend(self.FULL), role=role)
+        assert middleware._sections == DIGEST_KEYS
+
+    @pytest.mark.parametrize(
+        "kwargs", [{"form": REVIEW_FORM}, {"role": "reviewer"}]
+    )
+    async def test_review_is_never_injected(self, kwargs):
+        middleware = build_memory_middleware(Settings(), REPO, _Backend(self.FULL), **kwargs)
+        assert middleware._sections == ()
+        await middleware.abefore_agent(None, None)
+        assert middleware._memory is None
+        assert await _system_text(middleware, base="SYS") == "SYS"
+
+    async def test_the_digest_keeps_the_three_sections_and_drops_the_changelog(self):
+        # 直接造只读那一档：这里测的是「按节裁」，不测刷新（刷新要真 Gitee）
+        middleware = MemoryMiddleware(
+            backend=_Backend(self.FULL), path=PATH, sections=DIGEST_KEYS
+        )
+        await middleware.abefore_agent(None, None)
+        text = await _system_text(middleware)
+
+        assert "## 一、仓库基本信息" in text
+        assert "## 三、当前缺口" in text
+        assert "## 四、长期约束" in text
+        assert "商品列表分页" not in text, "变更记录不该进节选"
+        assert "### 2026-10-19" not in text
+        assert "变更记录没有注入" in text, "要说明这是节选，不是历史丢了"
 
 
 # -- 穿出图 ----------------------------------------------------------------

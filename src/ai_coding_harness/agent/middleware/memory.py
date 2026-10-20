@@ -79,6 +79,7 @@ from ai_coding_harness.agent.middleware.memory_reconcile import (
     reconcile,
     rows_to_verify,
 )
+from ai_coding_harness.agent.middleware.memory_sections import DIGEST_KEYS, digest
 from ai_coding_harness.agent.profiles import (
     ANALYSIS_FORM,
     ORCHESTRATE_FORM,
@@ -182,7 +183,17 @@ def _memory_block(path: str, text: str) -> str:
     return (
         f"{MEMORY_BLOCK_TITLE}\n"
         f"下面是 `{path}` 的当前全文 —— **不要再用 `read_file` 读它**，也不必读第二遍：\n"
-        "需要写回时直接以这份为底合并（`save_repo_memory` 是覆盖写）。\n\n"
+        "写回按本轮意图指令走：**按节增量写，不要整篇提交**。\n\n"
+        f"{text}"
+    )
+
+
+def _digest_block(path: str, text: str) -> str:
+    """精简注入块：说清「这是节选、不是没有历史」。"""
+    return (
+        f"{MEMORY_BLOCK_TITLE}\n"
+        f"下面是 `{path}` 的**按角色节选**（不是全文）—— **不要再用 `read_file` 读它**。\n"
+        "变更记录没有注入；需要历史时把问题回报主控，由主控查 PR。\n\n"
         f"{text}"
     )
 
@@ -290,6 +301,7 @@ class MemoryMiddleware(AgentMiddleware):
         all_prs: Callable[[], Awaitable[list[dict]]] | None = None,
         blocking: bool = False,
         platform: object = None,
+        sections: tuple[str, ...] | None = None,
     ) -> None:
         self._backend = backend
         self._path = path
@@ -301,14 +313,21 @@ class MemoryMiddleware(AgentMiddleware):
         #: 平台展示名（``Gitee`` / ``GitHub``）—— 只喂给日志与用户可见的文案，**不写死**：
         #: 同一个仓库换个平台，写死的那句话就全错了。
         self._label = platform_label(platform)
+        #: 注入哪些节：``None`` ＝ 全文；空元组 ＝ **不注入**（review / reviewer）；
+        #: 其余 ＝ 只注入这几节（见 ``memory_sections.digest``）。
+        self._sections = sections
         #: 本轮要注入的记忆块；``abefore_agent`` 每轮覆盖一次，``None`` ＝ 没得注入。
         self._memory: str | None = None
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         """读（或刷新）记忆 → 记下要注入的那块 → 按本轮意图判闸门，该拦的抛 ``TurnStop``。"""
+        # 不注入的形态（review / reviewer）连读都不读：它们审 diff + policies，记忆帮不上忙。
+        if self._sections == ():
+            self._memory = None
+            return None
         if self._all_prs is None:
             old = await _read_text(self._backend, self._path)
-            self._memory = None if old is None else _memory_block(self._path, old)
+            self._memory = self._block(old)
             return None
 
         try:
@@ -323,11 +342,7 @@ class MemoryMiddleware(AgentMiddleware):
 
         # 注入的是**刷新后**的全文，不是盘上原来那份：写回失败时盘上还是旧的，而让模型
         # 照着旧事实去合并写回比不注入更糟。没有记忆文件就什么都不注入（见 ``Refreshed``）。
-        self._memory = (
-            None
-            if refreshed.current is None
-            else _memory_block(self._path, refreshed.result.text)
-        )
+        self._memory = None if refreshed.current is None else self._block(refreshed.result.text)
         pending = refreshed.result.pending
 
         # 没挂闸门的形态（qa / analysis / review）到此为止：刷新照做，不拦。
@@ -366,6 +381,15 @@ class MemoryMiddleware(AgentMiddleware):
             },
         )
 
+    def _block(self, text: str | None) -> str | None:
+        """按 ``sections`` 决定注入全文、节选，还是不注入。"""
+        if text is None:
+            return None
+        if self._sections is None:
+            return _memory_block(self._path, text)
+        part = digest(text, self._sections)
+        return None if not part else _digest_block(self._path, part)
+
     async def awrap_model_call(
         self,
         request: ModelRequest,
@@ -385,8 +409,29 @@ class MemoryMiddleware(AgentMiddleware):
         return await handler(request.override(system_message=SystemMessage(content=text)))
 
 
+def memory_sections_for(
+    *, form: str | None, role: str | None = None
+) -> tuple[str, ...] | None:
+    """按形态 / 角色决定注入哪几节（2026-10-20 用户口径）。
+
+    - ``qa`` / ``analysis``：**全文**（它们要回答「这仓库有什么 / 以前做过什么」）；
+    - ``review`` 主控与 ``reviewer`` 子智能体：**不注入**（审 diff + policies 就够）；
+    - 其余（coding / plan 主控、planner / coder）：只注入
+      **基本信息 + 当前缺口 + 长期约束**，变更记录不注入。
+    """
+    if form == REVIEW_FORM or role == "reviewer":
+        return ()
+    if form in (QA_FORM, ANALYSIS_FORM):
+        return None
+    return DIGEST_KEYS
+
+
 def build_memory_middleware(
-    settings: Settings, repo: RepoSpec, backend: BackendProtocol, form: str | None = None
+    settings: Settings,
+    repo: RepoSpec,
+    backend: BackendProtocol,
+    form: str | None = None,
+    role: str | None = None,
 ) -> MemoryMiddleware:
     """按形态造仓库记忆中间件：**所有智能体都挂**。
 
@@ -403,8 +448,11 @@ def build_memory_middleware(
     记忆路径只有那一个口径，自己拼一份就会写到没人读的 key 上。
     """
     path = memory_path(repo.owner, repo.repo, settings.memories_prefix)
+    sections = memory_sections_for(form=form, role=role)
     if form not in REFRESH_FORMS:
-        return MemoryMiddleware(backend=backend, path=path, platform=repo)
+        return MemoryMiddleware(
+            backend=backend, path=path, platform=repo, sections=sections
+        )
     return MemoryMiddleware(
         backend=backend,
         path=path,
@@ -412,4 +460,5 @@ def build_memory_middleware(
         all_prs=build_git_client(settings, repo).all_pulls,
         blocking=form in BLOCKING_FORMS,
         platform=repo,
+        sections=sections,
     )

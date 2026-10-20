@@ -508,10 +508,9 @@ def test_the_template_asks_for_the_unfinished_features():
         encoding="utf-8"
     )
 
-    assert "## 三、当前缺口（按模块，全部列出）" in text
+    assert "## 三、当前缺口（按模块）" in text
     assert "未完成的功能" in text
-    assert "需求列表" in text, "摘表这件事本身要写在模版里（告诉模型别再写）"
-    assert "以 PR 为角度" in text
+    assert 'section="gaps"' in text, "按节增量写的口径要写在模版里"
 
 
 def test_the_template_records_the_pr_status_but_never_a_pr_less_entry():
@@ -525,7 +524,7 @@ def test_the_template_records_the_pr_status_but_never_a_pr_less_entry():
         encoding="utf-8"
     )
 
-    assert "- **PR**：{[#31](链接)}　｜　**状态**：{待合并 | 已合并 | 已关闭}" in text
-    assert "之后由平台按代码平台的实况改" in text
-    assert "这条变更记录**不写**" in text, "PR 没建成时的处置口径要写在模版里"
+    assert "- **PR**：{#31}　｜　**状态**：{待合并 | 已合并 | 已关闭}" in text
+    assert "之后由平台按代码平台实况改" in text
+    assert "这条**不写**" in text, "PR 没建成时的处置口径要写在模版里"
     assert "未提 PR" not in text, "「没有 PR」这一档已经取消，别再回来"
