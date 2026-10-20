@@ -25,6 +25,96 @@
 
 ### 2026-10-20
 
+#### 仓库记忆按形态分档注入：qa/analysis 全文，其余节选，review 不注入
+
+- **动机**（用户口径 2026-10-20）：记忆改成 6k 上限后仍是**每次模型调用**都整篇注入；
+  而「变更记录」对写码与审查这两类活没有用处 —— 它们要的是「怎么做才符合仓库」与「还差什么」。
+- **改动**：
+  - `agent/middleware/memory_sections.py` 新增 `digest()`：只保留指定几节（基本信息 / 当前缺口 /
+    长期约束），末尾注明「变更记录没有注入，需要历史回报主控」。
+  - `MemoryMiddleware` 新增 `sections` 参数：`None` = 全文、`()` = **不注入**（连读都不读）、
+    元组 = 只注入这几节；`build_memory_middleware(settings, repo, backend, form, role)` 按形态 / 角色决定。
+  - 分档：**qa / analysis 全文**；**coding / plan 主控 + planner / coder 子智能体**只给
+    「基本信息 + 当前缺口 + 长期约束」；**review 主控 + reviewer 子智能体一律不注入**。
+  - `build_subagents` 的 `memory_factory` 改成按角色建（`Callable[[str], MemoryMiddleware]`），
+    `session/manager.py` 的 lambda 同步传 `role=role`。
+  - 提示词同步：共用段写清分档口径；planner / coder 的「当前全文」改成「按角色节选」；
+    reviewer 段从「仓库记忆只读」改成「本轮不注入仓库记忆，不要为了补上下文去读它」。
+- **关键决策**：
+  - review 不给记忆，是因为审查的第一手材料永远是 **diff + `/ai_coding/policies/`**；
+    给了历史反而容易拿「以前是这么写的」当审查依据。
+  - qa / analysis 保持全文：它们的常见问法就是「这仓库有什么 / 以前做过什么」。
+- **验证**：全量 `pytest` **1604 passed**（新增注入分档用例：全文 / 节选 / 不注入，以及
+  「review 连读都不读」）；`ruff check` 干净；`scripts/check_prompts.py` 0 条冲突。
+
+#### 仓库记忆改成按节增量写：`save_repo_memory(section, payload)` + 长度上限
+
+- **动机**（用户口径 2026-10-20）：`wanqi-mall` 的记忆已经 **24,148 字**（20 条变更记录），
+  而它是**每次模型调用都整篇注入**——一轮 80 次调用就是上百万输入 tokens。同时观察到两个
+  坏习惯：模型把「本次改动」写进「仓库基本信息」；「关键决策」写得像第二份变更记录。
+- **改动**：
+  - `save_repo_memory` 的入参从 `content: str`（整篇）改成 `section + payload`：
+    `change`（追加一条：kind / summary / pr）、`gaps`（整节替换）、`decisions`（整节替换）、
+    `basic`（按白名单字段替换）。**不再接受整篇提交**。
+  - 新增 `agent/middleware/memory_sections.py`：解析四节（兼容老标题「项目概览 / 当前进度 /
+    关键决策 / 约定与注意事项」）、合并、渲染、按 PR 去重、滚动窗口。
+  - 长度上限（代码里硬拒，不静默截断）：基本信息 2000 / 当前缺口 1500 / 长期约束 1500 /
+    全文 6000 字；单字段 300、单条缺口 200、单条约束 120；变更记录只留最近 8 条、
+    摘要 ≤120 字。超了回执里报「哪一节 / 多少字」。
+  - 「关键决策」改名「**长期约束**」，每条必须三栏：约束 / 原因 / **影响**（写不出影响说明
+    它只是历史，应记进变更记录）；最多 8 条，整节替换。
+  - 「变更记录」一条只写两行：`### 日期 · 类型 · 摘要` + `- **PR**：#N ｜ **状态**`；
+    涉及文件与验证细节留在 PR 里（每轮全文注入，写细节等于每轮都付 token）。
+  - 模板（`docs/` 与 `sandbox/policies/` 两份逐字一致）与提示词同步：写明增量口径、
+    各节职责、上限，以及「本次改动不许写进基本信息」。
+  - 工具描述从「覆盖写」改成「按节增量写」；注入块同步改口径。
+  - **`basic` 写入时顺手归一化整节**（2026-10-20 补）：只拦新写入不够 —— 存量里已经躺着
+    「认证体系」「服务间鉴权」这类非白名单字段，下一次写 basic 时会把它们清掉（散文行保留），
+    回执里报「清掉 N 条」。
+- **数据迁移（一次性）**：4 份存量记忆已压缩并备份到 `store` 的 `memories_backup` 前缀：
+  `wanqi-mall` 24,148 → **5,392** 字（20 条变更 → 8 条；6 条滚出、6 条无 PR 丢弃），
+  `java-for-test` 6,495 → 3,030，`java_test_demo` 4,563 → 3,288，
+  `multi_model_rag_demo` 5,118 → 3,736。补做归一化后：`wanqi-mall` → **4,721**（清掉
+  「认证体系 / 服务间鉴权」2 条）、`java-for-test` → 2,828（3 条）、`java_test_demo` → 3,186（1 条）。
+- **关键决策**：
+  - 「变更记录」是唯一追加式的一节（按 PR 去重 + 滚动窗口）；缺口与长期约束是**整节替换**，
+    因为过时的结论必须能删掉，只追加会越写越乱。
+  - 上限落在**代码**里而不是提示词里：超长直接拒写并报数字，避免「模型自己截断」这种
+    不可预期行为。
+- **验证**：全量 `pytest` **1595 passed**；`ruff check` 改动文件干净；
+  `scripts/check_prompts.py` 0 条冲突。
+
+#### qa / analysis 允许跑测试与构建；装依赖只许落在 /tmp 副本
+
+- **动机**（用户口径 2026-10-20）：这两个形态此前是「只读」，运行时行为（测试过不过、构建
+  失败在哪、这段代码实际输出什么）只能靠读代码猜。要求：**允许执行验证**，但**仍不许写
+  任务代码**；缺依赖可以装，但项目里不能留下不需要的依赖。
+- **改动**：
+  - `prompts._READONLY_BOUNDARY`（qa / analysis 共用）重写：明确「可以执行验证」——
+    跑测试 / 构建、用 `python -c` / `node -e` 看输出；「缺依赖可以装，但只许在
+    `/tmp` 的仓库副本里」（`cp -a /ai_coding/project /tmp/verify-<repo>`），`/tmp` 随
+    沙箱销毁，项目目录里不留 node_modules / lockfile 改动；并写明**不许**跑
+    `--fix` / `--write` / `format`、不许 `git add/commit/push/checkout/merge`。
+  - `_ROLE_QA`「怎么查」新增第 4 条、`_ROLE_ANALYSIS`「分析工作法」第 2 条：
+    **能跑就别只读**，运行时事实优先。
+  - `safety/policy.py` 的 `AgentPolicy` 增加 `writes_project` / `project_root` /
+    `allow_install`，新增 `check_command`：
+    - 写根里没有 project 的形态（qa / analysis / plan / review / planner）**硬拦**
+      `git add|commit|push|checkout|merge|rebase|reset|…` 与 `--fix` / `--write` /
+      `gofmt -w` / `black` / `rustfmt`；
+    - 装依赖（npm / pip / poetry / uv / go mod / mvn dependency）只允许
+      `cd /tmp/…` 之后执行；没 `cd` 或 `cd` 进仓库一律拒；
+    - `cp` / `ln` / `rsync` 只把**目标**当写目标（源是只读的），所以
+      `cp -a /ai_coding/project /tmp/verify` 不会被自己的边界挡住。
+- **关键决策**：
+  - 依赖装在 `/tmp` 副本里，「清理」变成结构性的（沙箱销毁即没了），不依赖模型自觉；
+    qa 的写根仍然为空、analysis 仍然只有 `/ai_coding/tmp`。
+  - 拦截落在中间件（`BoundaryMiddleware` → `AgentPolicy`）而不是只写提示词 ——
+    提示词负责「劝它别选」，中间件负责「选了也不执行」。
+- **验证**：全量 `pytest` **1599 passed**；`ruff check` 改动文件干净；
+  `scripts/check_prompts.py` 0 条冲突。
+- **遗留**：装依赖需要沙箱能联网；连不上时如实报「依赖装不上」，不要退回猜测。
+
 #### Token 面板删掉上下文块；环图改看「最近一次主控调用」；子智能体折叠
 
 - **动机**（用户口径 2026-10-20）：Token 面板里的「窗口 128,000」来自会话级聚合
@@ -70,6 +160,82 @@
   `npm --prefix frontend run build`（含 vue-tsc）通过。
 - **遗留**：改版之前的历史记录里 `context` 仍是峰值口径（`max_input`）；环图对老记录
   按原样显示，不重算。
+
+#### 需求澄清落到 qa：新增 `requirement-clarifier`，删掉旧的补全 skill
+
+- **动机**（用户口径 2026-10-20）：用户抛来的需求常常是一句话、群聊碎片、只写了正常流程的
+  PRD。需要的是「理解 → 反问 → 确认 → 产出一份详细需求描述」。上一轮已经把**需求讨论**
+  的意图从 coding 挪到 qa，这一轮把**方法**也挪过去。
+- **改动**：
+  - 新增 `sandbox/skills/requirement-clarifier/SKILL.md`：吸收与分级（原文逐字、先查仓库、
+    信源冲突不互相覆盖）→ 按盲区清单挑漏洞（范围 / 状态 / 权限 / 并发 / 量级 / 存量 / 时序 /
+    删除语义 / 异常 / 边界，只留「不问清就得返工」的）→ 一次最多问 3 个、尽量选择题化 →
+    验收回答（剥离新需求、冲突检测、回答退化成「方向」就收口）→ 产出需求描述
+    （背景 / 范围 / 场景 / 功能明细 / 约束 / 验收标准（含反向用例）/ 待确认 / 下一步）。
+  - 删除 `sandbox/skills/coding-requirement-completer/SKILL.md`：它的终点是「产出可运行代码块」，
+    意图域是通用编程助手的 write/modify/debug…，默认值是「语言默认 Python、脚本形态」——
+    与这套「已有仓库 + 方案 + coder」的流程正好相反。
+  - `prompts.py`：coding 流程第 2.a 步不再指向 skill，改成「有歧义就别猜，讲清楚停下等答复」；
+    `_ROLE_QA` 新增「需求澄清（用户抛需求时）」一节，指明按该 skill 走、产物进回复正文。
+- **关键决策**：
+  - **产出进回复，不落文件**：qa 是只读形态（不改仓库、不写 `/ai_coding/output/`）。
+  - **方案设计不进这份 skill**：技术选型、步骤拆分、工作量估算归 plan，否则两个形态各写一遍。
+  - 参考的三份外部 skill 里，`docs/requirements/` 持久目录、HTML 确认单 + 问卷脚本、
+    `verify_evidence.py` 机检、「业务方不碰 AI、由开发转达」都**不适用**（没有那些脚本、
+    需求方就在这个界面里），只保留纪律部分。
+  - 追问格式：**意图不明**走 `<CLARIFY>` 弹窗，**需求细节**走正文 —— 现有弹窗的选项是
+    「选意图」用的（`_consume_clarification` 返回 intent），装不进需求细节。
+- **验证**：`tests/test_prompts.py` 146 passed；`scripts/check_prompts.py` 0 条冲突。
+- **遗留**：需求描述能否落库（`save_requirement` + 一张表，供 plan 直接引用）—— 本轮只进
+  回复，要沉淀时再立项。
+
+#### 意图口径：需求讨论归 qa、方案设计 / 讨论归 plan
+
+- **动机**（用户口径 2026-10-20）：「这个需求还能加个条件」这类**需求讨论**被判成 coding，
+  白读一遍代码；方案还在讨论阶段也被当成开工。要求：需求讨论一律 qa，方案设计 / 方案讨论
+  一律 plan。
+- **改动**：`server/intent.py` 的 `coding` 说明写明「讨论需求本身不是 coding」，`qa` 加
+  「需求讨论 / 需求补充 / 需求澄清」，`_BOUNDARY` 加两条分界（需求讨论 vs coding、
+  方案设计 / 方案讨论 → plan）。JEV 与大模型两条判定路共用同一份提示词，一并生效。
+- **关键决策**：**关键字层不动** —— 往强口令里塞「需求」「方案讨论」会把「方案讨论完了，
+  开始实施」判成 plan（plan 规则排在 coding 前面，先命中就赢）。这类句子交给模型判。
+- **验证**：`tests/test_intent_detection.py`、`tests/test_prompts.py` 全过；
+  `scripts/check_prompts.py` 0 条冲突。
+
+#### 代码平台令牌进配置，取消 OAuth 登录
+
+- **动机**：OAuth 登录后端做完之后前端一直没接，令牌散在 `.env` 里、改一次要重启；
+  改为**配置项**并**取消授权登录**。
+- **改动**：
+  - `config.RUNTIME_SETTINGS` 新增「代码平台」一组四格：`gitee_access_token` /
+    `gitee_username` / `github_access_token` / `github_username`；`RuntimeSetting.kind`
+    新增 `secret`（与 `str` 同型，只是接口层按凭据对待）。
+  - `api/routes/app_settings.py`：`secret` 的读取口径 —— **打开设置页回掩码**、
+    **保存之后的响应不再回显**（`value` 空、只带 `has_value`）；提交值等于当前掩码＝
+    不改，删空再保存＝清除。打码函数收敛到 `safety/redact.mask_secret`。
+  - 删除：`api/routes/auth.py`、`tests/test_auth_routes.py`、`config.py` 六个
+    `*_oauth_*` 字段、`.env.example` 的两段 OAuth 说明、`vite.config.ts` 的 `/auth` 代理。
+  - `create_session` 不再接受请求级令牌，统一取 `Settings.token_for` / `username_for`；
+    两家令牌进脱敏词表（`Settings.code_platform_secret_values`）。
+  - 前端设置页：`secret` 用密码框、未配置/已配置走占位提示；保存后用 **PUT 的响应**
+    铺界面（不再顺手 GET 一次 —— 那会把掩码又摆回来）。
+- **关键决策**：
+  - 令牌在**建会话那一刻**快照进库，改配置只影响之后新建的会话；`sessions.gitee_token`
+    那一列保留，不做迁移。
+  - `git 用户名` 一并进配置：OAuth 删掉之后没有「自动 oauth2」那条路，PAT 场景必须能填
+    真实用户名，否则 Gitee 认证会失败。
+- **验证**：`tests/test_app_settings.py`、`tests/test_session_reuse.py` 全过；
+  `npm --prefix frontend run build` 通过。
+- **遗留**：`sessions.gitee_token` / `gitee_username` 两列的名字仍按 Gitee 命名（实际也存
+  GitHub 的），改名要迁移，暂不动。
+
+#### 日志补 LLM 调用耗时（毫秒）
+
+- **动机**：日志里只有工具调用带耗时，LLM 调用看不出慢在哪。
+- **改动**：`observability/run_log.py` 在 `message-start` 记起始时刻（按 namespace ＋
+  是否内部调用两维配对），`message-finish` 输出「…，耗时 1834ms」；子智能体收尾那行从
+  `%.1fs` 改成毫秒，与工具完成同口径。
+- **验证**：`tests/test_run_logging.py` 全过（含「配对后起始时刻必须清空」）。
 
 #### 第二批：三个大文件按功能拆包
 

@@ -160,6 +160,10 @@
 
 ## 三、更早的遗留（跨批沿用，未动）
 
+- **需求描述落库**：qa 的 `requirement-clarifier` 目前把需求描述写在回复正文里（qa 是只读形态）。
+  若要让它跨轮引用、直接当 plan 的输入，需要一张 `requirements` 表 + `save_requirement` 工具，
+  并决定写入口径（只 qa 能写？plan 能不能改？）。抓手：`db/models.py` 加表、`tools/register.py`
+  加工具、`_ROLE_QA` 的边界段放行这一处写入（与 analysis 的记忆写回同形）。
 - **前端登录入口未接**：Gitee / GitHub 的 OAuth 后端都已就绪（`/auth/gitee/*`、
   `/auth/github/*`），前端还没接；眼下实际用的是 `.env` 里的 `GITEE_ACCESS_TOKEN` /
   `GITHUB_ACCESS_TOKEN`（见 `README.md` 与 CHANGELOG）。
