@@ -33,8 +33,12 @@ description: >
 ```
 git status / log / show / diff / diff --stat / diff --numstat / blame
 git ls-remote / remote -v / branch -a / tag -l
-ls / find / cat / head / tail / grep / rg / sed -n / awk（只打印）
+ls / find / head / tail / grep / rg / sed -n / awk（只打印）
 ```
+
+`cat` 只用于 `/ai_coding/skills` 与 `/ai_coding/tmp`；`/ai_coding/project` 与
+`/ai_coding/policies` 下用 `sed -n` / `head -n` / `grep`（`ReadGuardMiddleware` 会拦
+这两处的 `cat`）。`read_file` 读 policies 必须带 `limit` ≤80、读 project ≤200。
 
 ### 禁止
 
@@ -66,6 +70,13 @@ git diff --numstat         # 各文件增删行数（评估是否分批）
 - **`git diff` 为空** → 不要臆造审查结论。改查 `git diff --cached`，或向用户确认要审的 commit range；仍为空就明确告知「无改动可审」。
 
 ### 3. 逐项审查
+
+**读码边界（成本纪律）**：
+
+- 改动块是主材料：`git diff <base>..<head> -- <path>` 看 hunk；`read_file` 只补被改函数、
+  直接调用点与相关测试，不顺着文件通读。
+- 同一文件同一范围本轮不重读；用不同 offset 把同一文件从头扫到尾也算重读，已有结论直接用。
+- 看 hunk + 调用点能定性的，不再通读整个文件；覆盖率不等于读完所有文件。
 
 对每处改动，按「审查维度」逐项核对，并结合 `/ai_coding/policies/` 代码规则（如有）。
 
@@ -154,7 +165,13 @@ P3 低   —— 风格、命名、轻微建议。可选改进。
 ## 亮点（可选）
 - 值得肯定的地方
 
-## 本次未覆盖（必写）
+## 覆盖清单（必写）
+
+| 文件 | 状态 | 说明 |
+| --- | --- | --- |
+| （改动文件） | 已审 / 只看 hunk / 未审 | 未审原因，或只看 hunk 的理由 |
+
+## 未覆盖与残余风险（必写）
 - 查了哪些维度、哪些没查（如「未验证数据库迁移」「未运行测试」）、残余风险
 ```
 

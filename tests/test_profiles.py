@@ -532,8 +532,8 @@ class TestMainPromptForms:
 
     def test_review_form_shares_the_method_with_the_reviewer(self):
         prompt = self._review()
-        assert "git diff --stat" in prompt
-        assert "问题分级（严重 / 一般 / 建议）" in prompt
+        assert "先看 diff，不先读文件" in prompt
+        assert "报告开头给一张覆盖清单" in prompt
 
     # -- 全体共用的部分 ----------------------------------------------------
 
