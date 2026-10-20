@@ -223,12 +223,24 @@ def _config_for(settings: Settings, role: str) -> ModelConfig:
     return _row_config(row, window=resolve_window(settings, role))
 
 
+def _wants_reasoning_effort(model: str) -> bool:
+    """只有 OpenAI 的推理模型吃 ``reasoning_effort``。
+
+    智谱 glm-5.3-flash 带这个键会把思考流关掉（实测 ``high`` → 0 字、``medium`` → 400），
+    DeepSeek / Kimi / Qwen 也都不需要它。只按模型名认 OpenAI 推理家族：``gpt-5*`` /
+    ``o1*`` / ``o3*`` / ``o4*``。
+    """
+    name = (model or "").strip().lower()
+    return name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
 def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
     """按一份配置建模型实例（OpenAI 兼容）。``label`` 只用于报错时指认是谁。
 
-    不传 ``thinking``：实测 DeepSeek 不带该参数也返回 ``reasoning_content``，而该参数
-    并非官方 OpenAI 规范，传了只是多依赖一条未验证的接口契约；glm / qwen 的思考是
-    服务端默认（qwen 在云端默认开启），本来就没有开关可传。
+    思考参数分两家：``extra_body`` 的 ``thinking`` 保留（glm / deepseek 接受，qwen
+    默认开启）；``reasoning_effort`` **只给 OpenAI 推理模型** —— 2026-10-20 实测智谱
+    glm-5.3-flash：不带该键时 ``reasoning_content`` 正常返回，带上 ``high`` 思考内容
+    变成 0，``medium`` 直接 400（「该模型始终思考，不支持关闭思考」）。
 
     **温度按模型名兜一层**（``config.temperature_for``）：界面上的行没有温度这一格，
     而 kimi 系**只收 1**（传 0.3 直接 400）—— 2026-10-15 那次分析轮就是主模型失败后
@@ -241,6 +253,9 @@ def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
         raise ValueError("api_key and base_url are required")
     # 用带 reasoning 补丁的 ChatOpenAI：第三方网关的 ``reasoning_content`` 在
     # LangChain 的流式转换里会被丢掉，见 ``agent/chat_model.py``。
+    thinking: dict[str, Any] = {"extra_body": {"thinking": {"type": "enabled"}}}
+    if _wants_reasoning_effort(cfg.model):
+        thinking["reasoning_effort"] = "high"
     model = ReasoningChatOpenAI(
         model=cfg.model,
         api_key=cfg.api_key or None,
@@ -251,8 +266,7 @@ def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
         # 就是这么来的。网关不认这个字段时由 StreamUsageMiddleware 按地址降级重试。
         stream_usage=True,
         streaming=True,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}},
+        **thinking,
     )
     if cfg.context_window > 0:
         # 压缩中间件的 fraction 触发器要求模型带 max_input_tokens —— 这一格就是它读的
