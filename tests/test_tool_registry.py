@@ -1,7 +1,8 @@
 """按角色分配自定义工具的守卫测试。
 
 「谁拿哪个工具」是行为契约的一部分：PR 评论的发布权只给 reviewer 与主智能体，
-coder 只回报、不自己评论（PR 上的回复统一由主智能体按用户指示发出）。
+coder 可以**读**评论（自己拉审查原文）、但只回报、不自己评论（PR 上的回复统一由
+主智能体按用户指示发出）。
 
 ``handoffTask`` 是**所有形态**的出口，所以它不在 ``_FORM_TOOLS`` 那张表里 —— 表裁的是
 「这个形态有什么能力」，而交接恰恰是能力不够时的出路。这里也一并钉住。
@@ -125,12 +126,14 @@ def test_only_main_writes_repo_memory():
         assert "save_repo_memory" not in _subagent(role)
 
 
-def test_coder_cannot_comment_on_pr():
+def test_coder_can_read_but_not_post_pr_comments():
     names = _subagent("coder")
 
     assert "create_pr" in names
+    # 读评论：用来自己拉审查原文（主控只给问题编号，不整段粘贴）
+    assert "list_pr_comments" in names
+    # 写评论：仍归主智能体
     assert "comment_pr" not in names
-    assert "list_pr_comments" not in names
 
 
 def test_reviewer_can_read_and_post_pr_comments():

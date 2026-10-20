@@ -107,21 +107,20 @@ class TestIntentMiddleware:
         assert "不写「变更记录」" in text
 
     async def test_qa_intent_adds_no_directive(self):
-        """无指令的意图（qa）不塞意图指令 —— 但仍然拿得到当前时间。"""
+        """无指令的意图（qa）不塞意图指令，也不注入时间。"""
         text = _first_system_text(await _run("qa"))
         assert "本轮意图" not in text
-        assert "## 当前时间" in text
+        assert "## 当前时间" not in text
 
     async def test_missing_intent_adds_no_directive(self):
         text = _first_system_text(await _run(None))
         assert "本轮意图" not in text
 
-    async def test_current_time_is_injected_for_every_intent(self):
-        """日期必须逐次注入：智能体是会话级长期对象，构建期的日期会一路陈旧。"""
+    async def test_no_time_block_is_injected(self):
+        """时间不再注入：记忆头行由平台写，散文日期让模型自己跑 date。"""
         for intent in ("plan", "coding", "review", "qa", None):
             text = _first_system_text(await _run(intent))
-            assert "## 当前时间" in text
-            assert "（Asia/Shanghai）" in text
+            assert "## 当前时间" not in text
 
     async def test_directive_survives_subagent_middleware(self):
         """带子智能体时（它自己也会重写系统消息），两条内容都得在。"""
@@ -136,27 +135,6 @@ class TestIntentMiddleware:
         text = _first_system_text(await _run("plan", subagents=subagents))
         assert "SUBAGENT-哨兵" in text, "子智能体描述没进系统消息"
         assert "`task`" in text, "意图指令被子智能体中间件挤掉了"
-
-    async def test_rework_capability_says_task_is_available(self):
-        """rework 这轮要把「有 task、可派三从」写死，压住上一轮 analysis 的只读结论。"""
-        subagents = [
-            {"name": "planner", "description": "计划", "system_prompt": "p", "tools": []},
-            {"name": "coder", "description": "编码", "system_prompt": "c", "tools": []},
-            {"name": "reviewer", "description": "评审", "system_prompt": "r", "tools": []},
-        ]
-
-        text = _first_system_text(await _run("rework", subagents=subagents))
-
-        assert "## 本轮能力" in text
-        assert "`task`：有" in text
-        assert "planner / coder / reviewer" in text
-        assert "不要沿用上一轮" in text
-
-    async def test_analysis_capability_says_task_is_not_available(self):
-        text = _first_system_text(await _run("analysis"))
-
-        assert "`task`：没有" in text
-        assert "可派子智能体：无" in text
 
     async def test_clarification_intent_injects_the_ask_block(self):
         text = _first_system_text(
