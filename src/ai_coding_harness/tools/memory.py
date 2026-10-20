@@ -35,14 +35,14 @@ from dataclasses import dataclass
 from deepagents.backends.protocol import BackendProtocol
 from langchain_core.tools import BaseTool, tool
 
-from ai_coding_harness.agent.memory_reconcile import (
+from ai_coding_harness.agent.middleware.context_inject import now_stamp
+from ai_coding_harness.agent.middleware.memory_reconcile import (
     reconcile,
     restamp,
     rows_to_verify,
     same_except_stamp,
     strip_legacy,
 )
-from ai_coding_harness.agent.middleware.context_inject import now_stamp
 from ai_coding_harness.backends.composite import memory_path
 from ai_coding_harness.tools.git import PrLookupError
 

@@ -18,10 +18,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from ai_coding_harness.agent import memory_reconcile
+from ai_coding_harness.agent.middleware import memory_reconcile
 from ai_coding_harness.api.routes import sessions as sessions_route
-from ai_coding_harness.codeplatform import Platform, RepoSpec
 from ai_coding_harness.config import Settings
+from ai_coding_harness.core.codeplatform import Platform, RepoSpec
 from ai_coding_harness.tools.pr_client import PrLookupError, pull_state
 
 

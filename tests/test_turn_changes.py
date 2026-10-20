@@ -38,7 +38,7 @@ def _session() -> Any:
 
 
 def _change(path: str, *, added: int = 1, deleted: int = 0, status: str = "M") -> Any:
-    from ai_coding_harness.repo_cache import FileChange
+    from ai_coding_harness.infra.repo_cache import FileChange
 
     return FileChange(path=path, added=added, deleted=deleted, status=status)
 
@@ -97,7 +97,7 @@ class TestCollectingTheChanges:
 
     async def test_a_missing_branch_triggers_one_fetch_then_retries(self, monkeypatch):
         """coder 刚推上去的分支本地多半还没有：先 fetch 一次再算。"""
-        from ai_coding_harness.repo_cache import RepoViewError
+        from ai_coding_harness.infra.repo_cache import RepoViewError
 
         monkeypatch.setattr(service_mod.repo_cache, "is_cloned", lambda *a: True)
         calls = {"compare": 0, "sync": 0}

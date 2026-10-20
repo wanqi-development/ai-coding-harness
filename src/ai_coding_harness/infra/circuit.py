@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ai_coding_harness.redis_cache import RedisBacked
+from ai_coding_harness.infra.redis_cache import RedisBacked
 
 
 @dataclass

@@ -33,7 +33,7 @@ from ai_coding_harness.backends.composite import memory_path, read_memory
 from ai_coding_harness.db import dao
 from ai_coding_harness.observability.log_tail import read_session_logs
 from ai_coding_harness.observability.run_log import account_key
-from ai_coding_harness.redact import redact, secret_terms
+from ai_coding_harness.safety.redact import redact, secret_terms
 from ai_coding_harness.server.service import WORKSPACE_ERROR_MESSAGE, plan_payload
 from ai_coding_harness.session.manager import WORKSPACE_READY, Session, WorkspaceError
 from ai_coding_harness.tools.git import build_git_client

@@ -16,7 +16,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 
-from ai_coding_harness import repo_cache
+from ai_coding_harness.agent.clarification import CLARIFY_INTENTS, parse_clarification
 from ai_coding_harness.agent.llm import (
     build_classifier_model,
     build_model,
@@ -31,18 +31,29 @@ from ai_coding_harness.agent.profiles import (
     profile_for,
 )
 from ai_coding_harness.backends.composite import memory_path
-from ai_coding_harness.clarification import CLARIFY_INTENTS, parse_clarification
 from ai_coding_harness.config import Settings
+from ai_coding_harness.core.stream import (
+    CREATE_PR_TOOL,
+    TASK_TOOL,
+    ToolNames,
+    V3Translator,
+    call_id_of,
+    event_name,
+    method_of,
+    payload_of,
+    subagent_name,
+)
 from ai_coding_harness.db import Database, dao
+from ai_coding_harness.infra import repo_cache
+from ai_coding_harness.infra.repo_cache import RepoSpec, RepoViewError
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.observability.run_log import INTENT_ACTOR, AgentRunLog
-from ai_coding_harness.redact import (
+from ai_coding_harness.safety.redact import (
     CRED_TERM,
     detect_credential,
     redact,
     secret_terms,
 )
-from ai_coding_harness.repo_cache import RepoSpec, RepoViewError
 from ai_coding_harness.server.intent import (
     DIRECT_INTENTS,
     EXECUTION_INTENTS,
@@ -68,17 +79,6 @@ from ai_coding_harness.session.manager import (
     SessionManager,
     SessionRuntime,
     WorkspaceError,
-)
-from ai_coding_harness.stream import (
-    CREATE_PR_TOOL,
-    TASK_TOOL,
-    ToolNames,
-    V3Translator,
-    call_id_of,
-    event_name,
-    method_of,
-    payload_of,
-    subagent_name,
 )
 from ai_coding_harness.tools.git import PrLookupError, build_git_client
 

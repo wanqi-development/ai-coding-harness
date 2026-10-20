@@ -1,4 +1,4 @@
-"""右侧栏「代码」面板的接口：本机那份仓库只读缓存的读口（见 ``repo_cache.py``）。
+"""右侧栏「代码」面板的接口：本机那份仓库只读缓存的读口（见 ``infra/repo_cache.py``）。
 
 四个接口都挂在会话下 —— 要看的仓库、以及私有仓库要用的令牌都来自会话（``resolve_session``
 能拿库里的行组装出来，所以后端重启后照样能用）。
@@ -23,8 +23,7 @@ from ai_coding_harness.api.schemas import (
     RepoTreeEntry,
 )
 from ai_coding_harness.api.session_lookup import resolve_session
-from ai_coding_harness.redact import redact, secret_terms
-from ai_coding_harness.repo_cache import (
+from ai_coding_harness.infra.repo_cache import (
     GitMissingError,
     RepoSpec,
     RepoViewError,
@@ -38,6 +37,7 @@ from ai_coding_harness.repo_cache import (
     sync,
     tree,
 )
+from ai_coding_harness.safety.redact import redact, secret_terms
 
 router = APIRouter(prefix="/sessions", tags=["repo"])
 

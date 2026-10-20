@@ -117,18 +117,18 @@ class TestApiLog:
 class TestByPassStateLog:
     """Redis 旁路状态的告警必须**落盘**。
 
-    回归：``ai_coding_harness.redis_cache`` 曾经既不在 api 前缀、也不在 agent 前缀里，
+    回归：``ai_coding_harness.infra.redis_cache`` 曾经既不在 api 前缀、也不在 agent 前缀里，
     于是「Redis 上的运行缓冲不可用」那句只进控制台 —— 用户反复看到它，日志里却一个字
     都没有，无从判断是连不上还是运行期降级。
     """
 
     def test_redis_degradation_lands_in_agent_log(self, logs):
-        logging.getLogger("ai_coding_harness.redis_cache").warning(
+        logging.getLogger("ai_coding_harness.infra.redis_cache").warning(
             "Redis 上的 运行缓冲 不可用，本进程后续退回进程内实现"
         )
         text = (logs / "agent.log").read_text(encoding="utf-8")
         assert "运行缓冲" in text, "旁路状态的降级告警要能在日志里查到"
 
     def test_redis_logs_stay_out_of_api_log(self, logs):
-        logging.getLogger("ai_coding_harness.redis_cache").warning("Redis 不可用")
+        logging.getLogger("ai_coding_harness.infra.redis_cache").warning("Redis 不可用")
         assert "Redis 不可用" not in (logs / "api.log").read_text(encoding="utf-8")

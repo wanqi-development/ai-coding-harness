@@ -39,14 +39,14 @@ from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM
 from ai_coding_harness.agent.subagents import build_subagents
 from ai_coding_harness.config import Settings
 from ai_coding_harness.observability.run_log import AgentRunLog
-from ai_coding_harness.redact import (
+from ai_coding_harness.safety.policy import policy_for
+from ai_coding_harness.safety.redact import (
     CRED_TERM,
     REDACTED,
     detect_credential,
     redact,
     secret_terms,
 )
-from ai_coding_harness.safety.policy import policy_for
 from ai_coding_harness.server import service as service_mod
 from ai_coding_harness.server.intent import IntentDecision
 from ai_coding_harness.server.service import HarnessService

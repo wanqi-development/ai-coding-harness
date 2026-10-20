@@ -25,21 +25,21 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from opensandbox.models.sandboxes import Volume
 
-from ai_coding_harness.agent.circuit import CircuitStore
 from ai_coding_harness.agent.graph import build_agent
 from ai_coding_harness.agent.middleware import (
     FallbackMiddleware,
     build_memory_middleware,
 )
+from ai_coding_harness.agent.middleware.summarization import build_summarization
 from ai_coding_harness.agent.profiles import AgentProfile
 from ai_coding_harness.agent.prompts import build_main_prompt
 from ai_coding_harness.agent.subagents import build_subagents
-from ai_coding_harness.agent.middleware.summarization import build_summarization
 from ai_coding_harness.backends.composite import build_composite_backend
 from ai_coding_harness.backends.opensandbox_backend import OpenSandboxBackend
-from ai_coding_harness.codeplatform import Platform, RepoSpec, parse_repo_url
 from ai_coding_harness.config import Settings
+from ai_coding_harness.core.codeplatform import Platform, RepoSpec, parse_repo_url
 from ai_coding_harness.db import Database, dao
+from ai_coding_harness.infra.circuit import CircuitStore
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.safety.permissions import CommandSafety
 from ai_coding_harness.safety.policy import policy_for

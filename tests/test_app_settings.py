@@ -249,8 +249,8 @@ class TestTheSettingsAreActuallyConsumed:
         assert llm_mod.resolve_window(settings, "plan") == 128_000
 
     async def test_the_code_panel_opens_the_configured_branch(self):
-        from ai_coding_harness.codeplatform import Platform
-        from ai_coding_harness.repo_cache import RepoSpec, default_branch
+        from ai_coding_harness.core.codeplatform import Platform
+        from ai_coding_harness.infra.repo_cache import RepoSpec, default_branch
 
         spec = RepoSpec(owner="o", repo="r", url="https://gitee.com/o/r.git", platform=Platform.GITEE)
 

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from ai_coding_harness.stream import (
+from ai_coding_harness.core.stream import (
     ToolNames,
     V3Translator,
     call_id_of,

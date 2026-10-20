@@ -21,7 +21,7 @@ from ai_coding_harness.config import (
     Settings,
     model_metas_of,
 )
-from ai_coding_harness.model_types import MODEL_TYPES, is_text_model, model_type_of
+from ai_coding_harness.core.model_types import MODEL_TYPES, is_text_model, model_type_of
 
 GLM = "https://open.bigmodel.cn/api/paas/v4/"
 

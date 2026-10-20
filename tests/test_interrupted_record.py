@@ -27,7 +27,7 @@ from ai_coding_harness.agent.middleware import (
     TurnStop,
 )
 from ai_coding_harness.config import Settings
-from ai_coding_harness.redact import REDACTED
+from ai_coding_harness.safety.redact import REDACTED
 from ai_coding_harness.server import service as service_mod
 from ai_coding_harness.server.service import (
     CANCELLED_BY_USER,

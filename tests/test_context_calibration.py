@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from ai_coding_harness.agent.context_calibration import (
+from ai_coding_harness.agent.middleware.context_calibration import (
     CALIBRATION,
     CalibratedTokenCounter,
     CalibrationStore,

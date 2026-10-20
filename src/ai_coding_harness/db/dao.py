@@ -15,7 +15,7 @@ from sqlalchemy import Text, cast, delete, func, literal, select, update
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_coding_harness.codeplatform import Platform
+from ai_coding_harness.core.codeplatform import Platform
 from ai_coding_harness.db.models import (
     AgentSession,
     AppSetting,

@@ -12,9 +12,9 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
-from ai_coding_harness import redis_cache as redis_cache_module
 from ai_coding_harness.config import Settings
-from ai_coding_harness.redis_cache import (
+from ai_coding_harness.infra import redis_cache as redis_cache_module
+from ai_coding_harness.infra.redis_cache import (
     RedisBacked,
     build_redis,
     default_client_factory,
@@ -362,7 +362,7 @@ async def test_a_command_that_never_returns_is_cut_off_by_the_guard(
     实测（2026-10-12，SSH 隧道被重建的那一刻）一条命令花了 **556 秒**才由 TCP 自己放弃。
     这一层保证「一条命令」不会把一轮对话拖住几分钟 —— 超时按失败处理，走进程内 + 冷却。
     """
-    from ai_coding_harness.redis_cache import RedisBacked
+    from ai_coding_harness.infra.redis_cache import RedisBacked
 
     async def hangs() -> str:
         await asyncio.sleep(30)  # 模拟「写阻塞」：既不报错也不返回
@@ -387,7 +387,7 @@ async def test_a_command_that_never_returns_is_cut_off_by_the_guard(
 
 async def test_a_slow_but_finite_command_inside_the_guard_is_not_cut() -> None:
     """兜底不能把正常的慢命令掐掉：隧道量级的往返（几十毫秒级）要照常返回真值。"""
-    from ai_coding_harness.redis_cache import RedisBacked
+    from ai_coding_harness.infra.redis_cache import RedisBacked
 
     async def slow_but_ok() -> str:
         await asyncio.sleep(0.02)
@@ -410,7 +410,7 @@ def test_the_guard_follows_the_configured_socket_timeout() -> None:
     配置放大超时（远端 / 慢隧道）的人，需要兜底一起放大；写死 15 秒会让「30 秒的 socket
     超时」被兜底先掐掉，与配置的意图相反。
     """
-    from ai_coding_harness.redis_cache import COMMAND_GUARD_FACTOR, command_guard_seconds
+    from ai_coding_harness.infra.redis_cache import COMMAND_GUARD_FACTOR, command_guard_seconds
 
     assert command_guard_seconds(_settings(redis_timeout_seconds=5.0)) == pytest.approx(
         5.0 * COMMAND_GUARD_FACTOR

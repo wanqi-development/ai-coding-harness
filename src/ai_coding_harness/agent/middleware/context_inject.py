@@ -25,8 +25,8 @@ from zoneinfo import ZoneInfo
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import SystemMessage
 
+from ai_coding_harness.agent.clarification import CLARIFY_CLOSE, CLARIFY_INTENTS, CLARIFY_OPEN
 from ai_coding_harness.agent.prompts import intent_directive
-from ai_coding_harness.clarification import CLARIFY_CLOSE, CLARIFY_INTENTS, CLARIFY_OPEN
 from ai_coding_harness.tools.context import get_clarification, get_intent
 
 # 平台面向国内 Gitee 用户，日志与记忆里的日期都按这个时区口径

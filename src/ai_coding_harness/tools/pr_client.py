@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from ai_coding_harness.codeplatform import RepoSpec, platform_label
+from ai_coding_harness.core.codeplatform import RepoSpec, platform_label
 
 
 def missing_token_message(repo: RepoSpec) -> str:

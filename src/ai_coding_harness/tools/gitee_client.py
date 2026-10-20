@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from ai_coding_harness.codeplatform import RepoSpec
+from ai_coding_harness.core.codeplatform import RepoSpec
 from ai_coding_harness.tools.pr_client import (
     PrClient,
     find_open_pull,

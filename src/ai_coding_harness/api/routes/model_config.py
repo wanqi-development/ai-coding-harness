@@ -60,9 +60,9 @@ from ai_coding_harness.config import (
     provider_metas_of,
     sort_provider_metas,
 )
+from ai_coding_harness.core.model_types import MODEL_TYPES, is_text_model, model_type_of
 from ai_coding_harness.db import dao
 from ai_coding_harness.db.models import ModelEndpoint
-from ai_coding_harness.model_types import MODEL_TYPES, is_text_model, model_type_of
 
 logger = logging.getLogger(__name__)
 

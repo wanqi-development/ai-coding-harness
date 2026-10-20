@@ -30,9 +30,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from ai_coding_harness.observability.logging import MAIN_AGENT, MAIN_AGENT_NAME
-from ai_coding_harness.redact import redact
-from ai_coding_harness.stream import (
+from ai_coding_harness.core.stream import (
     TASK_TOOL,
     event_name,
     is_internal_call,
@@ -41,6 +39,8 @@ from ai_coding_harness.stream import (
     namespace_of,
     payload_of,
 )
+from ai_coding_harness.observability.logging import MAIN_AGENT, MAIN_AGENT_NAME
+from ai_coding_harness.safety.redact import redact
 
 logger = logging.getLogger(__name__)
 

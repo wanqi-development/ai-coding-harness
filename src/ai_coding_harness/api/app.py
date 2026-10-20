@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from ai_coding_harness.agent.circuit import RedisCircuitStore
 from ai_coding_harness.agent.llm import build_fallback, build_model
 from ai_coding_harness.api.middleware import ApiLogMiddleware
 from ai_coding_harness.api.routes import (
@@ -29,9 +28,10 @@ from ai_coding_harness.config import (
     provider_metas_of,
 )
 from ai_coding_harness.db import Database
+from ai_coding_harness.infra.circuit import RedisCircuitStore
+from ai_coding_harness.infra.redis_cache import build_redis, command_guard_seconds
 from ai_coding_harness.observability.logging import setup_logging
 from ai_coding_harness.observability.tracing import setup_tracing
-from ai_coding_harness.redis_cache import build_redis, command_guard_seconds
 from ai_coding_harness.server.intent import build_jev_decider
 from ai_coding_harness.server.run_store import RedisRunBuffer, RedisRunLock
 from ai_coding_harness.server.runs import RunHub
