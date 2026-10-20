@@ -11,7 +11,6 @@ from ai_coding_harness.agent.llm import build_fallback, build_model
 from ai_coding_harness.api.middleware import ApiLogMiddleware
 from ai_coding_harness.api.routes import (
     app_settings,
-    auth,
     chat,
     health,
     model_config,
@@ -293,7 +292,6 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(title="ai-coding-harness", lifespan=lifespan)
     app.add_middleware(ApiLogMiddleware)
-    app.include_router(auth.router)
     app.include_router(health.router)
     app.include_router(sessions.router)
     app.include_router(chat.router)

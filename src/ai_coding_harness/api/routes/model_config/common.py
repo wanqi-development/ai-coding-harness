@@ -40,6 +40,7 @@ from ai_coding_harness.config import (
 from ai_coding_harness.core.model_types import is_text_model, model_type_of
 from ai_coding_harness.db import dao
 from ai_coding_harness.db.models import ModelEndpoint
+from ai_coding_harness.safety.redact import mask_secret
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +59,8 @@ _PROVIDER_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 def mask_key(value: str | None) -> str:
-    """凭据打码：``sk-…e2b7``。太短就整段星号 —— 界面只用来「知道填没填」，不回明文。"""
-    if not value:
-        return ""
-    if len(value) <= 8:
-        return "*" * len(value)
-    return f"{value[:3]}…{value[-4:]}"
+    """凭据打码（兼容名）：实现只在 ``safety/redact.py::mask_secret`` 一份。"""
+    return mask_secret(value)
 
 
 def _positive_int(value: Any) -> int:
