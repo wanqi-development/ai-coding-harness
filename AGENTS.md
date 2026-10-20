@@ -42,9 +42,9 @@
   `frontend/vite.config.ts` 的 `server.proxy`** —— 漏了的现象是「点开界面就报错，而 curl 后端
   200」（请求打到了 vite 自己身上，`/model-config` 就这么踩过一次）。dev 只监听 IPv6 回环，
   用 `http://localhost:5173`（`127.0.0.1:5173` 会被拒）。
-- **设置是整页工作台，不是弹窗**：`frontend/src/SettingsPage.vue`（入口＝左栏品牌行那颗齿轮，
+- **设置是整页工作台，不是弹窗**：`frontend/src/components/settings/SettingsPage.vue`（入口＝左栏品牌行那颗齿轮，
   `Esc` 返回），左菜单三栏＝基本设置 / 外观 / 模型配置；切页时聊天区用 `v-show` 藏在原地，
-  不卸 DOM。**基本设置与外观是本机偏好**（`frontend/src/prefs.ts`，localStorage，改完立刻生效）；
+  不卸 DOM。**基本设置与外观是本机偏好**（`frontend/src/lib/prefs.ts`，localStorage，改完立刻生效）；
   **模型配置存后端库**（改完要保存，且重启后端才生效）。主题只改 `<html data-theme>`，
   颜色全在 `style.css` 的两组令牌里 —— 组件里不判断主题，**新增颜色必须走令牌**，
   否则深色下会出「白块 / 看不见的字」。
@@ -92,7 +92,7 @@
   与各家窗口。**键与类型只认 `config.RUNTIME_SETTINGS` 那一张表**，接口 `GET/PUT /app-settings`，
   写入后赋回 `Settings` 实例 → **改完立刻生效**（配合「agent 不缓存」）。新增可配项就在那张表里加一行，
   并在设置页「基本设置」里出现（分组名由它带出来）。直接改库也能用：GET 时会重新落一遍。
-- **「这一轮改了什么」在本地代码缓存里算，不碰沙箱**：`repo_cache.compare/file_diff` +
+- **「这一轮改了什么」在本地代码缓存里算，不碰沙箱**：`infra/repo_cache.compare/file_diff` +
   `GET /sessions/{id}/repo/diff`，`base...head` 两支取 `create_pr` 的入参（三点式＝相对共同祖先，
   这才是 PR 的语义）。只组建成 PR 的轮次、只存**文件清单**（diff 正文按需拉，脱敏 + 上限），
   所以**沙箱释放之后 diff 照样点得开**。**中止的轮次只要本轮建过 PR 也照样算**
@@ -123,7 +123,7 @@
   （`llm.resolve_window`）：行内显式 → `(供应商, 模型)` → 模型名（治自建网关）→ `.env` 那家（兜底）
   → 兜底值。同一家不同模型窗口差很远（glm-5.3 是 1M、glm-4.6 是 128k），按家取值会把压缩线推错。
   清单**只在点「刷新」时拉**（`POST /model-config/providers/{p}/models/refresh`，key 借用 agent 行），
-  非文本模型也落表并标类型（`model_types.py`，判据只能按名字），界面上只显示 `chat`。
+  非文本模型也落表并标类型（`core/model_types.py`，判据只能按名字），界面上只显示 `chat`。
 - **压缩中间件是我们自己构造的那一份，上游那份被按类排掉**（`agent/summarization.py` +
   `agent/graph.py` 里的 `excluded_middleware`）：**别改回上游工厂** —— 它的 `trigger` / `keep` /
   `trim_tokens_to_summarize` 三个默认值都不合用，而且**都没暴露成参数**（工厂把最后一格默认
@@ -135,7 +135,7 @@
 - **上下文计数是「中英混合」口径**（`middleware/context_trim.py::context_token_counter`）：
   中文按 1.6 字符/token、其余按 3.8，按当轮实际比例折一个等效系数。**别改回单一常量** ——
   统一按 1.6 时实测把**代码**高估 2.49 倍，而压缩的窗口比例共用这把尺子，线会被推歪。
-  估算之上还有一层**按模型**的在线校准（`agent/context_calibration.py`）：用每次调用
+  估算之上还有一层**按模型**的在线校准（`agent/middleware/context_calibration.py`）：用每次调用
   `usage_metadata.input_tokens` 的真值做 EMA（α=0.3），样本只认「刚发出去的那一份」；
   没有样本时系数 1.0、行为与校准前一致。**别拿预剪前的估算配预剪后的真值** —— 比例会被放大。
 - **思考正文靠 `agent/chat_model.py` 补**：`ChatOpenAI` 只保留官方字段，第三方网关的

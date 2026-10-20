@@ -25,6 +25,38 @@
 
 ### 2026-10-20
 
+#### 后端源码按 core / infra 归位
+
+- **动机**：源码根目录混着跨层契约（stream / codeplatform / redact）与宿主机基础设施
+  （redis_cache / repo_cache），agent 里也夹着只服务某个中间件的支撑件；按功能归位，
+  根目录只留 `config.py` / `main.py`。
+- **改动**：
+  - `core/`：`stream.py`、`codeplatform.py`、`model_types.py`；
+  - `infra/`：`redis_cache.py`、`repo_cache.py`、`circuit.py`（原 `agent/circuit.py`）；
+  - `safety/redact.py`（原根目录 `redact.py`）；
+  - `agent/clarification.py`（原根目录 `clarification.py`）；
+  - `agent/middleware/context_calibration.py`、`agent/middleware/memory_reconcile.py`
+    （原在 `agent/` 下，只服务压缩 / 记忆中间件）。
+  - 全仓 import、日志名前缀、测试与文档路径同步。
+- **说明**：`repo_cache` **保留**——它是后端宿主机上的只读裸仓（默认
+  `~/.ai-coding-harness/repo_cache`），供右侧栏「代码」与「本轮改动」在沙箱释放后使用，
+  不是 agent 的工作副本；没打开过代码面板不会 clone。
+- **验证**：全量 `pytest` **1588 passed**；`ruff check` 改动文件干净。
+
+#### 前端文件按 components / lib 分组
+
+- **动机**：`frontend/src` 原来 22 个文件全部平铺（组件、工具、全局样式混在一起），
+  设置页、右栏面板与工具函数的边界只能靠文件名猜。
+- **改动**：
+  - `components/settings/`：SettingsPage / ModelConfigDialog / ModelEntry / ProvidersPanel；
+  - `components/panels/`：LogPanel / MemoryPanel / PrPanel / RepoPanel / UsagePanel；
+  - `components/ClarificationDialog.vue`；
+  - `lib/`：api / markdown / highlight / modelWindow / prefs / splitter / streamblocks /
+    todos / viewState；
+  - `App.vue`、`main.ts`、`style.css` 留在 `src/` 根；所有 import 同步。
+- **验证**：`npm.cmd --prefix frontend run build`（`vue-tsc` + `vite`）通过。
+- **遗留**：无。
+
 #### coder 的 rework 改成按模块编排
 
 - **动机**：13:45 那轮修 PR #17 的 9 条问题，按 P0/P1 逐条修，结果 **206 次 coder 调用 /

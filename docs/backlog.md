@@ -112,7 +112,7 @@
   `cb4c905c` 23:22:21）：`摘要调用完成：输入 40019 / 输出 3617`，压完第一次模型调用输入
   **38,521**，而上一轮末次是 **152,340**；剪裁那侧的证据是输入曲线出现回落（64,833→62,450
   这种，当时还有常规 40k 剪裁；2026-10-17 已删，现在只有 `CONTEXT_PRETRIM`）。
-  **2026-10-18 补上了**「估算值与供应商真值差多少」这层校准：`agent/context_calibration.py`
+**2026-10-18 补上了**「估算值与供应商真值差多少」这层校准：`agent/middleware/context_calibration.py`
   按 `(base_url, model)` 做 EMA（α=0.3），样本来自每次调用的 `usage_metadata.input_tokens`，
   只认「刚发出去的那一份」；没有样本时系数 1.0。**还差的**是真机验证 —— 本机 PostgreSQL
   当时未启动，后端没跑；下次起来后看 `CONTEXT_CALIBRATION` 的 `ratio` 是否收敛到实测的

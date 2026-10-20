@@ -20,3 +20,6 @@ logs/
 .claude/settings.local.json
 # 意图评测的真实样本可能包含用户消息 / 代码片段，默认不进库；示例文件照旧提交
 docs/intent-eval.jsonl
+
+# 本地一次性排查脚本 / 临时笔记：不进库，也不占根目录
+scratch/

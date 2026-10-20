@@ -3,9 +3,9 @@
 这份文档说的是**界面上的「设置」长什么样、每一项存在哪、什么时候生效**。
 「最近改了什么」看 `CHANGELOG.md`；「还没做的」看 `docs/backlog.md`。
 
-入口是左栏品牌行那颗齿轮（`frontend/src/SettingsPage.vue`），`Esc` 或左上角返回回到聊天。
+入口是左栏品牌行那颗齿轮（`frontend/src/components/settings/SettingsPage.vue`），`Esc` 或左上角返回回到聊天。
 切页时聊天区用 `v-show` 藏在原地（不卸 DOM：正在跑的流还在往 App 的状态里写）；
-「在哪一页」记在 URL 的 hash 上（`#settings/basic|look|models`，见 `frontend/src/viewState.ts`），
+「在哪一页」记在 URL 的 hash 上（`#settings/basic|look|models`，见 `frontend/src/lib/viewState.ts`），
 所以**刷新之后还在原来那一页**。
 
 ## 一、左菜单四栏
@@ -26,7 +26,7 @@
 | 默认打开的右栏标签 | 刷新/新开页面时右栏停在哪个标签（代码 / 记忆 / PR / 日志 / Token） |
 | 恢复默认布局 | 两个栏宽 + 收起状态 + 退出右栏全屏，清回默认 |
 
-存在 `localStorage`（`ui.panelTab` / `ui.sidebar.*` / `ui.right.*`，见 `frontend/src/prefs.ts` 与
+存在 `localStorage`（`ui.panelTab` / `ui.sidebar.*` / `ui.right.*`，见 `frontend/src/lib/prefs.ts` 与
 `splitter.ts`）—— 本机单人的显示偏好，后端没有「用户设置」表，为它加表加迁移不划算。
 
 ### 代码缓存配置（后端库，保存即生效）
@@ -105,7 +105,7 @@
 
 顺带几条（2026-10-15 用户口径）：
 
-- 窗口那一格按 `1M` / `128K` 显示（存库仍是 tokens，进制 1024，见 `frontend/src/modelWindow.ts`），
+- 窗口那一格按 `1M` / `128K` 显示（存库仍是 tokens，进制 1024，见 `frontend/src/lib/modelWindow.ts`），
   且**只回显真值** —— 后端解析出来的窗口带一个来源（`row` 行内手填 / `model` 按模型查到 /
   `fallback` 我们的保守值），界面只显示前两种：`fallback` 不是厂商给的数，回显出来会让人以为
   查到了（用户原话：「这个 128K 从哪来」）。查不到就**留空**，要准就手填或点「刷新清单」。
