@@ -307,7 +307,7 @@ PR 没建成就不写这条）。
 | --- | --- |
 | 建会话 / 会话列表 / 删会话 | `api/routes/sessions.py`、`session/manager.py` |
 | 消息入口、SSE 订阅 | `api/routes/chat.py`、`server/runs.py` |
-| 凭据拒收、意图分类、分发、收尾 | `server/service.py`、`server/intent.py` |
+| 凭据拒收、意图分类、分发、收尾 | `server/turn/*.py`（`HarnessService` 组合）、`server/intent.py` |
 | 运行宿主（断线不影响运行、跨 worker） | `server/runs.py`、`server/run_store.py` |
 | 中间件（记忆 / 边界 / 委派闸门 / 循环守卫 / 兜底 / 脱敏） | `agent/middleware/*.py`、`infra/circuit.py` |
 | 形态 → 提示词 / 工具 / 子智能体 | `agent/profiles.py`、`agent/prompts.py`、`tools/register.py` |

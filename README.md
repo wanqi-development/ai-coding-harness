@@ -103,11 +103,11 @@ GET    /health
 
 ```
 src/ai_coding_harness/
-├── api/            # FastAPI app、路由、SSE、schemas
-├── server/         # 意图判定 + 业务编排 + 运行宿主（RunHub）
+├── api/            # FastAPI app、路由（model_config 按 agents / providers / probe 分包）、SSE、schemas
+├── server/         # 意图判定 + 业务编排（turn/ 按职责拆 mixin）+ 运行宿主（RunHub）
 ├── agent/          # graph、llm、profiles、prompts、subagents（一主三从）
 │   └── middleware/ # 上下文注入 / 脱敏 / 工具自洽 / 边界 / 空转刹车 / 兜底
-├── db/             # 业务库 ORM / DAO / 引擎（PostgreSQL）
+├── db/             # 业务库 ORM / 引擎；dao/ 按表分组（会话 / 方案 / 记录 / 模型 / 澄清）
 ├── backends/       # OpenSandbox 后端 + 混合路由
 ├── sandbox/        # 沙箱供给 + SDK 客户端 + 工作区卷
 ├── tools/          # PR（Gitee / GitHub）/ 方案 / 记忆 / 交接 / web 搜索 / 工具注册

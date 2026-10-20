@@ -25,6 +25,25 @@
 
 ### 2026-10-20
 
+#### 第二批：三个大文件按功能拆包
+
+- **动机**：第一层只整理了目录；三个核心文件仍然过长（`db/dao.py` 703 行、
+  `api/routes/model_config.py` 654 行、`server/service.py` 约 1500 行），职责混在一个文件里。
+- **改动**：
+  - `db/dao.py` → `db/dao/{_common,sessions,repositories,plans,records,models,clarifications}.py`；
+    `__init__.py` 重新导出全部 49 个函数，`dao.foo` 的调用方式不变。
+  - `api/routes/model_config.py` → `model_config/{common,agents,providers,probe}.py`；
+    `__init__.py` 组合三个子 router，URL 与响应模型不变。
+  - `server/service.py` → `server/turn/{common,runner,intent,clarify,records,usage,changes}.py`，
+    按职责拆成 mixin；`service.py` 只留 `HarnessService` 组合、`__init__` 与兼容 re-export。
+  - 测试的 monkeypatch 目标跟着移到了实际使用点（`route.probe` / `route.providers`、
+    `service_mod.turn_intent` / `turn_usage` / `turn_changes` / `turn_records`）。
+  - 注释与前端文档里指向旧文件名的路径（`config.py` / `sessions.py` / `run_log.py` /
+    `memory.py` / `llm.py` / `SettingsPage.vue`）一并改到新位置。
+  - README 目录树与业务流文档同步。
+- **验证**：全量 `pytest` **1588 passed**；`ruff check` 改动文件干净。
+- **遗留**：无。
+
 #### 后端源码按 core / infra 归位
 
 - **动机**：源码根目录混着跨层契约（stream / codeplatform / redact）与宿主机基础设施
