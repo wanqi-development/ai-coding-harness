@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ClarificationInfo } from './api'
+import type { ClarificationInfo } from '../lib/api'
 
 defineProps<{
   info: ClarificationInfo

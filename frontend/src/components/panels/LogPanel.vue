@@ -15,7 +15,7 @@
  *   要看更早的那些行就从这儿拿走 —— 面板不追日志的 `.1`/`.2` 备份文件。
  */
 import { nextTick, ref, watch } from 'vue'
-import { getLogs, logsDownloadUrl, type LogPage } from './api'
+import { getLogs, logsDownloadUrl, type LogPage } from '../../lib/api'
 
 const props = defineProps<{ sessionId: string }>()
 

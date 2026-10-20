@@ -29,11 +29,11 @@ import {
   type ProviderOption,
   type RuntimeSettingItem,
   type RuntimeSettingsSnapshot,
-} from './api'
+} from '../../lib/api'
 import ModelConfigDialog from './ModelConfigDialog.vue'
 import ModelEntry from './ModelEntry.vue'
 import ProvidersPanel from './ProvidersPanel.vue'
-import { formatWindow, parseWindow } from './modelWindow'
+import { formatWindow, parseWindow } from '../../lib/modelWindow'
 import {
   CODE_SIZE,
   CHAT_WIDTH_LABEL,
@@ -48,8 +48,8 @@ import {
   type ChatWidth,
   type PanelTab,
   type ThemeMode,
-} from './prefs'
-import type { SettingsPanel } from './viewState'
+} from '../../lib/prefs'
+import type { SettingsPanel } from '../../lib/viewState'
 
 const props = defineProps<{ panel: SettingsPanel }>()
 const emit = defineEmits<{ close: []; 'reset-layout': []; panel: [SettingsPanel] }>()

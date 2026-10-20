@@ -19,8 +19,8 @@ import {
   type RepoStatus,
   type RepoTree,
   type RepoTreeEntry,
-} from './api'
-import { renderCode } from './markdown'
+} from '../../lib/api'
+import { renderCode } from '../../lib/markdown'
 
 const props = defineProps<{
   sessionId: string

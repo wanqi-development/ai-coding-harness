@@ -10,7 +10,7 @@
  *   并保持中性色 —— 认不出来就说认不出来，不猜。
  */
 import { computed, ref, watch } from 'vue'
-import { getPulls, type PullList } from './api'
+import { getPulls, type PullList } from '../../lib/api'
 
 const props = defineProps<{ sessionId: string }>()
 

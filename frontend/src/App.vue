@@ -25,20 +25,20 @@ import {
   type FileChange,
   getRepoDiff,
   type WorkspaceStatus,
-} from './api'
-import { renderMarkdown } from './markdown'
-import MemoryPanel from './MemoryPanel.vue'
-import LogPanel from './LogPanel.vue'
-import PrPanel from './PrPanel.vue'
-import UsagePanel from './UsagePanel.vue'
-import RepoPanel from './RepoPanel.vue'
-import SettingsPage from './SettingsPage.vue'
-import ClarificationDialog from './ClarificationDialog.vue'
-import { defaultPanelTab } from './prefs'
-import { usePanelWidth } from './splitter'
-import { splitLongText } from './streamblocks'
-import { shouldShowTodos } from './todos'
-import { readView, watchView, writeView, type AppView, type SettingsPanel } from './viewState'
+} from './lib/api'
+import { renderMarkdown } from './lib/markdown'
+import MemoryPanel from './components/panels/MemoryPanel.vue'
+import LogPanel from './components/panels/LogPanel.vue'
+import PrPanel from './components/panels/PrPanel.vue'
+import UsagePanel from './components/panels/UsagePanel.vue'
+import RepoPanel from './components/panels/RepoPanel.vue'
+import SettingsPage from './components/settings/SettingsPage.vue'
+import ClarificationDialog from './components/ClarificationDialog.vue'
+import { defaultPanelTab } from './lib/prefs'
+import { usePanelWidth } from './lib/splitter'
+import { splitLongText } from './lib/streamblocks'
+import { shouldShowTodos } from './lib/todos'
+import { readView, watchView, writeView, type AppView, type SettingsPanel } from './lib/viewState'
 
 /** AI 消息里的三种块；用户消息恒为单个 text 块。待办树固定渲染在回复最下边。 */
 type Part =

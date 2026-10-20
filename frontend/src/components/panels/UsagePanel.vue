@@ -12,7 +12,7 @@
  * - **不算钱**：只显示 token。各家计价口径与缓存折扣不同，显示一个错的金额比不显示更糟。
  */
 import { computed, ref, watch } from 'vue'
-import { getUsage, type UsageActor, type UsageSnapshot } from './api'
+import { getUsage, type UsageActor, type UsageSnapshot } from '../../lib/api'
 
 const props = defineProps<{ sessionId: string }>()
 
