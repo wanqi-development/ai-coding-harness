@@ -231,6 +231,10 @@ class AgentRunLog:
         self._delegations: dict[str, str] = {}
         # 工具调用 id → 起始时刻，用于打印耗时
         self._tool_starts: dict[str, float] = {}
+        # (namespace, 是不是中间件内部调用) → 本次模型调用的起始时刻。
+        # 主控与子智能体会并发调模型，所以按 namespace 各自配对；内部调用（摘要）
+        # 会与主控撞同一个 namespace，再叠一层 internal 标记才分得开。
+        self._llm_starts: dict[tuple[tuple[str, ...], bool], float] = {}
         # 执行主角 → [输入 tokens, 输出 tokens, 调用次数]（``usage_snapshot`` 的原料）
         self._usage: dict[str, list[int]] = {}
         # 平台没回用量的调用次数 —— 账上的缺口要能看见，不能悄悄当成 0
@@ -302,9 +306,9 @@ class AgentRunLog:
         lines[0] += numbers[0]
         lines[1] += numbers[1]
         lines[2] += 1
-        # 上下文压力只看主控那一路（见 ``__init__`` 的说明）。两个数都留着，用法见
-        # ``peak_input`` / ``last_input`` 的说明：没压缩的轮次看峰值（最近一次会因为
-        # 缓存命中而偏小），压缩过的轮次看末值（峰值是压缩前那一次，会虚高）。
+        # 上下文压力只看主控那一路（见 ``__init__`` 的说明）。两个数都留着：
+        # **环图读 ``last_input``**（2026-10-20 用户口径：现在有多长，不看历史峰值）；
+        # ``peak_input`` 留给日志 / 排查，不再参与压力百分比。
         if key == MAIN_ACTOR:
             self._main_peak_input = max(self._main_peak_input, numbers[0])
             self._main_last_input = numbers[0]
@@ -364,6 +368,16 @@ class AgentRunLog:
             parts.append(f"网关记的思考 token {reasoning_tokens}")
         return " / ".join(parts)
 
+    def _llm_elapsed(self, event: dict, internal: bool) -> str:
+        """这次模型调用的耗时（毫秒）。没有 ``message-start`` 的流（半截日志）返回空串。
+
+        单位统一用毫秒：与「工具完成 ← …ms」同一把尺子，日志里不需要再换单位。
+        """
+        start = self._llm_starts.pop((namespace_of(event), internal), None)
+        if start is None:
+            return ""
+        return f"，耗时 {(time.perf_counter() - start) * 1000:.0f}ms"
+
     def usage_snapshot(
         self, *, interrupted: bool = False, context: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -403,15 +417,15 @@ class AgentRunLog:
 
     @property
     def peak_input(self) -> int:
-        """本轮**主控**单次调用的最大输入 tokens（上下文压力的原料，0 ＝ 没测到）。"""
+        """本轮**主控**单次调用的最大输入 tokens（只做排查用；压力百分比读 ``last_input``）。"""
         return self._main_peak_input
 
     @property
     def last_input(self) -> int:
-        """本轮**主控**最后一次调用的输入 tokens（0 ＝ 没测到）。
+        """本轮**主控**最后一次调用的输入 tokens（0 ＝ 没测到）—— 环图用它算压力。
 
-        与 ``peak_input`` 的差别只在「这一轮发生过压缩」时有意义：那会儿峰值是压缩前那一次，
-        末值才是压完之后的真实占用（见 ``service._turn_context`` 的取法）。
+        2026-10-20 用户口径：环图回答「**现在**这条历史有多长」—— 末值天然就是压缩之后的
+        真实占用；峰值只增不减，会把已经压下去的历史显示成「还满着」。
         """
         return self._main_last_input
 
@@ -431,6 +445,11 @@ class AgentRunLog:
         if name:
             self._ns_agents.setdefault(namespace_of(event), name)
         name = event_name(event)
+        if name == "message-start":
+            self._llm_starts[(namespace_of(event), is_internal_call(event))] = (
+                time.perf_counter()
+            )
+            return
         if name == "content-block-delta":
             self._note_delta(event)
             return
@@ -444,10 +463,20 @@ class AgentRunLog:
         if is_internal_call(event):
             self._accumulate(INTERNAL_ACTOR, numbers)
             self._compressions += 1
-            self._log(self.actor(event), "摘要调用完成：%s", usage_of(event))
+            self._log(
+                self.actor(event),
+                "摘要调用完成：%s%s",
+                usage_of(event),
+                self._llm_elapsed(event, True),
+            )
         else:
             self._accumulate(self.actor(event), numbers)
-            self._log(self.actor(event), "LLM 调用完成：%s", usage_of(event))
+            self._log(
+                self.actor(event),
+                "LLM 调用完成：%s%s",
+                usage_of(event),
+                self._llm_elapsed(event, False),
+            )
         # 大调用补一行「产出明细」：输出 1 万 token 而可见正文只有几百字 —— 那 1 万
         # 花在哪（思考？被丢掉的旁白？工具参数？）只有这行能说清。
         if numbers is not None and numbers[1] >= DETAIL_OUTPUT_TOKENS:
@@ -489,9 +518,9 @@ class AgentRunLog:
             returned = delegation_result_text(output)
             self._log(
                 MAIN_AGENT,
-                "子智能体完成 ← %s %.1fs，返回 %d 字：%s",
+                "子智能体完成 ← %s %.0fms，返回 %d 字：%s",
                 subagent,
-                cost,
+                cost * 1000,
                 len(returned),
                 self._safe(returned, self._delegation_result_limit),
             )

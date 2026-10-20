@@ -23,6 +23,7 @@ from tests.v3_events import (
     SUB_NS,
     RunLogFeed,
     message_finish,
+    message_start,
     reasoning,
     text,
     todo_delta,
@@ -236,6 +237,27 @@ class TestUsage:
         caplog.clear()
         log.on_message(message_finish())  # 只有 message-finish 才记用量
         assert _messages(caplog) == ["LLM 调用完成：（无用量信息）"]
+
+    def test_the_call_reports_elapsed_ms(self, caplog):
+        """耗时与「工具完成」同一把尺子（毫秒），不给半截事件编一个假数字。"""
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        log = AgentRunLog(arg_limit=2000, result_limit=300)
+        log.on_message(message_start())
+        log.on_message(_llm_end())
+        line = _messages(caplog)[-1]
+        assert line.startswith("LLM 调用完成：输入 120 / 输出 8 tokens，耗时 ")
+        assert line.endswith("ms")
+
+    def test_each_namespace_times_its_own_call(self, caplog):
+        """主控与子智能体并发调模型：起始时刻按 namespace 配对，不会互相顶掉。"""
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        log = AgentRunLog(arg_limit=2000, result_limit=300)
+        log.on_message(message_start())
+        log.on_message(message_start(ns=SUB_NS, agent="planner"))
+        log.on_message(_llm_end(SUB_NS, agent="planner"))
+        log.on_message(_llm_end())
+        assert all("耗时" in line and line.endswith("ms") for line in _messages(caplog))
+        assert log._llm_starts == {}, "成对的起始时刻要当场弹掉，不能攒着"
 
 
 class TestInternalCallLines:
