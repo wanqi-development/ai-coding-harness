@@ -29,7 +29,7 @@
 - **文件后端**：混合 `CompositeBackend` —— default 走自定义 OpenSandbox 后端，`/memories/` 走 `StoreBackend`。
 - **Redis（可选）**：多 worker 时的**跨进程旁路状态** —— 一轮对话的帧缓冲（刷新/断线后落到哪个 worker 都能带 `after` 游标接回）、会话运行权（同一会话不许两个 worker 同时跑）、模型熔断状态。帧号由 `INCR` 发，缓冲有上限与 TTL。**不配 `REDIS_URL` 就全部留在进程内**（单 worker 的行为，默认）；配了但连不上会退回进程内并记 warning，`REDIS_REQUIRED=true` 则直接拒绝启动。单条命令失败后退回进程内是**「冷却一段时间再试一次」而不是永久降级**（默认 60s）—— 走隧道 / 在远端的 Redis 一次瞬时抖动，不该让这个进程此后彻底失去跨进程能力。注意：**沙箱句柄仍在各 worker 里**（同一会话落到别的 worker 会另建容器，工作区靠命名卷共享），所以真要横向扩容还得配 sticky 路由或「谁持锁谁干活」的约束。
 - **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机自己 `git clone --bare` 一份只读缓存（按 `owner/repo`，`REPO_VIEW_DIR` 默认 **`~/.ai-coding-harness/repo_cache`**，即用户个人目录，不写进项目目录），切分支只是换个 ref，读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
-- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流；token 请求优先、平台配置兜底。**两个平台的 OAuth 登录后端都已就绪**（`/auth/gitee/*` 与 `/auth/github/*`，换回的 token 随 `create_session` 的 `gitee_token` / `github_token` 带上）；**前端还没接登录入口**，所以眼下实际用的仍是 `.env` 里的 `GITEE_ACCESS_TOKEN` / `GITHUB_ACCESS_TOKEN`（见 CHANGELOG 遗留项）。
+- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流。令牌与 git 用户名在设置页「代码平台」那一栏配（`.env` 的同名键只是初始值），**建会话时快照进库**，之后改配置不影响已有会话。OAuth 登录已删（2026-10-20）。
 - **安全**：危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
 - **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（到压缩线后的应急裁剪：剪了几条、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。
 - **思考展示**：模型思考以 `reasoning` 帧单独下发，主控与子智能体按角色分段显示；它只存在于前端与 RunHub 的临时帧缓冲，**不落业务库**。流式期间正文按纯文本显示，任务结束后一次性 Markdown 化。
@@ -63,7 +63,7 @@
 ## API
 
 ```
-POST   /sessions                    {"repo_url": "...", "gitee_token": "可选", "github_token": "可选"}  # 建会话（同仓库已有活跃会话则复用）
+POST   /sessions                    {"repo_url": "..."}                         # 建会话（同仓库已有活跃会话则复用；令牌取设置页那一栏）
 GET    /sessions                    ?limit=50                                   # 会话列表
 GET    /sessions/{id}                                                           # 会话详情（含 running，刷新后据此决定是否接回直播）
 DELETE /sessions/{id}                                                           # 销毁会话
@@ -90,10 +90,6 @@ PUT    /model-config/providers/{provider}                                       
 POST   /chat/{id}                   {"message": "..."}                          # 起一轮（SSE 流式）
                                      # 澄清选项：再加 {"clarification_id":"...","choice":0}
 GET    /chat/{id}/stream            ?after=<帧号>                               # 续订阅（刷新后接回）
-GET    /auth/gitee/authorize                                                    # 跳转 Gitee 授权页（带自签 state）
-GET    /auth/gitee/callback             ?code=...&state=...                     # 授权回调，验 state 后拿 code 换 token
-GET    /auth/github/authorize                                                   # 跳转 GitHub 授权页（同上）
-GET    /auth/github/callback            ?code=...&state=...                     # 授权回调（GitHub 必须回 Accept: application/json）
 GET    /health
 ```
 
@@ -158,5 +154,5 @@ npm --prefix frontend run dev          # 前端 http://localhost:5173
 - **兜底与熔断**：兜底只有设置页「兜底模型」那一行（留空＝关掉）；`FALLBACK_CIRCUIT_THRESHOLD` / `FALLBACK_CIRCUIT_COOLDOWN_SECONDS` 仍从 `.env` 读。
 - **意图分类**：**严格二选一**（设置页 →「模型配置」→ 意图识别里选）—— JEV 那一行（供应商锁 `typesafe`，填 base_url + api_key）或「意图识别（大模型）」那一行。`INTENT_JEV_ENABLED` / `INTENT_LLM_ENABLED`（关掉某一侧）、`INTENT_TIMEOUT_SECONDS` / `INTENT_HISTORY_TURNS` / `TYPESAFE_TIMEOUT_SECONDS` 仍在 `.env`。
 - **运行约束**：`AGENT_RECURSION_LIMIT`、`LOOP_GUARD_REPEATS`（`0` = 关掉空转刹车）、`HANDOFF_RESULT_MAX`。
-- **业务**：`GLM_*`（智谱，web 搜索也用它）、`OPENSANDBOX_*` + `SANDBOX_*`（沙箱镜像 / 资产 / 工作区卷）、`GITEE_*` / `GITHUB_*`（两个平台的 PR 兜底 token、OAuth 登录凭据，GitHub 侧要先建 OAuth App 并把回调地址填成 `GITHUB_OAUTH_REDIRECT_URI`）、`POSTGRES_*`（业务库）。
+- **业务**：`GLM_*`（智谱，web 搜索也用它）、`OPENSANDBOX_*` + `SANDBOX_*`（沙箱镜像 / 资产 / 工作区卷）、`GITEE_*` / `GITHUB_*`（两个平台的令牌与 git 用户名的初始值，配好之后以设置页「代码平台」那一栏为准）、`POSTGRES_*`（业务库）。
 - **Redis（可选，多 worker 才需要）**：`REDIS_URL`（留空 = 进程内）、`REDIS_PREFIX`、`REDIS_REQUIRED`、`REDIS_TIMEOUT_SECONDS`（默认 5s；**Redis 走隧道 / 在远端时必须放大**）、`REDIS_DEGRADE_COOLDOWN_SECONDS`（一次失败后退回进程内多久再试一次，默认 60s；设 0 = 旧的「永久降级」），以及运行缓冲/运行权的 `RUN_BUFFER_TTL_SECONDS`、`RUN_BUFFER_MAX_FRAMES`、`RUN_LOCK_TTL_SECONDS`、`RUN_POLL_INTERVAL_SECONDS`。

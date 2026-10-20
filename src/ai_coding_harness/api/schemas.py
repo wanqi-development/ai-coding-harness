@@ -10,10 +10,8 @@ from pydantic import BaseModel, Field
 
 class CreateSessionRequest(BaseModel):
     repo_url: str
-    # 平台由 repo_url 判定；两个令牌字段按平台取用（Gitee 走 OAuth 登录、
-    # GitHub 目前只支持 .env 里的令牌，见 CHANGELOG 的遗留项）
-    gitee_token: str | None = None
-    github_token: str | None = None
+    # 平台由 repo_url 判定；令牌**不在这里传** —— 统一取设置页「代码平台」那两格
+    # （2026-10-20 用户口径：取消 OAuth 登录，令牌改成配置项）
 
 
 class SessionResponse(BaseModel):
@@ -214,6 +212,9 @@ class RuntimeSettingItem(BaseModel):
 
     ``source`` 说的是**现在生效的这个值是哪来的**：``db``（在界面里改过）还是 ``default``
     （``.env`` / 代码默认值）。界面据此标一格「已改过」，与模型配置那套口径一致。
+
+    ``kind="secret"`` 的格子额外带 ``has_value``：``value`` 只在**打开设置页时**回掩码，
+    保存之后的响应里是空串（用户口径 2026-10-20：配过就有提示，保存完不再回显）。
     """
 
     key: str
@@ -222,6 +223,8 @@ class RuntimeSettingItem(BaseModel):
     #: 值的类型：``str`` / ``int`` / ``float``（界面据此选输入框与校验）
     kind: str = "str"
     value: Any = None
+    #: 这一格是否已配置值（仅 ``secret`` 有意义；空串 + 它才是「配过但没回显」）
+    has_value: bool = False
     source: str = "default"
 
 

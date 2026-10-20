@@ -47,6 +47,7 @@ class TestTheKeyTable:
         assert len(set(keys)) == len(keys), "键是表主键"
         assert {item.group for item in RUNTIME_SETTINGS} == {
             "代码缓存配置",
+            "代码平台",
             "上下文窗口配置",
             "上下文压缩配置",
             "意图识别",
@@ -55,8 +56,12 @@ class TestTheKeyTable:
     def test_intent_clarify_threshold_defaults_to_055(self):
         assert _settings().intent_clarify_confidence == 0.55
 
-    def test_only_the_three_kinds_are_used(self):
-        assert {item.kind for item in RUNTIME_SETTINGS} <= {"str", "int", "float"}
+    def test_only_the_four_kinds_are_used(self):
+        assert {item.kind for item in RUNTIME_SETTINGS} <= {"str", "int", "float", "secret"}
+
+    def test_the_platform_tokens_are_secrets(self):
+        for key in ("gitee_access_token", "github_access_token"):
+            assert RUNTIME_SETTING_BY_KEY[key].kind == "secret", key
 
 
 # -- 二、类型转换与落值 --------------------------------------------------------
@@ -224,6 +229,64 @@ class TestApi:
         assert store["gitee_base_branch"] == ""
         assert settings.gitee_base_branch == ""
         assert {i["key"]: i for i in body["items"]}["gitee_base_branch"]["source"] == "db"
+
+
+class TestSecrets:
+    """令牌那两格（2026-10-20 用户口径）：打开设置页回掩码，保存之后不再回显。"""
+
+    def _app_with_token(self, monkeypatch, token: str = "ghp_0123456789abcdef"):
+        store: dict[str, Any] = {}
+        settings = _settings(github_access_token=token)
+        _patch_dao(monkeypatch, store)
+        return _app(settings, store), settings, store
+
+    async def test_get_echoes_a_mask_not_the_value(self, monkeypatch):
+        app = self._app_with_token(monkeypatch)[0]
+
+        body = (await _call(app, "GET", "/app-settings")).json()
+
+        item = {i["key"]: i for i in body["items"]}["github_access_token"]
+        assert item["kind"] == "secret"
+        assert item["value"] == "ghp…cdef"
+        assert item["has_value"] is True
+        assert "0123456789abcdef" not in str(body), "明文一个字节都不该出现在响应里"
+
+    async def test_put_does_not_echo_the_token(self, monkeypatch):
+        app, settings_, store = self._app_with_token(monkeypatch, token="")
+
+        body = (
+            await _call(
+                app,
+                "PUT",
+                "/app-settings",
+                json={"items": {"github_access_token": "ghp_0123456789abcdef"}},
+            )
+        ).json()
+
+        item = {i["key"]: i for i in body["items"]}["github_access_token"]
+        assert settings_.github_access_token == "ghp_0123456789abcdef", "当场生效"
+        assert store["github_access_token"] == "ghp_0123456789abcdef"
+        assert item["value"] == "", "保存之后不再回显"
+        assert item["has_value"] is True, "但要能说「配过了」"
+
+    async def test_a_mask_sent_back_unchanged_is_not_a_write(self, monkeypatch):
+        """界面上那串掩码只是提示：原样提交回来不等于把令牌改成了掩码本身。"""
+        token = "ghp_0123456789abcdef"
+        app, settings_, store = self._app_with_token(monkeypatch, token=token)
+
+        await _call(app, "PUT", "/app-settings", json={"items": {"github_access_token": "ghp…cdef"}})
+
+        assert settings_.github_access_token == token
+        assert store == {}
+
+    async def test_an_empty_value_clears_it(self, monkeypatch):
+        """把掩码删空再保存＝清除（这是界面上唯一能触发清空的动作）。"""
+        app, settings_, store = self._app_with_token(monkeypatch)
+
+        await _call(app, "PUT", "/app-settings", json={"items": {"github_access_token": ""}})
+
+        assert settings_.github_access_token == ""
+        assert store["github_access_token"] == ""
 
 
 # -- 四、这几格真的被读到（不然「能配」是假的）--------------------------------

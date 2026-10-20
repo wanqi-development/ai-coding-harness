@@ -84,7 +84,8 @@ class TurnRunnerMixin:
         """
         terms = secret_terms(
             session.repo.token,
-            self._settings.gitee_access_token,
+            # 两家平台的令牌都可能被模型复述（设置页配的那份）
+            *self._settings.code_platform_secret_values(),
             # 模型凭据也进词表（2026-10-13）：库里/界面配的 key 同样不该出现在日志与记录里
             *self._settings.model_secret_values(),
         )
