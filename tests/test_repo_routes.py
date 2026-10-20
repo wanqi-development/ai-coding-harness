@@ -237,7 +237,7 @@ class TestErrors:
         assert "nosuch" in resp.json()["detail"]
 
     async def test_without_git_it_is_503_not_a_500(self, app, monkeypatch):
-        monkeypatch.setattr("ai_coding_harness.repo_cache.find_git", lambda settings: None)
+        monkeypatch.setattr("ai_coding_harness.infra.repo_cache.find_git", lambda settings: None)
         # 路由在读状态时也调 find_git，这里让它返回 None（面板会显示「没找到 git」）
         async with _client(app) as client:
             resp = await client.post("/sessions/s-1/repo/sync")

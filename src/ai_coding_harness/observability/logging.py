@@ -41,7 +41,7 @@ _AGENT_PREFIXES = (
     # 旁路状态（运行缓冲 / 熔断状态）的降级告警。它不在上面任何前缀下，漏掉这条的代价
     # 实测过：Redis 连不上时那句「退回进程内实现」只进控制台，日志文件里一个字都没有，
     # 窗口一关就再也查不到为什么「明明连得上却降级了」。
-    "ai_coding_harness.redis_cache",
+    "ai_coding_harness.infra.redis_cache",
     "opensandbox",
     "httpx",
     "langchain",

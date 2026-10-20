@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_coding_harness.codeplatform import (
+from ai_coding_harness.core.codeplatform import (
     Platform,
     RepoSpec,
     parse_pr_url,

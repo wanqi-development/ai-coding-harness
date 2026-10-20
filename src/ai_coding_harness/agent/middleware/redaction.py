@@ -23,7 +23,7 @@ from langchain.agents.middleware import (
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
-from ai_coding_harness.redact import redact
+from ai_coding_harness.safety.redact import redact
 from ai_coding_harness.tools.context import get_redact_terms
 
 

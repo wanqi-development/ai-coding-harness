@@ -30,9 +30,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from ai_coding_harness.observability.logging import MAIN_AGENT, MAIN_AGENT_NAME
-from ai_coding_harness.redact import redact
-from ai_coding_harness.stream import (
+from ai_coding_harness.core.stream import (
     TASK_TOOL,
     event_name,
     is_internal_call,
@@ -41,6 +39,8 @@ from ai_coding_harness.stream import (
     namespace_of,
     payload_of,
 )
+from ai_coding_harness.observability.logging import MAIN_AGENT, MAIN_AGENT_NAME
+from ai_coding_harness.safety.redact import redact
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ _MAIN_NAMES = frozenset({MAIN_AGENT, MAIN_AGENT_NAME})
 #: 「主控」名下会把这笔开销藏起来 —— 实测单次就是 7 万~8 万输入 tokens。
 INTERNAL_ACTOR = "internal"
 
-#: 意图分类那次调用的归类名。它跑在事件流之外（``server/service.py`` 直接调），
+#: 意图分类那次调用的归类名。它跑在事件流之外（``server/turn/intent.py`` 直接调），
 #: 用量由 service 并进同一份账，所以归类名在这里定义、两处共用。
 INTENT_ACTOR = "intent"
 

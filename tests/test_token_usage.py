@@ -437,7 +437,7 @@ async def test_the_round_streams_the_account_while_it_runs(monkeypatch) -> None:
     from ai_coding_harness.server import service as service_mod
     from tests.test_plan_events import _run, _tool_call
 
-    monkeypatch.setattr(service_mod, "_USAGE_FRAME_MIN_GAP", 0.0)
+    monkeypatch.setattr(service_mod.turn_usage, "_USAGE_FRAME_MIN_GAP", 0.0)
 
     out = await _run([*_tool_call("execute"), *_tool_call("read_file", call_id="t2")])
 

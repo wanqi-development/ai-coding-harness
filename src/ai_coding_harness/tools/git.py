@@ -15,13 +15,13 @@ import logging
 import httpx
 from langchain_core.tools import BaseTool, tool
 
-from ai_coding_harness.codeplatform import (
+from ai_coding_harness.config import Settings
+from ai_coding_harness.core.codeplatform import (
     Platform,
     RepoSpec,
     parse_pr_url,
     parse_repo_url,
 )
-from ai_coding_harness.config import Settings
 from ai_coding_harness.tools.gitee_client import GiteeClient
 from ai_coding_harness.tools.github_client import GitHubClient
 from ai_coding_harness.tools.pr_client import (

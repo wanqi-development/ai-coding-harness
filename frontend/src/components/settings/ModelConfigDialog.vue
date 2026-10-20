@@ -17,8 +17,8 @@
  * 自己不持有状态：草稿还是父组件那份，改完点「保存」由父组件提交这一行。
  */
 import { computed, onMounted, ref } from 'vue'
-import { formatWindow, parseWindow } from './modelWindow'
-import type { ProviderModelItem, ProviderOption } from './api'
+import { formatWindow, parseWindow } from '../../lib/modelWindow'
+import type { ProviderModelItem, ProviderOption } from '../../lib/api'
 
 type Draft = {
   provider: string

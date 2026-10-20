@@ -14,7 +14,7 @@
  * 要下架就停用。
  */
 import { onMounted, onUnmounted, ref } from 'vue'
-import { getProviders, putProvider, type ProviderOption, type ProviderUpsert } from './api'
+import { getProviders, putProvider, type ProviderOption, type ProviderUpsert } from '../../lib/api'
 
 const providers = ref<ProviderOption[]>([])
 const busy = ref(false)

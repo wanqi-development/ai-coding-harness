@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from ai_coding_harness.stream import INTERNAL_CALL_KEY, ToolNames
+from ai_coding_harness.core.stream import INTERNAL_CALL_KEY, ToolNames
 
 MAIN_NS: tuple[str, ...] = ()
 SUB_NS = ("tools:7b1e4d2a-0000-4000-8000-000000000001",)

@@ -21,8 +21,8 @@ import pytest
 from fastapi import FastAPI
 
 from ai_coding_harness.api.routes import sessions as sessions_route
-from ai_coding_harness.codeplatform import Platform, RepoSpec
 from ai_coding_harness.config import Settings
+from ai_coding_harness.core.codeplatform import Platform, RepoSpec
 from ai_coding_harness.observability.context import reset_session_id, set_session_id
 from ai_coding_harness.observability.log_tail import read_session_logs
 from ai_coding_harness.observability.logging import setup_logging

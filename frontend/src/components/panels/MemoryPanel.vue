@@ -12,8 +12,8 @@
  * - 没写过记忆的仓库是**空态**（`content === null`），不是错误。
  */
 import { ref, watch } from 'vue'
-import { getMemory, type MemorySnapshot } from './api'
-import { renderMarkdown } from './markdown'
+import { getMemory, type MemorySnapshot } from '../../lib/api'
+import { renderMarkdown } from '../../lib/markdown'
 
 const props = defineProps<{ sessionId: string }>()
 

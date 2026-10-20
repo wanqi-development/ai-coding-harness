@@ -39,7 +39,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.types import Command
 
 from ai_coding_harness.agent import graph as graph_mod
-from ai_coding_harness.agent.context_calibration import CalibratedTokenCounter
+from ai_coding_harness.agent.middleware.context_calibration import CalibratedTokenCounter
 from ai_coding_harness.agent.middleware.context_trim import (
     context_token_counter,
 )

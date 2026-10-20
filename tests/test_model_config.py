@@ -749,7 +749,7 @@ class TestApi:
             seen["url"] = route._models_url(base_url, path)
             return [{"model": "glm-5.3", "model_type": "chat", "context_window": 1_048_576}]
 
-        monkeypatch.setattr(route, "fetch_provider_model_entries", fake_entries)
+        monkeypatch.setattr(route.providers, "fetch_provider_model_entries", fake_entries)
         settings = _settings()
         app = _app(settings)
         await apply_model_providers(settings, _FakeDb([]))  # 内存那份还拿着旧路径
@@ -1050,7 +1050,7 @@ class TestApi:
             assert (base_url, api_key) == ("https://row/v1", "sk-fresh")
             return ["m1", "m2"], 65_536
 
-        monkeypatch.setattr(route, "fetch_provider_models", fake)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", fake)
 
         body = (
             await _call(
@@ -1073,7 +1073,7 @@ class TestApi:
         async def fake(base_url: str, api_key: str, **kw: Any):
             return ["m1"], 0
 
-        monkeypatch.setattr(route, "fetch_provider_models", fake)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", fake)
 
         body = (
             await _call(
@@ -1092,7 +1092,7 @@ class TestApi:
         async def boom(base_url: str, api_key: str, **kw: Any):
             raise httpx.ConnectError("connection refused")
 
-        monkeypatch.setattr(route, "fetch_provider_models", boom)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", boom)
 
         resp = await _call(
             _app(),
@@ -1123,7 +1123,7 @@ class TestApi:
             seen.update(base_url=base_url, api_key=api_key)
             return [], 0
 
-        monkeypatch.setattr(route, "fetch_provider_models", fake)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", fake)
 
         await _call(
             _app(_settings()),
@@ -1143,7 +1143,7 @@ class TestApi:
             seen.update(base_url=base_url, api_key=api_key)
             return [], 0
 
-        monkeypatch.setattr(route, "fetch_provider_models", fake)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", fake)
 
         await _call(
             _app(_settings(typesafe_api_key="sk-jev")),
@@ -1184,7 +1184,7 @@ class TestProbeWithDirectory:
             seen.update(base_url=base_url, api_key=api_key, **kw)
             return ["m1"], 0
 
-        monkeypatch.setattr(route, "fetch_provider_models", fake)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", fake)
 
         await _call(
             _app(),
@@ -1208,7 +1208,7 @@ class TestProbeWithDirectory:
         async def boom(base_url: str, api_key: str, **kw: Any):
             raise httpx.ConnectError("connection refused")
 
-        monkeypatch.setattr(route, "fetch_provider_models", boom)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", boom)
 
         body = (
             await _call(
@@ -1242,7 +1242,7 @@ class TestProbeWithDirectory:
             seen["called"] = base_url
             return ["live1"], 0
 
-        monkeypatch.setattr(route, "fetch_provider_models", fake)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", fake)
 
         body = (
             await _call(
@@ -1267,7 +1267,7 @@ class TestProbeWithDirectory:
         async def fake(base_url: str, api_key: str, **kw: Any):
             return [], 0
 
-        monkeypatch.setattr(route, "fetch_provider_models", fake)
+        monkeypatch.setattr(route.probe, "fetch_provider_models", fake)
 
         body = (
             await _call(

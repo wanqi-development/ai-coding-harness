@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ai_coding_harness.agent.memory_reconcile import (
+from ai_coding_harness.agent.middleware.memory_reconcile import (
     PENDING,
     reconcile,
     restamp,

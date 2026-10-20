@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ai_coding_harness.agent.memory_reconcile import restamp
+from ai_coding_harness.agent.middleware.memory_reconcile import restamp
 from ai_coding_harness.backends.composite import memory_path
 from ai_coding_harness.config import Settings
 from ai_coding_harness.tools import memory as memory_mod

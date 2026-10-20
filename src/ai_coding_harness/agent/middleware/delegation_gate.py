@@ -41,8 +41,8 @@ from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
+from ai_coding_harness.core.stream import TASK_TOOL, TODO_TOOL
 from ai_coding_harness.observability.logging import MAIN_AGENT
-from ai_coding_harness.stream import TASK_TOOL, TODO_TOOL
 
 logger = logging.getLogger(__name__)
 

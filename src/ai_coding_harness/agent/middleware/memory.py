@@ -32,7 +32,7 @@ checkpoint。**没写过记忆的仓库不注入**：那时盘上根本没有这
 **抛出的 ``TurnStop`` 就是用户看到的东西** —— server 层收下后把 ``marker`` 原样发成
 ``ai`` 帧并写进记录正文，所以文案要能独立读懂，不靠前后文。
 
-这里的 :func:`refresh_memory` 也被**轮末打底**（``server/service.py``）复用：启动与编码
+这里的 :func:`refresh_memory` 也被**轮末打底**（``server/turn/records.py``）复用：启动与编码
 收尾是同一件事的两次机会，读→对账→写回的写法与「查不到不写」的纪律只该有一份。
 
 **两件事分开**（2026-09-25 起）：
@@ -71,14 +71,14 @@ from deepagents.backends.protocol import BackendProtocol
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import SystemMessage
 
-from ai_coding_harness.agent.memory_reconcile import (
+from ai_coding_harness.agent.middleware.context_inject import now_stamp
+from ai_coding_harness.agent.middleware.guard import TurnStop
+from ai_coding_harness.agent.middleware.memory_reconcile import (
     OpenPull,
     Reconciled,
     reconcile,
     rows_to_verify,
 )
-from ai_coding_harness.agent.middleware.context_inject import now_stamp
-from ai_coding_harness.agent.middleware.guard import TurnStop
 from ai_coding_harness.agent.profiles import (
     ANALYSIS_FORM,
     ORCHESTRATE_FORM,
@@ -87,8 +87,8 @@ from ai_coding_harness.agent.profiles import (
     REVIEW_FORM,
 )
 from ai_coding_harness.backends.composite import memory_path
-from ai_coding_harness.codeplatform import platform_label
 from ai_coding_harness.config import Settings
+from ai_coding_harness.core.codeplatform import platform_label
 from ai_coding_harness.server.intent import REWORK_INTENT
 from ai_coding_harness.tools.context import get_intent
 from ai_coding_harness.tools.git import PrLookupError, RepoSpec, build_git_client

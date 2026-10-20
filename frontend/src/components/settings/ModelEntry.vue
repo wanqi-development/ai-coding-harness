@@ -32,7 +32,7 @@ const props = defineProps<{
 const emit = defineEmits<{ configure: [] }>()
 
 /** 窗口：按 K / M 紧凑显示（与弹窗那一格同一个函数口径）。 */
-import { formatWindow } from './modelWindow'
+import { formatWindow } from '../../lib/modelWindow'
 
 /**
  * 次行：**本行配了什么** + **实际生效是什么**。

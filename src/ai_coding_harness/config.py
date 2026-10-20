@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ai_coding_harness.codeplatform import Platform
+from ai_coding_harness.core.codeplatform import Platform
 
 logger = logging.getLogger(__name__)
 
@@ -543,10 +543,10 @@ class Settings(BaseSettings):
     # 以游标重放）、会话运行权（同一会话不许两个 worker 同时跑）、模型熔断状态。
     # 留空 `REDIS_URL` = 全部留在进程内，就是 2026-09-26 之前的行为（单 worker 够用）。
     # `REDIS_REQUIRED=true` 时连不上直接启动失败 —— 多 worker 部署该开：静默退回进程内
-    # 意味着「你以为共享的东西其实各 worker 一份」，比启动失败更难查（见 redis_cache.py）。
+    # 意味着「你以为共享的东西其实各 worker 一份」，比启动失败更难查（见 infra/redis_cache.py）。
     redis_url: str = os.getenv("REDIS_URL", "")
     # 密码单独一个键（而不是塞进 URL）：① URL 会被日志原样打出来，密码进去就跟着泄；
-    # ② 两边都写时以这个键为准（见 redis_cache.default_client_factory）。
+    # ② 两边都写时以这个键为准（见 infra/redis_cache.default_client_factory）。
     redis_password: str = os.getenv("REDIS_PASSWORD", "")
     redis_prefix: str = os.getenv("REDIS_PREFIX", "harness:")
     redis_required: bool = os.getenv("REDIS_REQUIRED", "false").strip().lower() in (
@@ -560,7 +560,7 @@ class Settings(BaseSettings):
     # （TCP 重传通常 ≥200ms、连丢可到 1s 以上）就把进程打到降级。默认给 5 秒。
     redis_timeout_seconds: float = float(os.getenv("REDIS_TIMEOUT_SECONDS", "5.0"))
     # 降级窗口：一次失败后退回进程内这么多秒，**过了就再试一次**（不是永久降级 ——
-    # 理由与实测见 redis_cache.py 的 ``RedisBacked.run``）。设 0 ＝ 永不重试（旧行为）。
+    # 理由与实测见 infra/redis_cache.py 的 ``RedisBacked.run``）。设 0 ＝ 永不重试（旧行为）。
     redis_degrade_cooldown_seconds: float = float(
         os.getenv("REDIS_DEGRADE_COOLDOWN_SECONDS", "60")
     )
@@ -752,12 +752,12 @@ class Settings(BaseSettings):
 
     # 右侧栏「代码」面板：**宿主机自己** clone 一份仓库做只读浏览（不经沙箱）。
     # 为什么要有：沙箱会没（TTL 到期、会话结束、首次创建失败），而「看看这个仓库的代码」
-    # 是随时都可能想做的事；本机 clone 一份之后，面板与沙箱彻底解耦（见 repo_cache.py）。
+    # 是随时都可能想做的事；本机 clone 一份之后，面板与沙箱彻底解耦（见 infra/repo_cache.py）。
     repo_view_enabled: bool = True
     # 缓存根目录，按 owner/repo 各一份裸仓。**默认落在用户个人目录下**
     # （`~/.ai-coding-harness/repo_cache`），不写进项目目录 —— 那是下载来的第三方代码，
     # 混在项目里既会被误当成项目文件，也会跟着项目被备份/同步走。
-    # 给了相对路径就按**当前工作目录**解析（`repo_cache.py` 会把它转成绝对路径）。
+    # 给了相对路径就按**当前工作目录**解析（`infra/repo_cache.py` 会把它转成绝对路径）。
     repo_view_dir: str = Field(default_factory=_default_repo_view_dir)
     # git 可执行文件；留空 = 自动探测（PATH + Windows 常见安装位置）
     repo_view_git: str = ""
@@ -821,7 +821,7 @@ class Settings(BaseSettings):
     def provider_metas(self) -> tuple[ProviderMeta, ...]:
         """启动时读进来的那份目录 —— 现在只当**兜底**用（见下）。
 
-        界面上的目录是**每条请求现读库**（`api/routes/model_config.py::_provider_metas`），
+        界面上的目录是**每条请求现读库**（`api/routes/model_config/common.py::_provider_metas`），
         所以改库 + 刷新就生效、不用重启。这里这份在两种情况下生效：
         库里读不出来（表坏了 / 连不上），以及压根没有种子文件的老环境 —— 退回
         ``PROVIDER_OPTIONS`` + ``.env`` 里的地址，行为与加表之前一致。

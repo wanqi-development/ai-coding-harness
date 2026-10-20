@@ -21,7 +21,7 @@ from ai_coding_harness.config import (
     Settings,
     model_metas_of,
 )
-from ai_coding_harness.model_types import MODEL_TYPES, is_text_model, model_type_of
+from ai_coding_harness.core.model_types import MODEL_TYPES, is_text_model, model_type_of
 
 GLM = "https://open.bigmodel.cn/api/paas/v4/"
 
@@ -222,7 +222,7 @@ class TestApi:
                 {"model": "glm-5.3-embedding", "model_type": "embedding", "context_window": 8192},
             ]
 
-        monkeypatch.setattr(route, "fetch_provider_model_entries", fake_entries)
+        monkeypatch.setattr(route.providers, "fetch_provider_model_entries", fake_entries)
 
         body = (
             await _call(
@@ -243,7 +243,7 @@ class TestApi:
         async def boom(base_url, api_key, **kw):
             raise httpx.ConnectError("connection refused")
 
-        monkeypatch.setattr(route, "fetch_provider_model_entries", boom)
+        monkeypatch.setattr(route.providers, "fetch_provider_model_entries", boom)
 
         resp = await _call(
             _app(settings, store), "POST", "/model-config/providers/glm/models/refresh"
@@ -325,7 +325,7 @@ class TestApi:
         async def fake_entries(base_url, api_key, **kw):
             return [{"model": "glm-5.3", "model_type": "chat", "context_window": 0}]
 
-        monkeypatch.setattr(route, "fetch_provider_model_entries", fake_entries)
+        monkeypatch.setattr(route.providers, "fetch_provider_model_entries", fake_entries)
 
         body = (
             await _call(

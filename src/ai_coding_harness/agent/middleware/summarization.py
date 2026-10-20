@@ -61,7 +61,7 @@ from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage
 
-from ai_coding_harness.agent.context_calibration import CalibratedTokenCounter
+from ai_coding_harness.agent.middleware.context_calibration import CalibratedTokenCounter
 from ai_coding_harness.agent.middleware.context_trim import (
     keep_items_from_messages,
     pretrim_tool_results,

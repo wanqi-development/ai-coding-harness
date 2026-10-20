@@ -1,4 +1,4 @@
-"""宿主机侧的仓库只读缓存（``repo_cache.py``）：**真拿 git 跑**，不 mock git。
+"""宿主机侧的仓库只读缓存（``infra/repo_cache.py``）：**真拿 git 跑**，不 mock git。
 
 夹具是一个临时 git 仓库（master + 一支 feature 分支 + 带空格/中文的路径 + 二进制文件），
 克隆走**本地路径** —— 不需要网络，也不涉及凭据。本机没装 git 时整个文件跳过：这个功能
@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from ai_coding_harness.config import Settings
-from ai_coding_harness.repo_cache import (
+from ai_coding_harness.infra.repo_cache import (
     GitMissingError,
     RepoSpec,
     RepoViewError,
@@ -347,8 +347,8 @@ class TestCredentials:
         把认证头挂到 gitee.com 上，等于**静默失效**：git 照样去 github 拉，却带着一份用不上
         的凭据。
         """
-        from ai_coding_harness.codeplatform import Platform
-        from ai_coding_harness.repo_cache import _auth_env
+        from ai_coding_harness.core.codeplatform import Platform
+        from ai_coding_harness.infra.repo_cache import _auth_env
 
         gitee = _auth_env(RepoSpec(owner="a", repo="b", url="", token="t"))
         github = _auth_env(
@@ -407,7 +407,7 @@ class TestGitDiscovery:
         assert require_git(settings) == "/opt/git/bin/git"
 
     def test_no_git_anywhere_gives_a_readable_error(self, monkeypatch):
-        monkeypatch.setattr("ai_coding_harness.repo_cache.find_git", lambda settings: None)
+        monkeypatch.setattr("ai_coding_harness.infra.repo_cache.find_git", lambda settings: None)
 
         with pytest.raises(GitMissingError, match="REPO_VIEW_GIT"):
             require_git(Settings())

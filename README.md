@@ -28,7 +28,7 @@
 - **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
 - **文件后端**：混合 `CompositeBackend` —— default 走自定义 OpenSandbox 后端，`/memories/` 走 `StoreBackend`。
 - **Redis（可选）**：多 worker 时的**跨进程旁路状态** —— 一轮对话的帧缓冲（刷新/断线后落到哪个 worker 都能带 `after` 游标接回）、会话运行权（同一会话不许两个 worker 同时跑）、模型熔断状态。帧号由 `INCR` 发，缓冲有上限与 TTL。**不配 `REDIS_URL` 就全部留在进程内**（单 worker 的行为，默认）；配了但连不上会退回进程内并记 warning，`REDIS_REQUIRED=true` 则直接拒绝启动。单条命令失败后退回进程内是**「冷却一段时间再试一次」而不是永久降级**（默认 60s）—— 走隧道 / 在远端的 Redis 一次瞬时抖动，不该让这个进程此后彻底失去跨进程能力。注意：**沙箱句柄仍在各 worker 里**（同一会话落到别的 worker 会另建容器，工作区靠命名卷共享），所以真要横向扩容还得配 sticky 路由或「谁持锁谁干活」的约束。
-- **右侧栏「代码」面板**（`repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机自己 `git clone --bare` 一份只读缓存（按 `owner/repo`，`REPO_VIEW_DIR` 默认 **`~/.ai-coding-harness/repo_cache`**，即用户个人目录，不写进项目目录），切分支只是换个 ref，读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
+- **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机自己 `git clone --bare` 一份只读缓存（按 `owner/repo`，`REPO_VIEW_DIR` 默认 **`~/.ai-coding-harness/repo_cache`**，即用户个人目录，不写进项目目录），切分支只是换个 ref，读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
 - **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流；token 请求优先、平台配置兜底。**两个平台的 OAuth 登录后端都已就绪**（`/auth/gitee/*` 与 `/auth/github/*`，换回的 token 随 `create_session` 的 `gitee_token` / `github_token` 带上）；**前端还没接登录入口**，所以眼下实际用的仍是 `.env` 里的 `GITEE_ACCESS_TOKEN` / `GITHUB_ACCESS_TOKEN`（见 CHANGELOG 遗留项）。
 - **安全**：危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
 - **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（到压缩线后的应急裁剪：剪了几条、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。
@@ -103,18 +103,18 @@ GET    /health
 
 ```
 src/ai_coding_harness/
-├── api/            # FastAPI app、路由、SSE、schemas
-├── server/         # 意图判定 + 业务编排 + 运行宿主（RunHub）
+├── api/            # FastAPI app、路由（model_config 按 agents / providers / probe 分包）、SSE、schemas
+├── server/         # 意图判定 + 业务编排（turn/ 按职责拆 mixin）+ 运行宿主（RunHub）
 ├── agent/          # graph、llm、profiles、prompts、subagents（一主三从）
 │   └── middleware/ # 上下文注入 / 脱敏 / 工具自洽 / 边界 / 空转刹车 / 兜底
-├── db/             # 业务库 ORM / DAO / 引擎（PostgreSQL）
+├── db/             # 业务库 ORM / 引擎；dao/ 按表分组（会话 / 方案 / 记录 / 模型 / 澄清）
 ├── backends/       # OpenSandbox 后端 + 混合路由
 ├── sandbox/        # 沙箱供给 + SDK 客户端 + 工作区卷
 ├── tools/          # PR（Gitee / GitHub）/ 方案 / 记忆 / 交接 / web 搜索 / 工具注册
 ├── session/        # 会话管理 + checkpointer / store
-├── safety/         # 命令与工具边界策略
-├── stream.py       # v3 事件 → SSE 帧的翻译
-├── redact.py       # 凭据脱敏的纯函数
+├── safety/         # 命令与工具边界策略 + 凭据脱敏
+├── core/           # 跨层契约：SSE 事件、git 平台判定、模型类型
+├── infra/          # 宿主机基础设施：Redis、仓库只读缓存、熔断
 └── observability/  # 日志 + trace
 
 frontend/           # Vue3 + Vite 聊天界面（DeepSeek 风格：正文流、待办树、方案面板、终止 / 续传）

@@ -36,7 +36,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from ai_coding_harness.redis_cache import RedisBacked
+from ai_coding_harness.infra.redis_cache import RedisBacked
 
 logger = logging.getLogger(__name__)
 

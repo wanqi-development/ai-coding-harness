@@ -36,7 +36,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
-from ai_coding_harness.codeplatform import Platform
+from ai_coding_harness.core.codeplatform import Platform
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 

@@ -5,7 +5,7 @@
  * 分工与「存在哪」：
  *
  * - **基本设置 / 外观** 是本机显示偏好，改动**立刻生效**，存在 localStorage（见 `prefs.ts`）；
- * - **模型配置** 存在后端库里（按智能体，见 `api/routes/model_config.py`），改完在**弹窗里保存**，
+ * - **模型配置** 存在后端库里（按智能体，见 `api/routes/model_config/`），改完在**弹窗里保存**，
  *   **下一轮**就用新的连接（主智能体每轮现建，不用重启）。
  *
  * 2026-10-15 的口径：**没有「出厂默认」**（一行没配就是没配，用到它的角色会报错）、
@@ -29,11 +29,11 @@ import {
   type ProviderOption,
   type RuntimeSettingItem,
   type RuntimeSettingsSnapshot,
-} from './api'
+} from '../../lib/api'
 import ModelConfigDialog from './ModelConfigDialog.vue'
 import ModelEntry from './ModelEntry.vue'
 import ProvidersPanel from './ProvidersPanel.vue'
-import { formatWindow, parseWindow } from './modelWindow'
+import { formatWindow, parseWindow } from '../../lib/modelWindow'
 import {
   CODE_SIZE,
   CHAT_WIDTH_LABEL,
@@ -48,8 +48,8 @@ import {
   type ChatWidth,
   type PanelTab,
   type ThemeMode,
-} from './prefs'
-import type { SettingsPanel } from './viewState'
+} from '../../lib/prefs'
+import type { SettingsPanel } from '../../lib/viewState'
 
 const props = defineProps<{ panel: SettingsPanel }>()
 const emit = defineEmits<{ close: []; 'reset-layout': []; panel: [SettingsPanel] }>()

@@ -326,7 +326,7 @@ def build_classifier_model(settings: Settings) -> BaseChatModel:
 
     取值顺序：① 「意图识别（大模型）」那一行 → ② ``unified``（统一模型的场景下它就是
     「默认大模型」）→ 都没有就抛错 —— 调用方接住之后落**关键字口径**（判定是增强，
-    不是新的故障点，见 ``server/service.py``）。
+    不是新的故障点，见 ``server/turn/intent.py``）。
     """
     cfg = settings.agent_models.get("classifier") or settings.agent_models.get("unified")
     if cfg is None or not cfg.model:

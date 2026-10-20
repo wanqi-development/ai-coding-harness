@@ -16,12 +16,12 @@ import pytest
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage
 
-from ai_coding_harness.agent.circuit import (
+from ai_coding_harness.agent.middleware.fallback import CIRCUIT_LOG_TAG, FallbackMiddleware
+from ai_coding_harness.infra.circuit import (
     CircuitState,
     MemoryCircuitStore,
     RedisCircuitStore,
 )
-from ai_coding_harness.agent.middleware.fallback import CIRCUIT_LOG_TAG, FallbackMiddleware
 from tests.fake_redis import FakeRedis
 from tests.test_model_fallback import _model, _rate_limited
 

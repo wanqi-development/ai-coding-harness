@@ -56,8 +56,8 @@ from ai_coding_harness.agent.profiles import (
 )
 from ai_coding_harness.agent.subagents import build_subagents
 from ai_coding_harness.backends.composite import memory_path
-from ai_coding_harness.codeplatform import Platform, RepoSpec
 from ai_coding_harness.config import Settings
+from ai_coding_harness.core.codeplatform import Platform, RepoSpec
 from ai_coding_harness.safety.policy import policy_for
 from ai_coding_harness.server import service as service_mod
 from ai_coding_harness.server.intent import IntentDecision
@@ -697,7 +697,7 @@ class TestThroughTheGraph:
         assert caught.value.marker.startswith(GATE_MARKER)
 
 
-# -- 轮末打底（``server/service.py``）---------------------------------------
+# -- 轮末打底（``server/turn/records.py``）---------------------------------
 
 
 class _FakeDb:
@@ -735,7 +735,7 @@ def _patch_pr_client(monkeypatch, *, pulls=(), error: Exception | None = None) -
             return list(pulls)
 
     monkeypatch.setattr(
-        service_mod, "build_git_client", lambda *a, **k: _Client(*a, **k)
+        service_mod.turn_records, "build_git_client", lambda *a, **k: _Client(*a, **k)
     )
     return calls
 

@@ -33,7 +33,7 @@ from ai_coding_harness.backends.composite import memory_path, read_memory
 from ai_coding_harness.db import dao
 from ai_coding_harness.observability.log_tail import read_session_logs
 from ai_coding_harness.observability.run_log import account_key
-from ai_coding_harness.redact import redact, secret_terms
+from ai_coding_harness.safety.redact import redact, secret_terms
 from ai_coding_harness.server.service import WORKSPACE_ERROR_MESSAGE, plan_payload
 from ai_coding_harness.session.manager import WORKSPACE_READY, Session, WorkspaceError
 from ai_coding_harness.tools.git import build_git_client
@@ -492,7 +492,7 @@ async def get_usage(session_id: str, request: Request) -> UsageSnapshot:
     """本会话的 token 消耗（右栏「Token」标签）。
 
     **聚合视图，不改任何数据**：数据源是各轮 assistant 记录里的 ``extra["usage"]``
-    （由 ``server/service.py`` 在轮末写入，按执行主角分类）。
+    （由 ``server/turn/records.py`` 在轮末写入，按执行主角分类）。
 
     两条口径都必须如实外传，界面才不会说谎：
     - 本功能上线前的记录**没有**那份数据 —— 回 ``rounds_with_usage`` 让界面说

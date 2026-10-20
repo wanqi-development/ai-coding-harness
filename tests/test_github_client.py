@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from ai_coding_harness.codeplatform import Platform, RepoSpec
+from ai_coding_harness.core.codeplatform import Platform, RepoSpec
 from ai_coding_harness.tools.github_client import API_VERSION, GitHubClient
 from ai_coding_harness.tools.pr_client import PrLookupError, _format_pr
 

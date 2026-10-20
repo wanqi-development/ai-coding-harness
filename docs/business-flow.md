@@ -294,7 +294,7 @@ PR 没建成就不写这条）。
 | 同一工具同参数反复调用 | 先警告一次；再重复即本轮收尾 | `LoopGuardMiddleware` |
 | 主控这一段没更新清单就要派子智能体 | 拦下本次 `task`，回一条可读理由；补一次 `write_todos` 后放行（每次派发都要有一段新的更新） | `DelegationGateMiddleware` |
 | 工具越界（不该它用的工具 / 不该写的目录） | 调用被拒，回一条可读理由让模型换做法 | `BoundaryMiddleware` |
-| Redis 不可用 | 退回进程内实现（运行缓冲 / 运行权 / 熔断），记 warning（带这条命令的耗时）；**冷却 60s 后自己再试一次**，成功即恢复；`REDIS_REQUIRED=true` 则拒绝启动 | `redis_cache.build_redis` / `RedisBacked.run` |
+| Redis 不可用 | 退回进程内实现（运行缓冲 / 运行权 / 熔断），记 warning（带这条命令的耗时）；**冷却 60s 后自己再试一次**，成功即恢复；`REDIS_REQUIRED=true` 则拒绝启动 | `infra/redis_cache.build_redis` / `RedisBacked.run` |
 | 平台侧 DB 不可用 | 请求 500（不重试）；**注意**：连接超时目前是操作系统默认值，隧道断掉时一次请求可能挂 130 秒 | `db/engine.py` |
 | 浏览器刷新 / 断网 | 运行照跑；带 `after` 游标重订阅即可接回（缓冲有帧数上限与 TTL） | `RunHub.subscribe` |
 | 用户点「终止」 | 取消本轮 task；已挂的订阅者干净收尾（**不产 error 帧**），库里记中断标记 | `RunHub.cancel` |
@@ -307,10 +307,10 @@ PR 没建成就不写这条）。
 | --- | --- |
 | 建会话 / 会话列表 / 删会话 | `api/routes/sessions.py`、`session/manager.py` |
 | 消息入口、SSE 订阅 | `api/routes/chat.py`、`server/runs.py` |
-| 凭据拒收、意图分类、分发、收尾 | `server/service.py`、`server/intent.py` |
+| 凭据拒收、意图分类、分发、收尾 | `server/turn/*.py`（`HarnessService` 组合）、`server/intent.py` |
 | 运行宿主（断线不影响运行、跨 worker） | `server/runs.py`、`server/run_store.py` |
-| 中间件（记忆 / 边界 / 委派闸门 / 循环守卫 / 兜底 / 脱敏） | `agent/middleware/*.py`、`agent/circuit.py` |
+| 中间件（记忆 / 边界 / 委派闸门 / 循环守卫 / 兜底 / 脱敏） | `agent/middleware/*.py`、`infra/circuit.py` |
 | 形态 → 提示词 / 工具 / 子智能体 | `agent/profiles.py`、`agent/prompts.py`、`tools/register.py` |
 | 沙箱与工作区卷 | `sandbox/*.py` |
-| 仓库记忆的写入口径 | `agent/middleware/memory.py`、`agent/memory_reconcile.py`、`tools/memory.py`、`docs/repo-memory-template.md` |
-| 右侧栏「代码」面板（与沙箱解耦） | `repo_cache.py`、`api/routes/repo.py` |
+| 仓库记忆的写入口径 | `agent/middleware/memory.py`、`agent/middleware/memory_reconcile.py`、`tools/memory.py`、`docs/repo-memory-template.md` |
+| 右侧栏「代码」面板（与沙箱解耦） | `infra/repo_cache.py`、`api/routes/repo.py` |

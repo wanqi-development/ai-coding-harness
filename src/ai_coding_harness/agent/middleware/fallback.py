@@ -37,7 +37,7 @@ from langchain.agents.middleware import (
 from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.errors import GraphBubbleUp
 
-from ai_coding_harness.agent.circuit import (
+from ai_coding_harness.infra.circuit import (
     CircuitState,
     CircuitStore,
     MemoryCircuitStore,

@@ -44,8 +44,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-from ai_coding_harness.codeplatform import Platform
 from ai_coding_harness.config import Settings
+from ai_coding_harness.core.codeplatform import Platform
 
 if TYPE_CHECKING:  # 只为类型标注：不把会话模块的导入拖进本模块
     from ai_coding_harness.session.manager import Session

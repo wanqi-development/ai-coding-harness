@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from ai_coding_harness.clarification import parse_clarification
+from ai_coding_harness.agent.clarification import parse_clarification
 from ai_coding_harness.config import Settings
 from ai_coding_harness.db import dao
 from ai_coding_harness.server.service import HarnessService
