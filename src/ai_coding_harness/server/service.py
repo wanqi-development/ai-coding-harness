@@ -1088,9 +1088,13 @@ class HarnessService:
             # 就只剩一条用户消息空着，刷新后看不出这轮出过事），再原样抛出 —— 上层靠
             # 它区分「用户终止」与「故障」。这条 await 是安全的：task.cancel() 只投递
             # 一次；除非期间又被取消一次，那时这条标记会丢（丢了也只是个标记）。
+            usage = self._turn_usage(session, intent, run_log, interrupted=True)
+            self._log_turn_cost(
+                session, intent, usage,
+                llm_calls=llm_calls, tool_calls=tool_calls, chars=len(text),
+            )
             await self._record_interrupted(
-                session, text, translator, intent, terms,
-                usage=self._turn_usage(session, intent, run_log, interrupted=True),
+                session, text, translator, intent, terms, usage=usage,
             )
             raise
         except TurnStop as stop:
@@ -1101,19 +1105,27 @@ class HarnessService:
         except Exception as exc:
             # 下面那次 _record 在循环之外，异常一跳过它就永远不执行 —— 先补一条中断记录，
             # 再把异常原样抛给 chat()（error 帧的产生只留它那一处）。
+            usage = self._turn_usage(session, intent, run_log, interrupted=True)
+            self._log_turn_cost(
+                session, intent, usage,
+                llm_calls=llm_calls, tool_calls=tool_calls, chars=len(text),
+            )
             await self._record_interrupted(
-                session, text, translator, intent, terms, exc,
-                usage=self._turn_usage(session, intent, run_log, interrupted=True),
+                session, text, translator, intent, terms, exc, usage=usage,
             )
             raise
 
         if state.aborted is not None:
             # 提前收尾：这一轮没跑完，不能落到下面那条「智能体完成」与正常记录里
             stop = state.aborted
+            usage = self._turn_usage(session, intent, run_log, interrupted=True)
+            self._log_turn_cost(
+                session, intent, usage,
+                llm_calls=llm_calls, tool_calls=tool_calls, chars=len(text),
+            )
             await self._record_interrupted(
                 session, text, translator, intent, terms,
-                closing=stop.marker, extra=stop.extra,
-                usage=self._turn_usage(session, intent, run_log, interrupted=True),
+                closing=stop.marker, extra=stop.extra, usage=usage,
             )
             # 标记的写法与记录里的一致（``_record_interrupted`` 用空行分隔），
             # 这样实时看到的东西和刷新后回放的一样
@@ -1144,9 +1156,14 @@ class HarnessService:
             session.public_id, intent, llm_calls, tool_calls, len(text),
             extra={"agent": MAIN_AGENT},
         )
+        usage = self._turn_usage(session, intent, run_log)
+        self._log_turn_cost(
+            session, intent, usage,
+            llm_calls=llm_calls, tool_calls=tool_calls, chars=len(text),
+        )
         extra: dict[str, Any] = {
             "intent": intent,
-            "usage": self._turn_usage(session, intent, run_log),
+            "usage": usage,
         }
         if clarification_frame is not None:
             extra["clarification"] = clarification_frame
@@ -1268,6 +1285,58 @@ class HarnessService:
             return None
         self._last_usage_frame = stamp
         return self._turn_usage(session, intent, run_log, commit_context=False)
+
+    def _log_turn_cost(
+        self,
+        session: Session,
+        intent: str,
+        usage: Mapping[str, Any],
+        *,
+        llm_calls: int,
+        tool_calls: int,
+        chars: int,
+    ) -> None:
+        """一轮结束打一条**一眼可见**的成本账；超过阈值再单独记一条 WARNING。
+
+        逐角色的明细已经在 ``usage`` 里（库与界面都读它），这里只做汇总：2026-10-20
+        那轮 1593 万输入，原先只能事后手工把日志里每一条 ``LLM 调用完成`` 加起来才看得出。
+        """
+        totals = usage.get("totals") or {}
+        context = usage.get("context") or {}
+        total_in = int(totals.get("input", 0))
+        logger.info(
+            "本轮成本：public_id=%s intent=%s 输入 %d / 输出 %d / 调用 %d / 工具 %d "
+            "/ 主控峰值上下文 %d / 输出 %d 字",
+            session.public_id,
+            intent,
+            total_in,
+            int(totals.get("output", 0)),
+            llm_calls,
+            tool_calls,
+            int(context.get("max_input", 0)),
+            chars,
+            extra={"agent": MAIN_AGENT},
+        )
+        if total_in < self._settings.turn_cost_warn_tokens:
+            return
+        by_actor = usage.get("by_actor") or {}
+        top_name, top = max(
+            (
+                (name, row)
+                for name, row in by_actor.items()
+                if isinstance(row, Mapping)
+            ),
+            key=lambda item: int(item[1].get("input", 0)),
+            default=("", {}),
+        )
+        logger.warning(
+            "本轮 token 偏高：输入 %d ≥ 阈值 %d（%s 占 %d）；看 by_actor 明细找增长来源",
+            total_in,
+            self._settings.turn_cost_warn_tokens,
+            top_name or "未知",
+            int(top.get("input", 0)),
+            extra={"agent": MAIN_AGENT},
+        )
 
     async def _changes_for_round(
         self, session: Session, pr_refs: Mapping[str, str]

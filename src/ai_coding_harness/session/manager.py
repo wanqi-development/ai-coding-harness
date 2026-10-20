@@ -34,7 +34,7 @@ from ai_coding_harness.agent.middleware import (
 from ai_coding_harness.agent.profiles import AgentProfile
 from ai_coding_harness.agent.prompts import build_main_prompt
 from ai_coding_harness.agent.subagents import build_subagents
-from ai_coding_harness.agent.summarization import build_summarization
+from ai_coding_harness.agent.middleware.summarization import build_summarization
 from ai_coding_harness.backends.composite import build_composite_backend
 from ai_coding_harness.backends.opensandbox_backend import OpenSandboxBackend
 from ai_coding_harness.codeplatform import Platform, RepoSpec, parse_repo_url
