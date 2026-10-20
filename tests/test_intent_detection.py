@@ -1311,3 +1311,33 @@ class TestTheFourGateWaterfall:
             _env_file=None, typesafe_api_key="dummy", intent_jev_enabled=False
         )
         assert build_jev_decider(disabled) is None
+
+
+class TestRequirementTalkAndPlanTalk:
+    """2026-10-20 用户口径：**需求讨论归 qa**，**方案设计 / 方案讨论归 plan**。
+
+    这两类句子都在说「要做什么」，但都没让人动手 —— 老口径把它们推向 coding，
+    结果是「先把需求说清楚」被当成开工，白读一遍代码。判据只留一条：有没有让动手。
+    """
+
+    async def test_requirement_talk_is_told_to_be_qa(self):
+        model = _FakeClassifier(reply="qa\n在补需求，没让动手")
+        await detect_intent("这个需求还能再加一个条件", model=model)
+
+        prompt = model.prompts[0]
+        assert "需求讨论 / 需求补充 / 需求澄清" in prompt
+        assert "讨论需求本身不是 coding" in prompt
+
+    async def test_plan_discussion_is_told_to_be_plan(self):
+        model = _FakeClassifier(reply="plan\n先要思路")
+        await detect_intent("比较一下这两种做法哪个更稳", model=model)
+
+        assert "方案设计 / 方案讨论也归 plan" in model.prompts[0]
+
+    def test_the_boundary_names_both_directions(self):
+        """两句话必须同时在提示词里，只写一条模型会自己往另一条上倒。"""
+        from ai_coding_harness.server.intent import _BOUNDARY
+
+        text = "\n".join(_BOUNDARY)
+        assert "需求讨论与 coding 的分界" in text
+        assert "方案设计 / 方案讨论" in text

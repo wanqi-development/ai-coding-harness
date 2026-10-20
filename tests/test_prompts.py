@@ -1022,6 +1022,26 @@ class TestSkillRulesBelongToTheFormThatDoesTheWork:
         assert "`code-review` skill" in REVIEW_AGENT_PROMPT
         assert "`code-review` skill" in MAIN_AGENT_PROMPT
 
+    def test_requirement_clarification_lives_in_qa(self):
+        """2026-10-20 用户口径：需求讨论归 qa，需求澄清的方法也只该挂在 qa 上。
+
+        老的那份 ``coding-requirement-completer`` 是给「从零生成单文件程序」写的
+        （终点是产出代码块），与这套「仓库 + 方案 + coder」的流程相反，已删除。
+        """
+        assert "`requirement-clarifier` skill" in QA_AGENT_PROMPT
+        assert "详细需求描述" in QA_AGENT_PROMPT
+        assert "不落文件" in QA_AGENT_PROMPT
+        for name, prompt in (
+            ("orchestrate", MAIN_AGENT_PROMPT),
+            ("plan", PLAN_AGENT_PROMPT),
+            ("analysis", ANALYSIS_AGENT_PROMPT),
+        ):
+            assert "requirement-clarifier" not in prompt, name
+
+    def test_coding_no_longer_points_at_the_deleted_skill(self):
+        assert "coding-requirement-completer" not in MAIN_AGENT_PROMPT
+        assert "有歧义就别猜" in MAIN_AGENT_PROMPT
+
 
 class TestGitWriteCommandsOnlyReachTheCoder:
     """``GIT_PROMPT`` 原来把 clone / 建分支 / commit / push 的写法放在写侧共用段里，
