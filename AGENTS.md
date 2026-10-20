@@ -95,7 +95,9 @@
 - **「这一轮改了什么」在本地代码缓存里算，不碰沙箱**：`repo_cache.compare/file_diff` +
   `GET /sessions/{id}/repo/diff`，`base...head` 两支取 `create_pr` 的入参（三点式＝相对共同祖先，
   这才是 PR 的语义）。只组建成 PR 的轮次、只存**文件清单**（diff 正文按需拉，脱敏 + 上限），
-  所以**沙箱释放之后 diff 照样点得开**。要动这块先看 `tests/test_turn_changes.py` 与
+  所以**沙箱释放之后 diff 照样点得开**。**中止的轮次只要本轮建过 PR 也照样算**
+  （`_record_interrupted` 收 `changes`）；rework 更新既有 PR、不新建，因此没有这一块。
+  要动这块先看 `tests/test_turn_changes.py` 与
   `tests/test_repo_cache.py::TestCompare`。
 - **提供商目录是表，不是代码常量，而且是「每条请求现读库」**：表 `model_providers`（界面上
   「提供商」那一栏：显示名 / 默认地址 / 清单路径 / 鉴权头 / 分组排序 / 启停）。**直接改库 + 刷新界面即生效，
@@ -156,7 +158,8 @@
   1M 窗口的 40% 是 40 万，真机一轮 131 次调用能涨到 194k 都不压。到压缩线的 90% 先注入
   `PRETRIM_NOTICE`，让模型写 `<working-note>` + `KEEP:` 清单；下一轮裁剪保留
   **当前步骤 + KEEP 点名的工具返回**（总额约 20k tokens，最近优先），未点名的一律换成
-  带身份占位符。剪完低于线就不摘要，仍高于才压。**不要**改成「最后一条 `HumanMessage`
+  带身份占位符。剪完**落到触发线的 80% 以下才免压**；只在 80%~100% 之间仍会摘要
+  （裁剪只改请求副本，勉强压到线边会让原历史在下次调用再剪一遍）。**不要**改成「最后一条 `HumanMessage`
   之后全部保留」—— 子智能体整轮可能有一百多条工具返回，等于没有裁剪。它跟随
   `CONTEXT_TRIM_TOOL_RESULTS` 总开关；`CONTEXT_TRIM_TRIGGER_TOKENS` / `CONTEXT_TRIM_KEEP`
   / `CONTEXT_TRIM_ROLES` 已作废，别再加回独立剪裁中间件。`CONTEXT_SUMMARY_TRIGGER_TOKENS`
@@ -173,10 +176,19 @@
   `CONTEXT_TRIM_CLEAR_INPUTS` 默认开（裁剪时清旧 `edit_file` / `write_file` 入参）；
   rework 的任务描述只给 PR / 问题编号，审查原文由 coder 用 `list_pr_comments` 自取
   （coder **只读**评论，`comment_pr` 仍归主控）。
+- **coder 的 rework 按模块编排**（`prompts._CODER_ROLE` B 流程）：先核验确认问题，再按
+  模块 / 目录分组（**不按 P0/P1**），`write_todos` 一项对应一个模块；同模块改完先跑该
+  模块测试，全部模块后再做一次全量。
 - **读文件红线由中间件拦**（`ReadGuardMiddleware`，主控与三个子智能体都挂）：
   `read_file` 读 `/ai_coding/policies` 必须显式给 `limit` 且 ≤80 行、`/ai_coding/project`
   ≤200 行；`execute` 里的 `cat` / `less` / `more` / `nl` / `tac` 读这两处一律拦，
   `head` / `tail` 超上限与 `sed -n '1,$p'` 也拦。提示词只做前置说明，真正的边界在这一层。
+- **reviewer 按 diff hunk 审查**（`prompts._REVIEW_METHOD` +
+  `sandbox/skills/code-review/SKILL.md`）：先 `git diff base..head` 看改动块，`read_file`
+  只补被改函数 / 直接调用点；同一文件同一范围不重读，**用不同 offset 把整个文件扫一遍
+  也算重读**；大 PR 分模块收口、报告增量写，开头给覆盖清单。skill 的步骤 3 也写了同一条
+  读码边界，命令白名单已对齐（`cat` 只用于 `/ai_coding/skills` 与 tmp，project / policies
+  用 `sed -n` / `head` / `grep`）。
 - **推理规则在基础提示词里**（`prompts._BASE_HEAD`，所有形态共享）：先过**影响面闸门**
   （会不会改变本次交付 / 低后果还是高后果 / 能不能验证）再决定展开深度；待决清单按
   `问题 | 影响面 | 处置(答/改/记/上报)` 列；不可验证的问题最多一次检索 + 一次查源码，
