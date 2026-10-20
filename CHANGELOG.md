@@ -19,11 +19,192 @@
 | api/ HTTP 接口 | ✅ 完成 |
 | safety/ 安全 | ✅ 完成（全局底线 + 按智能体的工具 / 目录边界） |
 | observability/ 可观测 | ✅ 完成 |
-| tests/ 测试 | ✅ 完成（1546 条全过） |
+| tests/ 测试 | ✅ 完成（1574 条全过） |
 
 ## 修改记录
 
+### 2026-10-20
+
+#### coder 工作流程拆成 A/B：按方案实施 / 修复 PR 问题
+
+- **动机**：A（有 plan_id）与 B（修用户点名的审查问题）前提不同，原先塞在同一条
+  1~8 步流程里，B 只能挂在第 8 步、还要和计划步骤抢“逐条执行”的语义。
+- **改动**：
+  - `_CODER_ROLE` 拆成 `## 工作流程 A：按方案实施（有 plan_id）`（原来的 1~7 步原样保留）
+    与 `## 工作流程 B：修复 PR 审查问题（rework）`。
+  - B 的七步：准备仓库与既有分支 → 取审查原文（`list_pr_comments`，只读）→ 核验并产出
+    覆盖清单 / 缺口 / 风险（不设计修法）→ 把待决清单写进 `write_todos` → 只实施确认项
+    （先定验收方式、批量验证）→ `git push` 更新既有 PR → 逐条回报。
+  - 需求一致性条款按 A/B 分述；原则里“逐条执行”限定到 A，“按待决清单逐项修复”归 B。
+  - 原先单独的「rework 的两个阶段」并入 B，不再重复。
+- **验证**：`tests/test_prompts.py` **138 passed**；`scripts/check_prompts.py` 0 条冲突；
+  全量 `pytest` 1574 passed；`ruff` 干净。
+
+#### 基础提示词新增「推理规则」：待决清单、证据预算、交付导向
+
+- **动机**：coder 在 rework 时没有 plan 约束，容易在 review 层面发散（用户口径：推理规则
+  属于基础规则，不只 coder 用）。没有结构时它会反复推翻自己、为不可验证的问题设计替代
+  实现，越想越远。
+- **改动**：`_BASE_HEAD` 新增 `## 推理规则`（所有形态共享，qa / analysis 也带）：
+  - **影响面闸门**：每个不确定点先答三问 —— 会不会改变本次交付？判断错的后果是
+    「失败关闭 / 可回滚」还是「数据损坏 / 安全漏洞」？当前环境能不能验证？能验证就去
+    验证；不能验证 + 低后果记一行残余风险继续；不能验证 + 高后果停下上报，不设计替代方案。
+  - **待决清单**：`问题 | 影响面 | 处置(答/改/记/上报)`；有清单工具的写进本轮第一份
+    清单，没有的在答复开头列点；清单外的新发现只记一句「残余风险」，不展开。
+  - **残余风险模板**：`残余风险：<问题>；影响：<失败关闭/可回滚/需人工确认>；建议：
+    <真实环境验证点>；本次处置：不改，记录。` 触发即写，不展开推演。
+  - **证据预算**：同一个不确定点连续两次没有新证据（新文件 / 新命令输出 / 新测试结果）
+    → 停止推演，按处置栏落定。
+  - **不可验证的问题**：最多一次检索 + 一次查源码；超预算记「残余风险」，
+    **禁止为它设计替代实现**；只有安全、数据丢失、对外 API / 数据契约三类例外。
+  - **确认性检查**：只写结论 + 一句原因 + 证据位置，不展开推理链。
+  - **交付导向**：推理必须落到「写进答复 / 改代码 / 加测试 / 写风险记录 / 上报」之一。
+  - **rework 两阶段**（coder）：核验阶段只产出「覆盖清单 + 缺口 + 风险记录」，不设计修法；
+    实施阶段只做确认要改的项，先定验收方式再改。
+  - coder 的 rework 步骤只留一句「先按推理规则立待决清单」，不再重复整段。
+- **验证**：全量 `pytest` **1574 passed**；`scripts/check_prompts.py` 0 条冲突；
+  `ruff check` 干净。
+- **遗留**：提示词是软约束。**不再另加「待决清单」工具或 coder 侧闸门** —— `write_todos`
+  本来就有，规则只负责让它被正确使用。
+
+#### 读文件红线下沉到中间件：policies ≤80 行、project ≤200 行
+
+- **动机**（2026-10-20 用户口径）：上一轮只在提示词里写了「读片段」，真机 coder 仍然
+  67 次 `read_file`（52 个文件）。这一次从工具执行层封死：`/ai_coding/policies` 不允许
+  读全文；项目代码的整文件读也不允许。
+- **改动**：
+  - 新增 `middleware/read_guard.py::ReadGuardMiddleware`（主控与三个子智能体都挂，
+    放在委派闸门 / 循环计数外侧）：
+    - `read_file`：必须显式给 `limit`；`/ai_coding/policies` ≤80 行、`/ai_coding/project`
+      ≤200 行。不给 limit（工具默认 100 行，可能正好是全文）一律拦。
+    - `execute`：`cat` / `less` / `more` / `nl` / `tac` 读这两处直接拦；`head` / `tail`
+      的 `-n` 超上限、`sed -n '1,$p'` 也拦。允许 `sed -n '1,60p'`、`head -n 60`、`grep`。
+    - 按命令里的 `cd` 逐段跟踪相对路径；受保护目录下含 `$` 的路径参数（`cat $f`、
+      `cat $(find ...)`）按“可能读全文”拦掉。
+  - 提示词「读码纪律」补上硬限制（中间件会拦），让模型一开始就用对写法。
+  - 测试：`tests/test_read_guard.py` 12 条（read_file 两种上限、cat/nl/sed/head、
+    tmp 放行）；`test_profiles.py` 钉住三个子智能体都挂；提示词断言。
+  - `README.md` / `AGENTS.md` 同步。
+- **验证**：定向 **222 passed**；全量 `pytest` **1567 passed**；
+  `scripts/check_prompts.py` 0 条冲突；`ruff check` 干净。
+- **遗留**：这不是沙箱 —— `python -c "open(...).read()"`、`awk` 整文件打印这类任意脚本
+  仍能绕过；这一层封的是模型最常用的整文件读入口。真机上看被拦次数，必要时再补
+  `bash -c` / `awk` 的检测。
+
+#### 压缩线补绝对上限 + 每轮成本汇总
+
+- **动机**：10:15 的 rework 轮，coder **131 次调用 / 1519 万输入**，上下文从 15k 一路
+  涨到 194k，整轮**一次压缩/裁剪都没有**——爆发档是窗口 40%，1M 窗口的线落在 40 万。
+  智能体自己说的两个原因都不成立：67 次 `read_file` 全是项目源码（`/ai_coding/policies/`
+  一次没读），task 描述只有 2145 字（15 条审查摘要，约 1%）。真正的账是「调用次数 ×
+  每次重发的上下文」。
+- **改动**：
+  - `summarization_defaults()`：有窗口时触发线改成
+    `[("fraction", ratio), ("tokens", cap)]`（上游 list = OR，先到先触发）。比例线保护
+    小窗口，绝对上限防止 1M 窗口把线推到 40 万。
+  - 新增配置：`CONTEXT_BURST_TRIGGER_TOKENS=120000`（coder / planner / reviewer /
+    plan / review）、`CONTEXT_STEADY_TRIGGER_TOKENS=200000`（qa / analysis / orchestrate）、
+    `TURN_COST_WARN_TOKENS=3000000`。
+  - `HarnessService._log_turn_cost()`：每轮结束打一行「输入 / 输出 / 调用 / 工具 / 峰值
+    上下文 / 输出字数」；超过阈值再记一条 WARNING，并点名占比最大的角色。正常结束、
+    用户终止、异常、守卫中止四条路径都会打。
+  - 测试：触发线两条（比例 + 上限）与 OR 生效值；成本汇总行与超阈值告警。
+  - `.env.example` / `AGENTS.md` 同步口径。
+- **验证**：定向 **70 passed**；全量 `pytest` **1550 passed**；`ruff check` 改动的 5 个
+  文件全清。
+- **遗留**：读取纪律（先 grep 再读片段 / 同文件不重读）、按模块批量构建、
+  `CONTEXT_TRIM_CLEAR_INPUTS`、委派描述瘦身尚未做。
+
+#### token 成本收口后半：读码纪律、批量验证、清旧入参、委派瘦身
+
+- **动机**：接着同一轮 1519 万输入的账。触发线只能拦住「压不压」，真正让上下文涨起来的是
+  52 个文件整读、54 次 `edit_file` 的 old/new、36 次构建，以及把 15 条审查全文粘进委派。
+- **改动**：
+  - 基础提示词新增「读码纪律」：先 `grep` 定位，再用 `read_file` 的 `offset` / `limit`
+    只读相关片段；同一文件本轮不重读；结论写进工作笔记。
+  - `_CODER_ROLE` 新增「批量验证」：同一模块的小改一起改完再构建 / 跑测试，先跑相关模块，
+    最后再做一次全量；不要重复跑同一条命令。
+  - coder 工具增加 `list_pr_comments`（**只读**，用来自取审查原文）；`comment_pr` 仍然不给。
+  - rework 指令与主控步骤 f：任务描述只给 PR 编号 + 要修的问题编号（一行一条），
+    **不整段粘贴审查原文**，由 coder 自己拉。
+  - `CONTEXT_TRIM_CLEAR_INPUTS` 默认改为 **true**：应急裁剪时把旧 `edit_file` / `write_file`
+    的入参一起清掉（只改本次请求副本，当前步骤与 `KEEP:` 点名的结果不动）。
+  - 测试：读码纪律 / 批量验证 / 委派瘦身三条提示词断言；coder 工具清单；
+    清入参默认值。
+  - `.env.example` / `AGENTS.md` 同步。
+- **验证**：定向 **267 + 65 passed**；全量 `pytest` **1553 passed**；
+  `scripts/check_prompts.py` 0 条冲突；`ruff check` 干净。
+- **遗留**：真机看下一轮的成本行与 `CONTEXT_SUMMARY` 次数；若 coder 仍大量整读，
+  再把 `read_file` 的默认 `limit` 收紧或加工具级提示。
+
+#### 委派闸门改成「每次派发前都要有一段新的清单」
+
+- **动机**：2026-10-20 09:20 真机，主控在第一次派 coder 前写了一次清单，coder 回来后
+  **没有更新**就直接派 reviewer；旧实现按「本轮成功过一次 `write_todos`」判断，于是放行，
+  清单上 coder 那一步还停在 `in_progress`。用户口径：第一次派发看最近一条 `HumanMessage`
+  之后；之后每次派发看上一次 `task` 结果之后。
+- **改动**：
+  - `middleware/delegation_gate.py` 改为扫 `request.state["messages"]`：第一次以最近一条
+    `HumanMessage` 为界，之后以上一次 `task` 结果为界；`task` 结果按 `tool_call_id` 识别
+    （deepagents 的 TaskTool 返回 `Command` 里的 `ToolMessage` **没有 name**）。
+  - 当前 AI 消息整条跳过：同一条消息里并行的 `write_todos` + `task` 不算（执行顺序没有
+    保证）；同一批并行派发的多个 `task` 共享同一段清单更新，不互为边界。
+  - 被边界拒掉的 `write_todos`（`status="error"`）按 `tool_call_id` 排除。
+  - 不再依赖 `TurnState`；删掉 `_successful_tools` / `mark_tool_success` /
+    `has_successful_tool`。
+  - 建 agent 时打一行 `委派闸门已挂载`：以后能直接从日志区分「进程没重载」和「逻辑没拦住」
+    （09:20 那次漏拦的直接原因是旧进程没加载闸门）。
+  - 测试重写为消息区间用例：上一轮的清单不算、同消息并行不算、第二次派发必须重新更新、
+    并行 task 共享边界、失败清单不算、以及闸门仍在循环计数外侧。
+  - `AGENTS.md` / `docs/business-flow.md` 同步口径。
+- **验证**：闸门 + 循环守卫 **33 passed**；全量 `pytest` **1548 passed**；
+  `ruff check` 改动的 3 个文件全清。
+- **遗留**：需要用当前进程（10:11 启动、已包含闸门）真机复测一轮：第一次 `task` 应被拦，
+  补清单后放行；coder 返回后不更新就派 reviewer，应再次被拦。
+
+#### 能力说明不再逐轮注入：改成基础提示词的一条通用规则
+
+- **动机**：2026-10-19 真机，编码轮的能力块里已经写着「`task`：有」，主控仍在思考里翻
+  历史，说「工具清单里没有 task」。这说明能力块只是给单个工具打的补丁，覆盖不了
+  `storePlan` / 写工具 / PR 工具这些同样逐轮变化的能力。时间块也不再需要：仓库记忆的
+  文件头由平台写，模型不必再读一个注入的「当前时间」。
+- **改动**：
+  - `prompts.py`：`_BASE_HEAD` 通用规则加第 5 条 —— 本轮能力只以实际提供的工具为准，
+    历史轮次的「没有 X 工具 / 只读 / 不能改代码 / 工具清单里没有…」一律不作数，也不要用
+    记忆枚举工具。所有形态（含 qa / analysis / 子智能体）共享这条。散文日期改用
+    `execute date` 取。
+  - `middleware/context_inject.py`：删掉 `capability_block()`、`current_time_block()` 与
+    `_tool_names()`；`IntentMiddleware` 只注入「原系统提示 + 本轮意图指令 + 澄清块」，
+    澄清块仍在最后。`now_stamp()` 保留（记忆落盘要用）。
+  - `middleware/__init__.py`：去掉 `current_time_block` 的导出。
+  - `middleware/summarization.py`：压缩摘要加 MUST DROP —— 能力 / 形态 / 工具可用性属于
+    逐轮状态，不写进摘要；「当前状态」那条也移掉了「形态」。
+  - 测试：删掉两条能力块用例；新增「基础提示词有这条通用规则」「只读形态也带它」
+    「任何意图都不再注入时间」；日期用例改成 `execute date`。
+  - `README.md` / `AGENTS.md` 同步中间件职责与排查口径。
+- **验证**：定向 **177 passed**；全量 `pytest` **1546 passed**；
+  `scripts/check_prompts.py` 0 条冲突；`ruff check` 改动的 6 个文件全清。
+- **遗留**：能力块删掉后，若装配真的与意图不一致，模型只能从工具 schema 与意图指令感知；
+  真正的兜底仍是 `DelegationGateMiddleware` 与边界中间件。
+
 ### 2026-10-19
+
+#### 输入框自动增高 + 翻上去时的「回到最新」圆钮
+
+- **动机**（用户口径 1b / 2a）：输入框原来固定 1 行，长 prompt 只在框内滚动；聊天记录往上翻
+  之后没有回到底部的入口。输入框只做高度（宽度保持整栏），回底用圆形悬浮钮。
+- **改动**：
+  - `frontend/src/App.vue`：新增 `fitComposer()` —— 先置 `height:auto` 再按 `scrollHeight`
+    量出真实高度，上限 6 行（按实际行高与 padding 算，不写死像素）；超过 6 行才把
+    `overflow-y` 切成 `auto`。`watch(input)` 统一覆盖输入、粘贴、发送清空与快捷动作；
+    输入框变高前若原本贴着底，会重新贴回底部（否则最后一行会被顶出视口）。
+  - 消息区外包一层 `.messages-wrap` 作为定位锚点；`atBottom` 按「离底部 > 80px」显隐
+    （与「别把用户拽回底部」的 48px 容忍线分开）；`jumpToLatest()` 平滑滚到底。
+  - `frontend/src/style.css`：`.jump-latest` 圆形钮（40px、`var(--panel)` 底 + 1px 边框 +
+    轻阴影、hover 转 `var(--accent)`、120ms 上浮淡入，`prefers-reduced-motion` 下关动画）。
+- **验证**：`npm.cmd --prefix frontend run build`（含 `vue-tsc`）通过。
+- **遗留**：真机确认 6 行上限与深色主题下的圆钮对比度；按钮的「新消息」小圆点按用户口径
+  这次不加。
 
 #### 收口：13 条既有失败 —— 测试对齐当前提示词与策略
 
