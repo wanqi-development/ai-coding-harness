@@ -172,12 +172,36 @@ def test_the_classifier_turns_thinking_off_and_uses_zero_temperature() -> None:
 
 
 @pytest.mark.parametrize("role", sorted(_EXPECTED))
-def test_the_main_model_enables_thinking(role: str) -> None:
-    """主智能体（含三个子智能体）开思考；意图识别那一行单独关掉（见上一组用例）。"""
-    model = build_model(_settings(), role=role)
+def test_openai_reasoning_models_get_reasoning_effort(role: str) -> None:
+    """主智能体（含三个子智能体）在 OpenAI 推理模型上开思考；意图识别那行单独关掉。"""
+    rows = {key: _row("gpt-5.6-luna") for key in _ROWS}
+    model = build_model(_settings(rows=rows), role=role)
 
     assert model.reasoning_effort == "high"
     assert model.extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_glm_does_not_get_reasoning_effort() -> None:
+    """智谱 glm-5.3-flash 带 reasoning_effort 会把思考流关掉（2026-10-20 实测）。"""
+    rows = {key: _row("glm-5.3-flash") for key in _ROWS}
+    model = build_model(_settings(rows=rows), role="orchestrate")
+
+    assert model.reasoning_effort is None
+    assert model.extra_body == {"thinking": {"type": "enabled"}}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("gpt-5.6-luna", True),
+        ("o3-mini", True),
+        ("glm-5.3-flash", False),
+        ("deepseek-v4-pro", False),
+        ("kimi-k2.6", False),
+    ],
+)
+def test_reasoning_effort_is_openai_only(name: str, expected: bool) -> None:
+    assert llm_module._wants_reasoning_effort(name) is expected
 
 
 def test_context_window_sets_profile() -> None:

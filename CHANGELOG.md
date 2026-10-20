@@ -19,11 +19,96 @@
 | api/ HTTP 接口 | ✅ 完成 |
 | safety/ 安全 | ✅ 完成（全局底线 + 按智能体的工具 / 目录边界） |
 | observability/ 可观测 | ✅ 完成 |
-| tests/ 测试 | ✅ 完成（1574 条全过） |
+| tests/ 测试 | ✅ 完成（1588 条全过） |
 
 ## 修改记录
 
 ### 2026-10-20
+
+#### coder 的 rework 改成按模块编排
+
+- **动机**：13:45 那轮修 PR #17 的 9 条问题，按 P0/P1 逐条修，结果 **206 次 coder 调用 /
+  1619 万输入**、10 次 `mvn test`、32 次 `write_file`，一条问题反复定位、验证、重跑。
+- **改动**（`_CODER_ROLE` B 流程）：
+  - 步骤 4：核验确认后**按模块 / 目录分组，不按 P0/P1 排序**；`write_todos` 一项对应
+    一个模块（组内列问题编号），而不是一项一个问题。
+  - 步骤 5：同一模块的几条问题一起改完，先跑该模块的相关测试 / 编译；**全部模块改完
+    再做一次全量**，不要按级别逐条穿插。
+- **验证**：`tests/test_prompts.py` **144 passed**；全量 `pytest` 1588 passed；
+  `scripts/check_prompts.py` 0 条冲突；`ruff check` 干净。
+- **遗留**：真机看下一轮 rework 的调用数与 mvn 次数是否下降。
+
+#### code-review skill 补读码边界、覆盖清单与命令白名单
+
+- **动机**：reviewer 的方法提示词已经改成 diff hunk 驱动，但真正支撑它的是
+  `code-review` skill。skill 里已有“按规模分批”，却没有“只读 hunk + 调用点、不按 offset
+  通读、同范围不重读”；而且只读命令白名单还写着 `cat`，与新的 `ReadGuardMiddleware`
+  （project / policies 下拦 `cat`）冲突。
+- **改动**（`sandbox/skills/code-review/SKILL.md`）：
+  - 步骤 3 开头加「读码边界」：`git diff <base>..<head> -- <path>` 看 hunk；`read_file`
+    只补被改函数/调用点；同文件同范围不重读，不同 offset 扫全文件也算重读。
+  - 输出格式把「本次未覆盖」升级为文件级覆盖表（已审 / 只看 hunk / 未审原因），
+    保留「未覆盖与残余风险」。
+  - 命令白名单：`cat` 只用于 `/ai_coding/skills` 与 `/ai_coding/tmp`；project / policies
+    改用 `sed -n` / `head -n` / `grep`，并写明 `read_file` 的 limit 上限。
+- **验证**：`scripts/check_prompts.py` 0 条冲突；全量 `pytest` 1586 passed。
+- **遗留**：skill 是建会话时推入沙箱的，**新建会话**后才生效。
+
+#### reviewer 改成 diff hunk 驱动：不按 offset 重扫整个文件
+
+- **动机**：13:30 审查 PR #17 那轮，reviewer **30 次调用 / 228 万输入**（占全轮 79%）、
+  58 次 `read_file` / 49 个文件。读文件红线已经生效（58 次全带 `limit`），但它用
+  `offset` 0 / 194 / 394 / 108 把 `ProductImageServiceImpl` 从头扫到尾，还重叠回读了一段
+  —— 红线防住了「一次读全文」，没防住「分片通读」。
+- **改动**：重写 `_REVIEW_METHOD`：
+  - 先 `git diff --stat` + `git diff <base>..<head> -- <path>` 看**改动 hunk**，hunk 是主材料；
+  - `read_file` 只补被改函数、直接调用点与相关测试；同一文件同一范围不重读，不同 offset
+    扫全文件也算重读；
+  - 大 PR 分模块收口：一个模块审完先把结论写进 `/ai_coding/review/`，再开下一个；
+  - 报告开头给覆盖清单（已审 / 只看 hunk / 未审原因），原则补一句「覆盖率不等于读完所有文件」。
+- **验证**：`tests/test_prompts.py` **142 passed**；全量 `pytest` 1586 passed；
+  `scripts/check_prompts.py` 0 条冲突；`ruff check` 干净。
+- **遗留**：看下一轮 reviewer 的调用数与输入是否明显下降；若仍高，再考虑把 reviewer 的
+  爆发上限从 120k 降到 100k。
+
+#### 中止的轮次也保留「本轮改动」
+
+- **动机**：13:04 那轮 `create_pr` 已建成 PR #17，随后 reviewer 触发循环守卫中止；
+  记录走 `_record_interrupted`，不经过正常收尾的 `_changes_for_round`，于是界面上的
+  「本轮改动」整块消失，看起来像功能没了。09:47 那轮（PR #16）记录里仍有 81 个文件，
+  说明功能本身还在。
+- **改动**：`_record_interrupted` 接受 `changes` 并写进 `extra["changes"]`；异常路径与
+  `state.aborted` 路径都会按 `pr_refs` 重算一次；aborted 路径还会推 `changes` 帧，
+  实时也能看到。`CancelledError` 不额外计算（任务已被取消）。
+- **验证**：`tests/test_token_usage.py` **32 passed**；全量 `pytest` 1582 passed；
+  `ruff check` 干净。
+- **遗留**：rework（更新既有 PR、不新建）仍没有这一块；要显示得从任务/活动 PR 取
+  `base` / `head`，属于另一条改动。
+
+#### 修压缩空转：裁剪只在安全区免压
+
+- **动机**：12:47 那轮 coder **115 次调用 / 1003 万输入**，`CONTEXT_PRETRIM` 38 次、
+  `CONTEXT_SUMMARY` 0 次。每次都把 121~135k 剪到 103~117k，刚好低于 120k 的线，于是
+  “剪完不压”；但裁剪只改请求副本、原历史仍在 checkpoint，下一次调用又原样重剪。
+- **改动**：`HarnessSummarizationMiddleware` 增加数值触发线 `trigger_at`；应急裁剪后
+  只有落到**触发线的 80% 以下**才免压，80%~100% 之间仍继续摘要。日志区分「已低于线且
+  落在安全区」与「仅勉强低于线（>80%）」。
+- **验证**：`tests/test_summarization.py` **40 passed**；全量 `pytest` 1581 passed；
+  `ruff check` 干净。
+- **遗留**：重启后看真实轮次的 `CONTEXT_PRETRIM` 次数是否从几十次降到个位数。
+
+#### 修 GLM 思考不显示：`reasoning_effort` 只给 OpenAI 推理模型
+
+- **动机**：切到 glm-5.3-flash 后前端没有思考内容。对同一 endpoint 做三组流式探测：
+  不带参数 / 只带 `extra_body.thinking` 都正常返回 `reasoning_content`（396 / 325 字）；
+  一旦带上 `reasoning_effort="high"`，思考变成 **0 字**，`medium` 直接 400
+  （「该模型始终思考，不支持关闭思考」）。
+- **改动**：新增 `llm._wants_reasoning_effort()`，只认 `gpt-5*` / `o1*` / `o3*` / `o4*`；
+  `_model_from` 只在它命中时传 `reasoning_effort="high"`，`extra_body` 的 `thinking`
+  保留。GLM / DeepSeek / Kimi / Qwen 回到「服务端默认返回思考」。
+- **验证**：`tests/test_llm_config.py` **41 passed**；全量 `pytest` **1580 passed**；
+  `ruff check` 干净。
+- **遗留**：重启后端生效。
 
 #### coder 工作流程拆成 A/B：按方案实施 / 修复 PR 问题
 

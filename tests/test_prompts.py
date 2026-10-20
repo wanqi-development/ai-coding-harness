@@ -230,6 +230,42 @@ class TestReadAndBuildDiscipline:
         assert "list_pr_comments" in CODER_PROMPT, "coder 要能自己拉审查原文"
 
 
+class TestReviewIsDiffDriven:
+    """reviewer 49 个文件 / 58 次 read 的教训：diff hunk 是主材料，read_file 只补上下文。"""
+
+    def test_it_reads_the_diff_first(self):
+        assert "先看 diff，不先读文件" in REVIEWER_PROMPT
+        assert "改动 hunk" in REVIEWER_PROMPT
+        assert "同一文件同一范围本轮不重读" in REVIEWER_PROMPT
+
+    def test_it_does_not_rescan_a_file_with_offsets(self):
+        assert "用不同 offset 把同一文件从头扫到尾也算重读" in REVIEWER_PROMPT
+
+    def test_large_reviews_close_per_module(self):
+        assert "大 PR 分模块收口" in REVIEWER_PROMPT
+        assert "报告开头给一张覆盖清单" in REVIEWER_PROMPT
+        assert "覆盖率不等于读完所有文件" in REVIEWER_PROMPT
+
+    def test_the_review_form_shares_the_method(self):
+        assert "先看 diff，不先读文件" in REVIEW_AGENT_PROMPT
+
+
+class TestReworkGroupsByModule:
+    """2026-10-20：9 条问题按 P0/P1 逐条修，206 次调用 / 1700 万输入。
+
+    改成先确认问题、按模块分组、按模块改与测，避免按级别逐条穿插。
+    """
+
+    def test_issues_are_grouped_by_module_not_severity(self):
+        assert "按模块分组，不按级别" in CODER_PROMPT
+        assert "不按 P0/P1 排序" in CODER_PROMPT
+        assert "一项对应一个模块" in CODER_PROMPT
+
+    def test_each_module_is_tested_before_moving_on(self):
+        assert "同一模块的几条问题一起改完" in CODER_PROMPT
+        assert "全部模块改完再做一次全量" in CODER_PROMPT
+
+
 class TestReasoningRules:
     """推理纪律在基础提示词里，所有形态共享（不只 coder）。"""
 

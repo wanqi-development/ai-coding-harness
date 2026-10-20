@@ -1106,12 +1106,16 @@ class HarnessService:
             # 下面那次 _record 在循环之外，异常一跳过它就永远不执行 —— 先补一条中断记录，
             # 再把异常原样抛给 chat()（error 帧的产生只留它那一处）。
             usage = self._turn_usage(session, intent, run_log, interrupted=True)
+            changes = (
+                await self._changes_for_round(session, pr_refs) if pr_refs else None
+            )
             self._log_turn_cost(
                 session, intent, usage,
                 llm_calls=llm_calls, tool_calls=tool_calls, chars=len(text),
             )
             await self._record_interrupted(
-                session, text, translator, intent, terms, exc, usage=usage,
+                session, text, translator, intent, terms, exc,
+                usage=usage, changes=changes,
             )
             raise
 
@@ -1119,16 +1123,22 @@ class HarnessService:
             # 提前收尾：这一轮没跑完，不能落到下面那条「智能体完成」与正常记录里
             stop = state.aborted
             usage = self._turn_usage(session, intent, run_log, interrupted=True)
+            changes = (
+                await self._changes_for_round(session, pr_refs) if pr_refs else None
+            )
             self._log_turn_cost(
                 session, intent, usage,
                 llm_calls=llm_calls, tool_calls=tool_calls, chars=len(text),
             )
             await self._record_interrupted(
                 session, text, translator, intent, terms,
-                closing=stop.marker, extra=stop.extra, usage=usage,
+                closing=stop.marker, extra=stop.extra,
+                usage=usage, changes=changes,
             )
             # 标记的写法与记录里的一致（``_record_interrupted`` 用空行分隔），
             # 这样实时看到的东西和刷新后回放的一样
+            if changes is not None:
+                yield {"type": "changes", "changes": changes}
             yield {
                 "type": "ai",
                 "content": f"{text}\n\n{stop.marker}" if text else stop.marker,
@@ -1497,6 +1507,7 @@ class HarnessService:
         closing: str | None = None,
         extra: Mapping[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
+        changes: Mapping[str, Any] | None = None,
     ) -> None:
         """一轮跑到一半断了：把已产出的部分补一条记录，别让它在历史里凭空消失。
 
@@ -1529,6 +1540,10 @@ class HarnessService:
         if usage is not None:
             # 中断的轮次同样入账（钱真花了），``usage.interrupted`` 已标成真
             fields["usage"] = usage
+        if changes is not None:
+            # 中止前已经建成的 PR 仍要展示改动（2026-10-20：reviewer 触发循环守卫后
+            # 整块「本轮改动」消失，用户以为功能没了）
+            fields["changes"] = changes
         if has_todos:
             # 有 parts 时前端按 parts 回放、content 整段被忽略，标记得补进块序列尾部
             fields["parts"] = [

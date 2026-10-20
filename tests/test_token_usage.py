@@ -284,6 +284,42 @@ def test_an_interrupted_round_keeps_the_usage_on_the_record() -> None:
     assert fields["usage"]["interrupted"] is True
 
 
+async def test_an_interrupted_round_keeps_changes_on_the_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """中止前已经建成的 PR 仍要留改动清单（2026-10-20 reviewer 触发守卫那轮）。"""
+    service = _service()
+    captured: dict[str, Any] = {}
+
+    async def fake_record(
+        session: Any, *, type: str, summary: str, content: str, extra: dict[str, Any]
+    ) -> None:
+        captured.update(extra)
+
+    monkeypatch.setattr(service, "_record", fake_record)
+    translator = SimpleNamespace(parts=SimpleNamespace(has_todos=False, data=[]))
+    changes = {
+        "base": "master",
+        "head": "feature/x",
+        "files": [{"path": "a.java", "added": 1, "deleted": 0, "status": "A"}],
+    }
+
+    await service._record_interrupted(
+        _session(),
+        "已产出",
+        translator,
+        "coding",
+        (),
+        closing="〔已中止：同一工具重复调用，本轮未取得进展〕",
+        extra={"aborted": "repeated_tool"},
+        changes=changes,
+    )
+
+    assert captured["changes"] == changes
+    assert captured["aborted"] == "repeated_tool"
+    assert captured["partial"] is True
+
+
 # -- 二之二、上下文压力 ----------------------------------------------------
 
 

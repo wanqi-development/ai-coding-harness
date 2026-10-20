@@ -20,9 +20,10 @@
    压了等于没压。改成绝对值。
 
 4. **压缩前先剪工具**（2026-10-17，2026-10-19 加工作笔记）：到线后先做一次应急裁剪，
-   保留「当前这一步」以及模型在 90% 提醒后写下的 ``KEEP:`` 清单点名的工具返回；剪完
-   低于线就不摘要，仍高于才压。供应商自报的上一轮用量只用来触发节点，剪完后按估算值
-   决定；估算偏小导致真实调用溢出时，回退压缩兜底。
+   保留「当前这一步」以及模型在 90% 提醒后写下的 ``KEEP:`` 清单点名的工具返回；
+   **剪完只有落到触发线的 80% 以下才免压**（裁剪只改请求副本，勉强压到线边会让原历史
+   在下次调用再剪一遍，2026-10-20 真机 38 次原地裁剪）；否则继续压。供应商自报的
+   上一轮用量只用来触发节点，剪完后按估算值决定；估算偏小导致真实调用溢出时，回退压缩兜底。
 
 位置也由我们自己定（``agent/graph.py`` / ``agent/subagents.py``）：现在**没有单独的
 常规剪裁中间件**，压缩中间件自己负责到线后的应急裁剪，所以它数到的就是「真要发出去的
@@ -168,6 +169,7 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         pretrim: bool = True,
         pretrim_clear_inputs: bool = False,
         notice_at: int = 0,
+        trigger_at: int = 0,
         **kwargs: Any,
     ) -> None:
         """``agent`` 是日志 ``%(agent)s`` 那一列；``trigger_text`` 是触发线的人话版。
@@ -181,6 +183,10 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
 
         ``notice_at`` 是「压缩线的 90%」那条提醒线：到这条线先让模型写工作笔记，
         下一轮真正裁剪时按笔记里的 ``KEEP:`` 清单保留；0 = 关闭。
+
+        ``trigger_at`` 是数值触发线（``trigger_line`` 折出来的最小值）：应急裁剪后
+        只有落到它的 80% 以下才允许免压。只勉强压到线边（>80%）时下次调用会再剪一遍
+        —— 因为裁剪只改请求副本、不改 checkpoint（2026-10-20 真机 38 次原地裁剪）。
         """
         super().__init__(*args, **kwargs)
         self._agent = agent
@@ -189,6 +195,7 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         self._pretrim = pretrim
         self._pretrim_clear_inputs = pretrim_clear_inputs
         self._notice_at = notice_at
+        self._trigger_at = trigger_at
 
     async def awrap_model_call(
         self,
@@ -252,8 +259,11 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                     pretrimmed, request.system_message, request.tools
                 )
                 still_over = self._should_summarize_estimate(pretrimmed, after)
-                self._log_pretrim(total, after, cleared, still_over)
-                if not still_over:
+                # 裁剪只改这一次请求：原历史仍在 checkpoint 里。若只是勉强压到线边，
+                # 下一次调用会原样再剪一遍，所以只有落到安全区（≤80% 线）才免压。
+                safe = not self._trigger_at or after <= self._trigger_at * 0.8
+                self._log_pretrim(total, after, cleared, still_over, safe)
+                if not still_over and safe:
                     response = await self._call_without_summary(
                         request, pretrimmed, handler, estimated=after
                     )
@@ -363,7 +373,12 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         )
 
     def _log_pretrim(
-        self, before: int, after: int, cleared: int, still_over: bool
+        self,
+        before: int,
+        after: int,
+        cleared: int,
+        still_over: bool,
+        safe: bool,
     ) -> None:
         logger.info(
             "%s 压缩前应急裁剪工具返回：清掉 %d 条，%d → %d tokens（省 %d；触发线 %s）；%s",
@@ -373,7 +388,15 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
             after,
             before - after,
             self._trigger_text,
-            "仍高于压缩线，继续压缩" if still_over else "已低于压缩线，本轮不压缩",
+            (
+                "仍高于压缩线，继续压缩"
+                if still_over
+                else (
+                    "已低于压缩线且落在安全区，本轮不压缩"
+                    if safe
+                    else "仅勉强低于压缩线（>80%），继续压缩"
+                )
+            ),
             extra={"agent": self._agent},
         )
 
@@ -608,7 +631,8 @@ def build_summarization(
     触发线是**按各自模型的窗口**算的，不标出来就对不上是哪一家的账。
 
     ``pretrim`` 跟随 ``CONTEXT_TRIM_TOOL_RESULTS``：到压缩线先做一次应急裁剪，剪完
-    低于线就不压；关掉工具裁剪总开关时退回上游原来的「到线直接压」。
+    落到线以下 80% 才免压（只勉强低于线仍会压）；关掉工具裁剪总开关时退回上游原来的
+    「到线直接压」。
     """
     if not settings.context_summary_enabled:
         return None
@@ -642,4 +666,5 @@ def build_summarization(
         pretrim=settings.context_trim_enabled,
         pretrim_clear_inputs=settings.context_trim_clear_inputs,
         notice_at=notice_at,
+        trigger_at=line or 0,
     )
