@@ -25,6 +25,52 @@
 
 ### 2026-10-20
 
+#### Token 面板删掉上下文块；环图改看「最近一次主控调用」；子智能体折叠
+
+- **动机**（用户口径 2026-10-20）：Token 面板里的「窗口 128,000」来自会话级聚合
+  「**取最小窗口 + 取最大峰值**」——两个数来自不同轮次（实测 298,277 / 128,000 = 233%），
+  拼出一个假比例；而环图关心的是「**现在**这条历史多长」，不该用历史峰值。
+- **改动**：
+  - `server/turn/usage.py::_turn_context`：取 `run_log.last_input`（本轮**最近一次主控
+    LLM 调用**的输入），不再取峰值；本轮没有主控调用时沿用上一轮的值（不会突然掉到 0）。
+    `_context_state` 改存「最近值 + 压缩次数」。
+  - 上下文那一格的字段 `max_input` 改名为 `input`；`UsageContext` 保留 `max_input`
+    只用于读改版之前的老记录，前端读 `input ?? max_input`。
+  - `GET /sessions/{id}/usage` **不再返回 context**，`_tighter_context` / `_smaller_window`
+    一并删除 —— Token 面板只留 token 账，上下文压力统一看输入框右边的环图。
+  - `GET /sessions/{id}/usage` 增加 `by_form`：主控在事件流里只有一个名字，按每一轮的
+    `extra.intent` 拆成 qa / analysis / plan / review / coding / rework。
+  - `UsagePanel.vue`：删掉「上下文」那一段；行结构改成**主控按形态** + **coding 组**
+    （2026-10-20 用户口径）：
+
+    ```
+    analysis 分析     28.6M
+    qa       问答     10.6M
+    plan     方案      6.4M
+    review   审查      3.0M
+    ▾ coding 编码     ...
+        coder 编码    207.9M
+        reviewer 审查  17.3M
+        planner 方案    7.5M
+      intent 意图分类  250k
+      摘要            157k
+    ```
+
+    **rework 不单列**：它与 coding 共用 `orchestrate` 形态，主控开销并进 coding 那一组。
+    折叠箭头默认展开 —— 折叠不会默认藏起最大的一笔。
+    `internal`（摘要）与 `intent`（判定）不并进 coding —— 它们不是主控派出去的子智能体。
+    主控里没有 `intent` 的老记录单独出「主控（未标注形态）」一行，保证账对得上。
+  - `style.css`：删掉 `.usage-context*` 一组样式，加折叠箭头与子行的缩进 / 弱化。
+- **关键决策**：
+  - 环图量的是**主控**的上下文（压缩只作用于主控那份历史）；子智能体各有自己的窗口，
+    把它们算进来会得出「永远安全」的错结论。
+  - 会话级聚合原本想表达「最坏情况」，但分子分母来自不同轮次时比例没有物理意义；
+    与其修正口径，不如把这一格整个删掉（用户口径：「不需要了」）。
+- **验证**：全量 `pytest` **1586 passed**；`ruff check` 改动文件干净；
+  `npm --prefix frontend run build`（含 vue-tsc）通过。
+- **遗留**：改版之前的历史记录里 `context` 仍是峰值口径（`max_input`）；环图对老记录
+  按原样显示，不重算。
+
 #### 第二批：三个大文件按功能拆包
 
 - **动机**：第一层只整理了目录；三个核心文件仍然过长（`db/dao.py` 703 行、

@@ -71,12 +71,12 @@ export interface UsageDetail {
 }
 
 /**
- * 上下文压力：这个会话的历史离主控模型的窗口还有多远。
+ * 上下文压力：**最近一次主控调用**的输入离主控模型的窗口还有多远。
  *
  * `window` 是**该轮主控模型**的窗口（orchestrate / plan 是 GLM 128k、review 是 Kimi 256k），
- * 所以同一份历史在不同形态下的 `ratio` 本来就不同。`max_input` 是**当前水位**：平时取各轮
- * 峰值（最近一次会因为缓存命中而偏小），压过之后改用压缩后的真实占用 —— 所以它会在压缩后
- * 掉下来，不会永久停在「接近压缩线」。
+ * 所以同一份历史在不同形态下的 `ratio` 本来就不同。`input` 是最近一次主控 LLM 调用的
+ * 输入 tokens（2026-10-20 用户口径：环图看「现在多长」，不看历史峰值）；`max_input`
+ * 是旧记录里的字段名，只为读改版之前的历史。
  *
  * 字段名与接口一致（snake_case），不做转换：后端每个模型都直接序列化，多一层改名就多
  * 一处会漂的地方。
@@ -112,7 +112,10 @@ export interface UsageContext {
   /** 服务端认的告警线 / 危险线（占窗口比例）：环图的变色口径由它给，界面不写死阈值 */
   warn_ratio?: number
   alert_ratio?: number
-  max_input: number
+  /** 最近一次主控 LLM 调用的输入 tokens（2026-10-20 起） */
+  input?: number
+  /** 旧记录里的口径（历史峰值）；新记录不再写它 */
+  max_input?: number
   window: number
   ratio: number
   compressed: number
@@ -387,13 +390,16 @@ export interface UsageActor {
 export interface UsageSnapshot {
   totals: UsageActor
   actors: UsageActor[]
+  /**
+   * **主控按形态**拆出来的用量（qa / analysis / plan / review / coding / rework）。
+   * 子智能体不在这里 —— 它们本来就是独立的执行主角（见 `actors`）。
+   */
+  by_form: Record<string, UsageActor>
   rounds: number
   rounds_with_usage: number
   rounds_interrupted: number
   /** 平台没回用量的调用次数 —— 账上的缺口，如实显示而不是抹掉 */
   missing: number
-  /** 各轮里**压力最大**的那一份（服务端已取极值）；没有 context 数据时为 null */
-  context: UsageContext | null
 }
 
 /**

@@ -41,26 +41,164 @@ const loading = ref(false)
 /** 是否有任何账可看：一轮都没统计到时就别再画 0 —— 那看着像「确实没花钱」。 */
 const hasUsage = computed(() => (data.value?.rounds_with_usage ?? 0) > 0)
 
-/** 某一项在最大项面前的占比（画横条用）；最大项为 0 时返回 0，避免除零。 */
-const peak = computed(() =>
-  Math.max(1, ...(data.value?.actors ?? []).map((a) => a.total)),
+/**
+ * 面板的行结构（2026-10-20 用户口径）：
+ *
+ * - 主控**按形态**拆开：analysis / qa / plan / review 各一行；
+ * - `coding` 是一组，子项是 coder / reviewer / planner；
+ * - **rework 不单列**：它与 coding 共用 `orchestrate` 形态，主控开销并进 coding 那一组；
+ * - `intent`（判定）与 `internal`（摘要）是别处的开销，各自平铺。
+ */
+const SUB_AGENT_KEYS = ['coder', 'reviewer', 'planner'] as const
+/** 独立成行的形态（主控按 ``extra.intent`` 聚合出来的） */
+const STANDALONE_FORMS = ['analysis', 'qa', 'plan', 'review'] as const
+/** 并进 coding 组的两个形态：rework 与 coding 共用同一套「主控 + 三个子智能体」 */
+const CODING_FORMS = ['coding', 'rework'] as const
+
+/** 形态的两个名字：拉丁名（与后端 key 对齐）+ 中文。 */
+const FORM_LABELS: Record<string, [string, string]> = {
+  analysis: ['analysis', '分析'],
+  qa: ['qa', '问答'],
+  plan: ['plan', '方案'],
+  review: ['review', '审查'],
+  coding: ['coding', '编码'],
+  rework: ['rework', '返工'],
+}
+
+/** 子智能体的两个名字（与 /ai_coding/skills 里的角色名一致）。 */
+const SUB_LABELS: Record<string, string> = { coder: '编码', reviewer: '审查', planner: '方案' }
+
+/** 展开状态。**默认展开** —— 折叠起来会把最大的一笔开销（通常是 coder）藏起来。 */
+const expanded = ref<Record<string, boolean>>({ coding: true, main: true })
+
+interface UsageRow {
+  /** 行键（v-for 与折叠状态都用它） */
+  key: string
+  actor: UsageActor
+  depth: 0 | 1
+  children: UsageActor[]
+  /** 有值时按「拉丁名 + 中文」显示（形态行）；否则走 ``actorLabel`` */
+  formKey?: string
+}
+
+/** 把若干项加起来装成一个「组」的伪 actor（只用于显示合计）。 */
+function sumActors(parts: UsageActor[], key: string): UsageActor {
+  const sum = (pick: (actor: UsageActor) => number) => parts.reduce((acc, a) => acc + pick(a), 0)
+  return {
+    key,
+    input: sum((a) => a.input),
+    output: sum((a) => a.output),
+    calls: sum((a) => a.calls),
+    total: sum((a) => a.total),
+  }
+}
+
+const groupedRows = computed<UsageRow[]>(() => {
+  const actors = data.value?.actors ?? []
+  const forms = data.value?.by_form ?? {}
+  // 老后端不返回 ``by_form``（还没重启）：退回改版前的样子 —— 一个「主控」父行 +
+  // 三个子智能体。不能让它显示成「主控（未标注形态）」，那不是数据缺形态，是接口老了。
+  const hasForms = Object.keys(forms).length > 0
+  const byKey = new Map(actors.map((actor) => [actor.key, actor]))
+  const rows: UsageRow[] = []
+
+  // ① 独立形态：主控在那一轮的全部开销，按花得多排前面
+  const standalone = STANDALONE_FORMS.map((key) => forms[key])
+    .filter((actor): actor is UsageActor => actor !== undefined && actor.total > 0)
+    .sort((a, b) => b.total - a.total)
+  for (const form of standalone) {
+    rows.push({ key: form.key, actor: form, depth: 0, children: [], formKey: form.key })
+  }
+
+  // ② coding 组：主控（coding + rework）+ 三个子智能体
+  const kids = SUB_AGENT_KEYS.map((key) => byKey.get(key))
+    .filter((actor): actor is UsageActor => actor !== undefined)
+    .sort((a, b) => b.total - a.total)
+  const codingParts = CODING_FORMS.map((key) => forms[key]).filter(
+    (actor): actor is UsageActor => actor !== undefined,
+  )
+  if (hasForms && (kids.length || codingParts.length)) {
+    rows.push({
+      key: 'coding',
+      actor: sumActors([...codingParts, ...kids], 'coding'),
+      depth: 0,
+      children: kids,
+      formKey: 'coding',
+    })
+  } else if (!hasForms) {
+    // 老接口：主控 + 子智能体，不按形态拆
+    const mainActor = byKey.get('main')
+    if (mainActor) rows.push({ key: 'main', actor: mainActor, depth: 0, children: kids })
+    else for (const child of kids) rows.push({ key: child.key, actor: child, depth: 0, children: [] })
+  }
+
+  // ③ 其余执行主角：意图判定、上下文摘要、以及将来新增/认不出的角色
+  for (const actor of actors) {
+    if (actor.key === 'main') continue
+    if ((SUB_AGENT_KEYS as readonly string[]).includes(actor.key)) continue
+    rows.push({ key: actor.key, actor, depth: 0, children: [] })
+  }
+
+  // ④ 主控里没有标注形态的余量（老记录 / intent 为空）：单独兜住，否则账对不上
+  const main = byKey.get('main')
+  const forms_ = Object.values(forms)
+  const lostInput = hasForms ? (main?.input ?? 0) - forms_.reduce((acc, f) => acc + f.input, 0) : 0
+  const lostOutput = hasForms
+    ? (main?.output ?? 0) - forms_.reduce((acc, f) => acc + f.output, 0)
+    : 0
+  if (hasForms && (lostInput > 0 || lostOutput > 0)) {
+    rows.push({
+      key: '__unattributed__',
+      actor: {
+        key: '__unattributed__',
+        input: Math.max(0, lostInput),
+        output: Math.max(0, lostOutput),
+        calls: 0,
+        total: Math.max(0, lostInput) + Math.max(0, lostOutput),
+      },
+      depth: 0,
+      children: [],
+    })
+  }
+  return rows
+})
+
+/** 展开的行 + 它的子项；折叠时子项不占行。 */
+const visibleRows = computed<UsageRow[]>(() =>
+  groupedRows.value.flatMap((row) => {
+    if (!row.children.length || !expanded.value[row.key]) return [row]
+    return [
+      row,
+      ...row.children.map((child) => ({
+        key: `${row.key}:${child.key}`,
+        actor: child,
+        depth: 1 as const,
+        children: [] as UsageActor[],
+      })),
+    ]
+  }),
 )
 
-/** 上下文压力百分比：服务端已算好 ratio，这里只转整数（阈值口径只有服务端一处）。 */
-const contextPercent = computed(() => {
-  const ctx = data.value?.context
-  if (!ctx || ctx.window <= 0) return 0
-  return Math.min(100, Math.round(ctx.ratio * 100))
-})
+function toggleRow(key: string) {
+  expanded.value[key] = !expanded.value[key]
+}
 
-/** 压力档位：与输入框上方那条同一个口径（80% 警示 / 60% 提醒）。 */
-const contextLevel = computed(() => {
-  const ctx = data.value?.context
-  if (!ctx || ctx.window <= 0) return 'none'
-  if (ctx.ratio >= 0.8) return 'alert'
-  if (ctx.ratio >= 0.6) return 'warn'
-  return 'ok'
-})
+/**
+ * 横条基准：**分组后的行**里的最大项。
+ *
+ * 不能用原始 ``actors`` —— coding 那一组是「主控 + 三个子智能体」的合计，可能比任何单个
+ * 角色都大；拿原始值当分母会让那一行的条超过 100%（撑出容器）。
+ */
+const peak = computed(() => Math.max(1, ...groupedRows.value.map((row) => row.actor.total)))
+
+/** 行名：形态行走「拉丁名 + 中文」，其余走固定标签表。 */
+function rowLabel(row: UsageRow): string {
+  if (row.formKey) return `${FORM_LABELS[row.formKey]?.[0] ?? row.formKey} ${FORM_LABELS[row.formKey]?.[1] ?? ''}`.trim()
+  const sub = SUB_LABELS[row.actor.key]
+  if (row.depth === 1 && sub) return `${row.actor.key} ${sub}`
+  if (row.actor.key === '__unattributed__') return '主控（未标注形态）'
+  return actorLabel(row.actor.key)
+}
 
 function actorLabel(key: string): string {
   return LABEL[key] ?? key
@@ -157,38 +295,34 @@ watch(() => props.sessionId, load, { immediate: true })
           >。
         </p>
 
-        <!-- 上下文压力：这是「为什么某轮回复变短了」的答案，放在明细之前 -->
-        <template v-if="data.context && data.context.window > 0">
-          <p class="usage-section">上下文</p>
-          <div class="usage-context" :class="contextLevel">
-            <div class="usage-track usage-context-track">
-              <i class="usage-fill" :style="{ width: `${contextPercent}%` }"></i>
-            </div>
-            <p class="usage-context-note">
-              峰值输入 {{ num(data.context.max_input) }} / 窗口
-              {{ num(data.context.window) }}（{{ contextPercent }}%）<template
-                v-if="data.context.compressed"
-              >
-                ；已压缩 {{ data.context.compressed }} 次</template
-              >。
-              <span v-if="contextLevel === 'alert'">
-                已接近压缩线（85%）：下一条消息可能触发压缩，这一轮的回复会变短。
-              </span>
-            </p>
-          </div>
-        </template>
-
         <p class="usage-section">按角色</p>
         <ul class="usage-list">
-          <li v-for="actor in data.actors" :key="actor.key" class="usage-item">
-            <span class="usage-name" :title="actorLabel(actor.key)">{{
-              actorLabel(actor.key)
-            }}</span>
+          <li
+            v-for="row in visibleRows"
+            :key="row.key"
+            class="usage-item"
+            :class="{ 'usage-item-child': row.depth === 1 }"
+          >
+            <button
+              v-if="row.children.length"
+              class="usage-fold"
+              type="button"
+              :aria-expanded="!!expanded[row.key]"
+              :title="expanded[row.key] ? '折叠子智能体' : '展开子智能体'"
+              @click="toggleRow(row.key)"
+            >
+              {{ expanded[row.key] ? '▾' : '▸' }}
+            </button>
+            <span v-else class="usage-fold usage-fold-empty" aria-hidden="true"></span>
+            <span class="usage-name" :title="rowLabel(row)">{{ rowLabel(row) }}</span>
             <span class="usage-track">
-              <i class="usage-fill" :style="{ width: barWidth(actor) }"></i>
+              <i class="usage-fill" :style="{ width: barWidth(row.actor) }"></i>
             </span>
-            <span class="usage-value" :title="`输入 ${num(actor.input)} / 输出 ${num(actor.output)}`">
-              {{ short(actor.total) }}
+            <span
+              class="usage-value"
+              :title="`输入 ${num(row.actor.input)} / 输出 ${num(row.actor.output)}`"
+            >
+              {{ short(row.actor.total) }}
             </span>
           </li>
         </ul>
@@ -204,11 +338,26 @@ watch(() => props.sessionId, load, { immediate: true })
             </tr>
           </thead>
           <tbody>
-            <tr v-for="actor in data.actors" :key="actor.key">
-              <td>{{ actorLabel(actor.key) }}</td>
-              <td>{{ num(actor.input) }}</td>
-              <td>{{ num(actor.output) }}</td>
-              <td>{{ actor.calls }}</td>
+            <tr
+              v-for="row in visibleRows"
+              :key="row.key"
+              :class="{ 'usage-child': row.depth === 1 }"
+            >
+              <td>
+                <button
+                  v-if="row.children.length"
+                  class="usage-fold"
+                  type="button"
+                  :aria-expanded="!!expanded[row.key]"
+                  @click="toggleRow(row.key)"
+                >
+                  {{ expanded[row.key] ? '▾' : '▸' }}
+                </button>
+                {{ rowLabel(row) }}
+              </td>
+              <td>{{ num(row.actor.input) }}</td>
+              <td>{{ num(row.actor.output) }}</td>
+              <td>{{ row.actor.calls }}</td>
             </tr>
             <tr class="usage-sum">
               <td>合计</td>

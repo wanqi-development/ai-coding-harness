@@ -362,19 +362,20 @@ class UsageTokens(BaseModel):
 
 
 class UsageContext(BaseModel):
-    """上下文压力：这个会话的历史离主控模型的窗口还有多远。
+    """上下文压力：**最近一次主控调用**的输入离模型的窗口还有多远。
 
     ``window`` 是**该轮主控模型**的窗口（orchestrate / plan 是 GLM 128k、review 是
     Kimi 256k），所以同一份历史在不同形态下的 ``ratio`` 本来就不同 —— 这是事实而非误差。
-    ``max_input`` 是**当前水位**：平时取各轮的峰值（最近一次会因为缓存命中而偏小，用它
-    会显示成「离上限还早」），但**压过之后改用压缩后的真实占用** —— 否则一次压缩就会让
-    这条提示永久停在「接近压缩线」。所以它会涨，也会在压缩后掉下来。
-    ``compressed`` 是本会话累计压缩次数（> 0 说明历史已经被压过）。
+    ``input`` 是**最近一次主控 LLM 调用**的输入 tokens（2026-10-20 用户口径：环图看
+    「现在多长」，不看历史峰值）。压缩之后它自然就是压完的长度。
+    ``max_input`` 是旧记录里的字段名（当时取的是峰值），保留只为读老数据。
 
     ``warn_ratio`` / ``alert_ratio`` 是**服务端认的**两条线（设置页可改）—— 环图的变色口径
     由它们给，界面不写死 0.6 / 0.8。旧记录里没有这两格时用同样的默认值。
     """
 
+    input: int = 0
+    #: 旧口径（历史峰值）：只用于读本功能改版之前的记录
     max_input: int = 0
     window: int = 0
     ratio: float = 0.0
@@ -429,17 +430,19 @@ class UsageSnapshot(BaseModel):
       **不能把缺数据的轮次当成 0 消耗**（那是最容易糊弄过去、也最容易看错的一种错）；
     - ``missing`` 是「平台没回用量的调用次数」，同样如实外传而不是抹掉。
 
-    ``context`` 取**各轮里压力最大的那一份**（峰值与窗口都按历史取最紧的一档），因为
-    用户问的是「现在这个会话有多满」。
+    **不含上下文压力**（2026-10-20 用户口径）：那一格挪到输入框右边的环图，
+    面板只留 token 账。
     """
 
     totals: UsageActor = Field(default_factory=lambda: UsageActor(key="total"))
     actors: list[UsageActor] = Field(default_factory=list)
+    #: **主控按形态**拆出来的用量（qa / analysis / plan / review / coding / rework）；
+    #: 子智能体不在里面 —— 它们本来就是独立的执行主角（见 ``actors``）。
+    by_form: dict[str, UsageActor] = Field(default_factory=dict)
     rounds: int = 0
     rounds_with_usage: int = 0
     rounds_interrupted: int = 0
     missing: int = 0
-    context: UsageContext | None = None
 
 
 class RecordItem(BaseModel):

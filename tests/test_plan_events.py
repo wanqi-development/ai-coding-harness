@@ -62,7 +62,7 @@ _DEFAULTS = Settings()
 EMPTY_USAGE = {
     **AgentRunLog(arg_limit=100, result_limit=100).usage_snapshot(
         context={
-            "max_input": 0,
+            "input": 0,
             "window": 128_000,
             "ratio": 0.0,
             "compressed": 0,

@@ -260,20 +260,20 @@ def _aggregate_usage(rows: Iterable[Any]) -> UsageSnapshot:
     形状不对的（老数据、别的记录类型、``extra`` 不是 dict）一律跳过，
     但**计入 rounds**：界面要据此说「有 N 轮没有用量数据」。
 
-    ``context`` 取**压力最大**的那一份：峰值输入取最大、窗口取最小、压缩次数取最大
-    —— 用户问的是「这个会话现在有多满」，报最松的那一轮等于粉饰。
-
     主角名走 ``observability.run_log.account_key``：写账与读账共用一个归类规则，
     本功能刚上线的那几轮把主控记在真名下，这里顺手归一次（否则界面上会冒出个英文名）。
+
+    ``by_form`` 是**主控按形态**拆出来的一份（2026-10-20 用户口径）：主控在事件流里只有
+    一个名字，不拆的话 qa / analysis / plan / review / coding 全压在同一行里。形态取自
+    每轮记录的 ``extra.intent``；子智能体不进这一格（它们本来就是独立的执行主角）。
     """
     per_actor: dict[str, list[int]] = {}
+    per_form: dict[str, list[int]] = {}
     totals = [0, 0, 0]
     missing = 0
     rounds = 0
     with_usage = 0
     interrupted = 0
-    context: dict[str, Any] | None = None
-
     for _row, detail in rows:
         extra = getattr(detail, "extra", None) if detail is not None else None
         if getattr(_row, "type", "") != "assistant":
@@ -289,18 +289,24 @@ def _aggregate_usage(rows: Iterable[Any]) -> UsageSnapshot:
         round_total = usage.get("totals") if isinstance(usage.get("totals"), dict) else {}
         totals[0] += _usage_int(round_total.get("input"))
         totals[1] += _usage_int(round_total.get("output"))
-        context = _tighter_context(context, usage.get("context"))
         by_actor = usage.get("by_actor")
         if not isinstance(by_actor, dict):
             continue
+        intent = str(extra.get("intent") or "").strip()
         for key, item in by_actor.items():
             if not isinstance(item, dict):
                 continue
-            lines = per_actor.setdefault(account_key(str(key)), [0, 0, 0])
+            actor = account_key(str(key))
+            lines = per_actor.setdefault(actor, [0, 0, 0])
             lines[0] += _usage_int(item.get("input"))
             lines[1] += _usage_int(item.get("output"))
             lines[2] += _usage_int(item.get("calls"))
             totals[2] += _usage_int(item.get("calls"))
+            if actor == "main" and intent:
+                form = per_form.setdefault(intent, [0, 0, 0])
+                form[0] += _usage_int(item.get("input"))
+                form[1] += _usage_int(item.get("output"))
+                form[2] += _usage_int(item.get("calls"))
 
     actors = [
         UsageActor(
@@ -314,6 +320,16 @@ def _aggregate_usage(rows: Iterable[Any]) -> UsageSnapshot:
         # 花得多的排前面：面板第一眼要看到「钱花在哪」，与 PR 面板「未合并排最前」同一考虑
     ]
     actors.sort(key=lambda item: (-item.total, item.key))
+    forms = {
+        key: UsageActor(
+            key=key,
+            input=lines[0],
+            output=lines[1],
+            calls=lines[2],
+            total=lines[0] + lines[1],
+        )
+        for key, lines in per_form.items()
+    }
     return UsageSnapshot(
         totals=UsageActor(
             key="total",
@@ -323,52 +339,12 @@ def _aggregate_usage(rows: Iterable[Any]) -> UsageSnapshot:
             total=totals[0] + totals[1],
         ),
         actors=actors,
+        by_form=forms,
         rounds=rounds,
         rounds_with_usage=with_usage,
         rounds_interrupted=interrupted,
         missing=missing,
-        context=context,
     )
-
-
-def _tighter_context(current: dict[str, Any] | None, raw: Any) -> dict[str, Any] | None:
-    """在已有压力最大的那一份与新的这一份之间取**更紧**的；两份都没有就返回原值。
-
-    「更紧」＝ 峰值输入更大、窗口更小、压缩次数更多，四个字段各取各的极值 —— 它们不
-    必然来自同一轮（换过形态就换过窗口），但界面要的是「最坏情况」。
-    """
-    if not isinstance(raw, dict):
-        return current
-    fresh = {
-        "max_input": _usage_int(raw.get("max_input")),
-        "window": _usage_int(raw.get("window")),
-        "ratio": 0.0,
-        "compressed": _usage_int(raw.get("compressed")),
-        "compressed_now": bool(raw.get("compressed_now")),
-    }
-    if current is None:
-        picked = fresh
-    else:
-        picked = {
-            "max_input": max(_usage_int(current.get("max_input")), fresh["max_input"]),
-            "window": _smaller_window(_usage_int(current.get("window")), fresh["window"]),
-            "compressed": max(_usage_int(current.get("compressed")), fresh["compressed"]),
-            "compressed_now": bool(current.get("compressed_now"))
-            or fresh["compressed_now"],
-        }
-    picked["ratio"] = (
-        round(picked["max_input"] / picked["window"], 3) if picked["window"] > 0 else 0.0
-    )
-    return picked
-
-
-def _smaller_window(old: int, new: int) -> int:
-    """两个窗口取更紧的那个；0 表示「未知」，不当成最小。"""
-    if old <= 0:
-        return new
-    if new <= 0:
-        return old
-    return min(old, new)
 
 
 def _log_paths(request: Request) -> list[Path]:

@@ -33,10 +33,12 @@ class TurnUsageMixin:
         *,
         commit: bool = True,
     ) -> dict[str, Any]:
-        """上下文压力那一格：峰值输入 / 窗口 / 占比 / 压缩次数。
+        """上下文压力那一格：**最近一次主控调用**的输入 / 窗口 / 占比 / 压缩次数。
 
-        峰值与压缩次数都**跨轮累计**（存在 ``_context_state`` 里，按 ``public_id`` 键）：
-        这一格回答的是「这个会话的历史涨到多大了」，逐轮算只能看到本轮那点量。
+        2026-10-20 用户口径：环图要回答的是「**现在**这条历史有多长」，所以取**最近一次
+        主控 LLM 调用的输入**，不是历史峰值 —— 峰值只增不减，压完也会停在压缩前的数上。
+        本轮没有主控调用（纯摘要 / 直接执行）时沿用上一轮记下的值，免得环图突然掉到 0。
+        这个「最近值」与压缩次数都跨轮保存在 ``_context_state`` 里（按 ``public_id`` 键）。
 
         ``commit=False`` ＝ **看一眼、不落账**（跑动中那些中间帧用它）：累计是 `+=`，
         同一轮里多算几次就会把压缩次数重复累加，所以中间帧一律只读。
@@ -44,28 +46,24 @@ class TurnUsageMixin:
         ``ratio`` 由服务端算好给前端（同一份口径只算一次）。``window`` 是**本轮主控模型**
         的窗口 —— 换形态就换模型（orchestrate/plan 是 GLM 128k、review 是 Kimi 256k），
         所以同一份历史在不同形态下的压力本来就不同，这是事实而不是误差。
-
-        峰值取**跨轮累计**（只增不减），但**这一轮压过**的除外：那会儿的峰值是压缩前
-        那一次，用它会让压力条永久停在「接近压缩线」——历史其实已经被压到 10%。压缩之后
-        的主控输入才是现在的真实占用，所以改用本轮**末值**（``last_input``）。
         """
         key = str(session.public_id)
         # 只读那几次（``commit=False``）连一格都不建 —— 中间帧不该留下任何痕迹
         stored = self._context_state.get(key)
-        peak, compressions = stored if stored is not None else (0, 0)
-        if run_log.compressions and run_log.last_input > 0:
-            peak = run_log.last_input
-        else:
-            peak = max(peak, run_log.peak_input)
+        latest, compressions = stored if stored is not None else (0, 0)
+        if run_log.last_input > 0:
+            latest = run_log.last_input
         if run_log.compressions:
             compressions += run_log.compressions
         if commit:
-            self._context_state[key] = [peak, compressions]
+            self._context_state[key] = [latest, compressions]
         window = _main_window(self._settings, intent)
         return {
-            "max_input": peak,
+            # ``input`` 是**最近一次主控调用**的输入；老记录里这一格叫 ``max_input``，
+            # 前端读 ``input ?? max_input`` 兼容它们。
+            "input": latest,
             "window": window,
-            "ratio": _ratio(peak, window),
+            "ratio": _ratio(latest, window),
             "compressed": compressions,
             "compressed_now": run_log.compressions > 0,
             # 告警线 / 危险线**随这一格发下去**：环图的变色口径只有一处出处（设置页那两格），
@@ -144,14 +142,14 @@ class TurnUsageMixin:
         total_in = int(totals.get("input", 0))
         logger.info(
             "本轮成本：public_id=%s intent=%s 输入 %d / 输出 %d / 调用 %d / 工具 %d "
-            "/ 主控峰值上下文 %d / 输出 %d 字",
+            "/ 主控最近上下文 %d / 输出 %d 字",
             session.public_id,
             intent,
             total_in,
             int(totals.get("output", 0)),
             llm_calls,
             tool_calls,
-            int(context.get("max_input", 0)),
+            int(context.get("input", 0)),
             chars,
             extra={"agent": MAIN_AGENT},
         )

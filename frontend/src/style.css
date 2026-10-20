@@ -1846,25 +1846,6 @@ body.resizing {
   margin: 0;
   accent-color: var(--accent);
 }
-.usage-context {
-  flex: none;
-}
-.usage-context .usage-context-track {
-  height: 4px;
-}
-.usage-context.alert .usage-fill {
-  background: var(--danger);
-}
-.usage-context-note {
-  margin: 4px 0 0;
-  font-size: 11px;
-  line-height: 1.6;
-  color: var(--text-muted);
-}
-.usage-context.alert .usage-context-note {
-  color: var(--danger);
-}
-
 /* ---------------- 右侧栏「Token」标签 ---------------- */
 .usage-panel {
   display: flex;
@@ -1944,10 +1925,36 @@ body.resizing {
   align-items: center;
   gap: 8px;
 }
+/* 子智能体那一行：整体缩进，横条起点仍与父行对齐 */
+.usage-item-child {
+  padding-left: 14px;
+}
+.usage-item-child .usage-name {
+  color: var(--text-muted);
+}
+/* 折叠箭头：固定一格宽，收起 / 展开时角色名不会左右跳 */
+.usage-fold {
+  flex: none;
+  width: 14px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.usage-fold:hover {
+  color: var(--text);
+}
+.usage-fold-empty {
+  cursor: default;
+}
 /* 角色名固定一列，横条起点才会对齐 */
 .usage-name {
   flex: none;
-  width: 76px;
+  /* 形态行是「拉丁名 + 中文」（analysis 分析），比单个角色名宽 */
+  width: 104px;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1997,6 +2004,13 @@ body.resizing {
 }
 .usage-table td:not(:first-child) {
   font-family: 'Cascadia Mono', Consolas, monospace;
+}
+/* 明细表里的子智能体：缩进 + 弱化，父子关系一眼能看出来 */
+.usage-table .usage-child td {
+  color: var(--text-muted);
+}
+.usage-table .usage-child td:first-child {
+  padding-left: 26px;
 }
 /* 合计行压一条实线：它上面那一堆是明细，这一行是小计 */
 .usage-sum td {
