@@ -821,7 +821,7 @@ class Settings(BaseSettings):
     def provider_metas(self) -> tuple[ProviderMeta, ...]:
         """启动时读进来的那份目录 —— 现在只当**兜底**用（见下）。
 
-        界面上的目录是**每条请求现读库**（`api/routes/model_config.py::_provider_metas`），
+        界面上的目录是**每条请求现读库**（`api/routes/model_config/common.py::_provider_metas`），
         所以改库 + 刷新就生效、不用重启。这里这份在两种情况下生效：
         库里读不出来（表坏了 / 连不上），以及压根没有种子文件的老环境 —— 退回
         ``PROVIDER_OPTIONS`` + ``.env`` 里的地址，行为与加表之前一致。

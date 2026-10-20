@@ -492,7 +492,7 @@ async def get_usage(session_id: str, request: Request) -> UsageSnapshot:
     """本会话的 token 消耗（右栏「Token」标签）。
 
     **聚合视图，不改任何数据**：数据源是各轮 assistant 记录里的 ``extra["usage"]``
-    （由 ``server/service.py`` 在轮末写入，按执行主角分类）。
+    （由 ``server/turn/records.py`` 在轮末写入，按执行主角分类）。
 
     两条口径都必须如实外传，界面才不会说谎：
     - 本功能上线前的记录**没有**那份数据 —— 回 ``rounds_with_usage`` 让界面说
