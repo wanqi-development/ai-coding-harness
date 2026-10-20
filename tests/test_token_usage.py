@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -734,3 +735,48 @@ async def test_an_invalid_session_id_is_400(monkeypatch: pytest.MonkeyPatch) -> 
     resp = await _get("/sessions/not-a-uuid/usage", [], monkeypatch)
 
     assert resp.status_code == 400
+
+
+class TestTurnCostLog:
+    """一轮结束必须有一行「输入 / 输出 / 调用 / 峰值」，超阈值再单独告警。"""
+
+    def _run(self, caplog, *, warn: int = 1000) -> None:
+        from ai_coding_harness.server.service import HarnessService
+
+        service = SimpleNamespace(
+            _settings=SimpleNamespace(turn_cost_warn_tokens=warn)
+        )
+        usage = {
+            "totals": {"input": 12, "output": 3, "calls": 2},
+            "by_actor": {
+                "coder": {"input": 9},
+                "main": {"input": 3},
+            },
+            "context": {"max_input": 8},
+        }
+        with caplog.at_level(logging.INFO):
+            HarnessService._log_turn_cost(
+                service,
+                SimpleNamespace(public_id="p-1"),
+                "coding",
+                usage,
+                llm_calls=2,
+                tool_calls=1,
+                chars=5,
+            )
+
+    def test_a_one_line_summary_is_always_logged(self, caplog):
+        self._run(caplog)
+
+        assert "本轮成本" in caplog.text
+        assert "输入 12" in caplog.text
+        assert "主控峰值上下文 8" in caplog.text
+        assert "本轮 token 偏高" not in caplog.text
+
+    def test_over_the_threshold_it_warns_and_names_the_top_actor(self, caplog):
+        self._run(caplog, warn=10)
+
+        assert "本轮 token 偏高" in caplog.text
+        assert "coder 占 9" in caplog.text
+
+

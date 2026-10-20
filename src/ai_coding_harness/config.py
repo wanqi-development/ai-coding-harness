@@ -466,10 +466,11 @@ class Settings(BaseSettings):
         "true",
         "yes",
     )
-    # 应急裁剪时连工具**入参**一起清（write_file 的整份文件、storePlan 的一万字正文）：收益
-    # 更大，但历史 AI 消息的 args 会变空 —— 默认关。
+    # 应急裁剪时连工具**入参**一起清（edit_file 的 old/new、write_file 的整份文件）：
+    # 2026-10-20 起**默认开** —— 真机上 54 次 edit 的正文一直留在历史里，每次调用都重发；
+    # 被裁掉的都是「旧步骤」，当前步骤与 KEEP 点名的结果不在清理范围。
     context_trim_clear_inputs: bool = (
-        os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "false").strip().lower() in ("1", "true", "yes")
+        os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "true").strip().lower() in ("1", "true", "yes")
     )
 
     # 压缩（摘要）：什么时候压 / 压完留多少 / 摘要那次调用最多吃多少。三件都在这组里，
@@ -490,8 +491,16 @@ class Settings(BaseSettings):
     context_burst_trigger_fraction: float = float(
         os.getenv("CONTEXT_BURST_TRIGGER_FRACTION", "0.40")
     )
-    # 窗口解析不出来时的兜底线；有窗口时不再参与触发（避免 1M 模型被一个固定小值
-    # 长期压住）。这条设 0 会被上游的取值校验拒掉。
+    # 触发线 = 比例线 **或** 下面这条绝对上限（先到先触发）。2026-10-20 真机：coder
+    # 一轮 131 次调用、上下文从 15k 涨到 194k，40%×1M=400k 的线永远到不了，于是整轮
+    # 没有压缩 —— 成本是「每次调用 × 当前上下文」，必须在 40 万之前刹住。
+    context_burst_trigger_tokens: int = int(
+        os.getenv("CONTEXT_BURST_TRIGGER_TOKENS", "120000")
+    )
+    context_steady_trigger_tokens: int = int(
+        os.getenv("CONTEXT_STEADY_TRIGGER_TOKENS", "200000")
+    )
+    # 窗口解析不出来时的兜底线（比例线没法算，只能用绝对值）。设 0 会被上游校验拒掉。
     context_summary_trigger_tokens: int = int(
         os.getenv("CONTEXT_SUMMARY_TRIGGER_TOKENS", "120000")
     )
@@ -505,6 +514,10 @@ class Settings(BaseSettings):
     # 「更早的那部分不进摘要」，不是「丢了」。
     context_summary_input_tokens: int = int(
         os.getenv("CONTEXT_SUMMARY_INPUT_TOKENS", "40000")
+    )
+    # 单轮输入合计超过这条线记一条 WARNING（只告警，不改变执行）。
+    turn_cost_warn_tokens: int = int(
+        os.getenv("TURN_COST_WARN_TOKENS", "3000000")
     )
     #: 临近压缩线时先提醒模型写工作笔记的线 = 压缩线 × 这个比例（0=关闭）。
     #: 90% 给模型留出一次正常回复的机会，把「已读到什么、还需要什么」写成 KEEP 清单；

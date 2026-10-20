@@ -2,13 +2,15 @@
 
 按出口分几个模块，各自的取舍都写在模块 docstring 里：
 
-- ``context_inject``：每次模型调用前注入当前时间与本轮意图；
+- ``context_inject``：每次模型调用前注入本轮意图与澄清块；
 - ``redaction``：凭据脱敏的两条出口 —— 工具返回值、模型输出；
 - ``tool_integrity``：工具调用配对自洽 —— 空 id 归一、工具异常兜底、历史整表修复；
 - ``boundary``：按智能体的活动范围 —— 隐藏越界的工具、拦下越界的调用；
 - ``guard``：本轮空转刹车 —— 同一工具同一参数反复调用时先劝、再停；
 - ``delegation_gate``：主控的委派前置条件 —— 本轮没成功写过 ``write_todos`` 就不许
   调用 ``task``；
+- ``read_guard``：读文件红线 —— policies ≤80 行、project ≤200 行；``cat`` 等整文件
+  命令直接拦；
 - ``memory``：仓库记忆 —— 每轮开始把它注入系统提示；plan / orchestrate 主控那份还按 Gitee
   的真实 PR 状态先对账，再按**本轮意图**判闸门（plan / coding 有未合入的 PR 就拦，rework
   反过来：没有待合并的 PR 才拦）；
@@ -30,7 +32,6 @@ from __future__ import annotations
 from ai_coding_harness.agent.middleware.boundary import BoundaryMiddleware
 from ai_coding_harness.agent.middleware.context_inject import (
     IntentMiddleware,
-    current_time_block,
     now_stamp,
 )
 from ai_coding_harness.agent.middleware.context_trim import (
@@ -64,6 +65,7 @@ from ai_coding_harness.agent.middleware.memory import (
     build_memory_middleware,
     refresh_memory,
 )
+from ai_coding_harness.agent.middleware.read_guard import ReadGuardMiddleware
 from ai_coding_harness.agent.middleware.redaction import (
     ModelRedactionMiddleware,
     RedactionMiddleware,
@@ -100,6 +102,7 @@ __all__ = [
     "LoopGuardMiddleware",
     "MemoryMiddleware",
     "ModelRedactionMiddleware",
+    "ReadGuardMiddleware",
     "RedactionMiddleware",
     "Refreshed",
     "StreamUsageMiddleware",
@@ -108,7 +111,6 @@ __all__ = [
     "TurnState",
     "TurnStop",
     "build_memory_middleware",
-    "current_time_block",
     "keep_items_from_messages",
     "now_stamp",
     "pretrim_tool_results",

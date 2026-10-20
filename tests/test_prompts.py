@@ -202,6 +202,70 @@ class TestThePlanIsNotCopiedAround:
         assert "再把**摘要**呈给用户" in PLAN_AGENT_PROMPT
 
 
+class TestReadAndBuildDiscipline:
+    """2026-10-20 的 token 账：52 个文件整读 + 54 次 edit + 131 次调用 = 1519 万输入。
+
+    读法（先定位、读片段、不重读）和构建节奏（批量验证）都写进基础/编码提示词，
+    否则模型只会照着「逐条修」的流程一路重读、一路全量构建。
+    """
+
+    def test_locate_before_reading_slices(self):
+        assert "先 `grep` 定位" in BASE_PROMPT
+        assert "`offset` / `limit`" in BASE_PROMPT
+        assert "不要整文件通读" in BASE_PROMPT
+
+    def test_the_hard_limits_are_stated(self):
+        assert "必须显式给 `limit` 且 ≤80 行" in BASE_PROMPT
+        assert "`/ai_coding/project` ≤200 行" in BASE_PROMPT
+        assert "`cat` / `less` / `more` / `nl` / `tac`" in BASE_PROMPT
+
+    def test_coder_batches_verification(self):
+        assert "批量验证" in CODER_PROMPT
+        assert "不要每改一行就跑一次全量" in CODER_PROMPT
+
+    def test_rework_delegation_does_not_paste_the_review(self):
+        directive = intent_directive("rework")
+        assert "不要整段粘贴审查原文" in directive
+        assert "list_pr_comments" in directive
+        assert "list_pr_comments" in CODER_PROMPT, "coder 要能自己拉审查原文"
+
+
+class TestReasoningRules:
+    """推理纪律在基础提示词里，所有形态共享（不只 coder）。"""
+
+    def test_the_rule_is_in_the_shared_head(self):
+        assert "## 推理规则" in BASE_PROMPT
+        assert "问题 | 影响面 | 处置(答/改/记/上报)" in BASE_PROMPT
+        assert "先过影响面闸门" in BASE_PROMPT
+        assert "同一个点连续两次没有新证据" in BASE_PROMPT
+
+    def test_unverifiable_issues_are_capped(self):
+        assert "最多一次检索 + 一次查源码" in BASE_PROMPT
+        assert "禁止为不可验证问题设计替代实现" in BASE_PROMPT
+        assert "安全、数据丢失、对外 API / 数据契约" in BASE_PROMPT
+
+    def test_the_impact_gate_decides_the_depth(self):
+        assert "低后果 → 记一行残余风险" in BASE_PROMPT
+        assert "高后果 → 停下上报" in BASE_PROMPT
+
+    def test_the_residual_risk_template_is_ready_to_use(self):
+        assert "残余风险：<问题>；影响：<失败关闭/可回滚/需人工确认>" in BASE_PROMPT
+
+    def test_readonly_forms_carry_it_too(self):
+        for prompt in (QA_AGENT_PROMPT, ANALYSIS_AGENT_PROMPT, PLANNER_PROMPT):
+            assert "## 推理规则" in prompt
+
+    def test_reasoning_must_land_in_an_artifact(self):
+        assert "写进答复 / 改代码 / 加测试 / 写风险记录 / 上报" in BASE_PROMPT
+
+    def test_coder_has_two_workflows(self):
+        assert "## 工作流程 A：按方案实施（有 plan_id）" in CODER_PROMPT
+        assert "## 工作流程 B：修复 PR 审查问题（rework）" in CODER_PROMPT
+        assert "核验，不设计修法" in CODER_PROMPT
+        assert "核验完成前不改代码" in CODER_PROMPT
+        assert "覆盖清单" in CODER_PROMPT
+
+
 class TestThePlanBodyStaysShortAndClean:
     """正文限长 + 写干净：一次超长生成会写出半成品。
 
@@ -574,17 +638,36 @@ class TestMemoryWritebackGate:
 class TestMemoryDateComesFromRuntime:
     """记忆里的日期曾经是编的（写了 2026-02-12，仓库其实只有一个 2026-09-16 的提交）。
 
-    现在日期由中间件逐次注入，提示词必须告诉模型「用注入的那个，别凭记忆写」。
+    现在文件头那一行由平台写；散文里的日期必须让模型自己跑 `date`，别凭记忆写。
     文件头那一行另归平台（``memory_reconcile`` 每次刷新按本轮重算），模型不必也不该填。
     """
 
-    def test_date_must_come_from_the_injected_time(self):
-        assert "系统提示里注入的「当前时间」" in BASE_PROMPT
+    def test_date_must_come_from_the_runtime(self):
+        assert "用 `execute` 跑 `date` 取" in BASE_PROMPT
         assert "不要凭记忆编写" in BASE_PROMPT
 
     def test_the_file_header_is_declared_platform_owned(self):
         assert "文件头" in BASE_PROMPT
         assert "{YYYY-MM-DD HH:mm}" not in BASE_PROMPT, "别再让模型往头行填时间"
+
+
+class TestCapabilitiesArePerTurn:
+    """历史里的工具可用性不能当成本轮依据。
+
+    2026-10-19 真机：编码轮的文本里已经写着「task：有」，主控仍在思考里翻历史，
+    说「工具清单里没有 task」。能力块于是被证明只是给单个工具打的补丁；现在改成
+    基础提示词里的一条通用规则 —— 所有形态共享，覆盖 task / storePlan / 写工具。
+    """
+
+    def test_the_rule_is_in_the_shared_head(self):
+        assert "每一轮的能力不同" in BASE_PROMPT
+        assert "只以本轮实际提供的工具为准" in BASE_PROMPT
+        assert "工具清单里没有…」只属于那一轮" in BASE_PROMPT
+        assert "也不要用记忆去枚举工具清单" in BASE_PROMPT
+
+    def test_readonly_forms_carry_it_too(self):
+        for prompt in (QA_AGENT_PROMPT, ANALYSIS_AGENT_PROMPT, PLANNER_PROMPT):
+            assert "每一轮的能力不同" in prompt
 
 
 class TestPrMergeIsHuman:

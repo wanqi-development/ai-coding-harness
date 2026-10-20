@@ -104,7 +104,7 @@ P0（优先保留；宁可少写背景，也不要丢这些）：
    若原话含 API key/token/密码/完整环境变量，必须打码，只写“已配置”。
 2. 精确标识符：文件路径、函数/类签名、命令串、错误码、版本号、配置键值；原样保留，
    不要改写、缩写或“整理”。
-3. 当前状态：目标/意图/形态、plan_id、PR 编号/链接/分支/base/head/commit、合并状态、
+3. 当前状态：目标/意图、plan_id、PR 编号/链接/分支/base/head/commit、合并状态、
    未完成步骤、todo 状态、下一步。
 4. 决策与取舍：已确认的方案、被否决的选项及原因。
 
@@ -112,6 +112,11 @@ P1：
 5. 进度与失败：已完成的步骤、测试/命令结果、失败原因、阻塞/风险/待确认。
 6. 可恢复指针：被压缩的工具输出保留“工具名 + 目标 + tool_call_id（若有）”；
    完整原文会落盘到会话历史文件（摘要消息里会给出路径）。
+
+P0 反向（MUST DROP，写了等于埋雷）：
+- 不要保留任何“能力 / 形态 / 工具可用性”的结论（如“这轮没有 task”“只能只读”
+  “工具清单里没有 X”）。它们逐轮都可能变，下一轮读摘要时会被当成现状；
+  只保留这一轮实际做了什么、还差什么。
 
 可以丢弃：完整文件内容、完整 diff、重复的工具输出、逐行日志、思考过程。
 长度：800~1200 字；P0 条目可以超出，先删背景叙述。
@@ -506,7 +511,8 @@ def summarization_defaults(
     """算出 ``trigger`` / ``keep`` / ``truncate_args_settings`` 三份取值。
 
     ``keep`` 一律用绝对值（理由见模块说明第 3 条）。有窗口时，稳态取窗口 70%、
-    爆发取窗口 40%；**不再叠一个固定绝对上限**，否则 1M 模型会被一个小固定值长期压住。
+    爆发取窗口 40%，**再与一条绝对上限取 OR**（先到先触发）：比例线保护小窗口，
+    绝对值防 1M 窗口把线推到 40 万（2026-10-20 真机：coder 194k 都没触发）。
     没有窗口时退回 ``CONTEXT_SUMMARY_TRIGGER_TOKENS``（保守兜底）。
     """
     if mode not in CONTEXT_MODE_LABELS:
@@ -523,7 +529,13 @@ def summarization_defaults(
         if mode == CONTEXT_MODE_STEADY
         else settings.context_burst_trigger_fraction
     )
-    trigger: Any = ("fraction", ratio)
+    cap = (
+        settings.context_steady_trigger_tokens
+        if mode == CONTEXT_MODE_STEADY
+        else settings.context_burst_trigger_tokens
+    )
+    # 上游对 list 是 OR 语义：比例线或绝对上限，哪条先到都触发。
+    trigger: Any = [("fraction", ratio), ("tokens", cap)]
     return {
         "trigger": trigger,
         "keep": keep,

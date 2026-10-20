@@ -23,7 +23,7 @@ from ai_coding_harness.agent.context_calibration import (
     reset_calibration,
 )
 from ai_coding_harness.agent.middleware.context_trim import context_token_counter
-from ai_coding_harness.agent.summarization import build_summarization
+from ai_coding_harness.agent.middleware.summarization import build_summarization
 from ai_coding_harness.config import Settings
 
 

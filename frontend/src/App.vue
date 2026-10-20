@@ -578,7 +578,10 @@ function showEarlier() {
 
 function onMessagesScroll() {
   const box = msgBox.value
-  if (box && box.scrollTop <= 80) void loadOlder()
+  if (!box) return
+  // 用户翻上去之后浮出「回到最新」；回到底部（含程序化置底）它自己消失。
+  atBottom.value = box.scrollHeight - box.scrollTop - box.clientHeight <= JUMP_LATEST_PX
+  if (box.scrollTop <= 80) void loadOlder()
 }
 
 async function loadOlder() {
@@ -608,6 +611,28 @@ async function loadOlder() {
   }
 }
 const input = ref('')
+/** 输入框高度随内容长（1→6 行）；超过 6 行框内滚动。 */
+const composerInput = ref<HTMLTextAreaElement | null>(null)
+const COMPOSER_MAX_LINES = 6
+function fitComposer() {
+  const el = composerInput.value
+  if (!el) return
+  // 输入框变高会把消息区压矮：原本贴着底的要重新贴回去，否则最后一行被顶出视口、
+  // 「回到最新」也会误弹出来。
+  const stick = atBottom.value
+  const style = getComputedStyle(el)
+  const line = parseFloat(style.lineHeight) || 22
+  const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+  // border-box 下 offsetHeight - clientHeight 就是上下边框；不加回去会矮 2px，一直挂着滚动条。
+  const border = el.offsetHeight - el.clientHeight
+  const max = line * COMPOSER_MAX_LINES + padding
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight + border, max)}px`
+  el.style.overflowY = el.scrollHeight + border > max ? 'auto' : 'hidden'
+  if (stick) scrollToBottom()
+}
+// 发送清空 / 粘贴 / 快捷动作改值都会经过这里，不必在每个调用点各写一次。
+watch(input, () => void nextTick(fitComposer))
 const loading = ref(false)
 const hasMoreHistory = ref(false)
 const loadingOlder = ref(false)
@@ -796,6 +821,11 @@ async function reloadSessions() {
 /** 离底部多少像素以内算「还贴着底」：用户往上翻之后，流式内容就不要再把他拽回来。 */
 const STICK_BOTTOM_PX = 48
 
+/** 离底部超过这段距离算「用户翻上去了」：显示回到最新的圆钮。 */
+const JUMP_LATEST_PX = 80
+/** 视口是否还贴着底（与 ``STICK_BOTTOM_PX`` 分开：48 是「别把我拽回去」的容忍，80 是按钮的显隐线）。 */
+const atBottom = ref(true)
+
 /** 视口是不是还贴着消息区的底？拿不到元素时按「是」算（首次进来本来就要跟到底）。 */
 function nearBottom(): boolean {
   const el = msgBox.value
@@ -817,8 +847,19 @@ function scrollToBottom(stick = true) {
   nextTick(() => {
     scrollQueued = false
     const el = msgBox.value
-    if (el) el.scrollTop = el.scrollHeight
+    if (el) {
+      el.scrollTop = el.scrollHeight
+      atBottom.value = true
+    }
   })
+}
+
+/** 点圆钮：平滑回到底部；按钮先收起，落底后由 scroll 事件重新校准。 */
+function jumpToLatest() {
+  const el = msgBox.value
+  atBottom.value = true
+  if (!el) return
+  el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
 }
 
 /**
@@ -1681,8 +1722,9 @@ onUnmounted(() => {
         <p class="hint">选中或新建一个对话，然后输入消息</p>
       </div>
 
-      <!-- 消息区 -->
-      <div v-else class="messages" ref="msgBox" @scroll.passive="onMessagesScroll" @click="onMessagesClick">
+      <!-- 消息区：外面这层只做「回到最新」的定位锚点，不参与滚动 -->
+      <div v-else class="messages-wrap">
+      <div class="messages" ref="msgBox" @scroll.passive="onMessagesScroll" @click="onMessagesClick">
         <!-- 更早的历史先不挂进 DOM（见 visibleTail）：真要翻再点出来 -->
         <div v-if="loadingOlder" class="load-earlier">正在加载更早的历史…</div>
         <div v-else-if="hasMoreHistory" class="load-earlier">
@@ -1906,6 +1948,27 @@ onUnmounted(() => {
           <span class="thinking-text">{{ activity }}</span>
         </div>
       </div>
+      <!-- 翻上去之后浮出来：圆形钮，点击平滑回到底部 -->
+      <button
+        v-if="!atBottom"
+        type="button"
+        class="jump-latest"
+        title="回到最新"
+        aria-label="回到最新"
+        @click="jumpToLatest"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path
+            d="M12 4v14m0 0 6-6m-6 6-6-6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+      </div>
 
       <!-- 一次性提示（如复用既有会话）：几秒后自己消失，不用点 -->
       <div v-if="notice" class="notice-bar">{{ notice }}</div>
@@ -1952,6 +2015,7 @@ onUnmounted(() => {
       <div v-if="!pendingRepo" class="composer">
         <textarea
           v-model="input"
+          ref="composerInput"
           class="composer-input"
           rows="1"
           placeholder="给 ai-coding-harness 发送消息…"

@@ -43,8 +43,7 @@ from ai_coding_harness.agent.context_calibration import CalibratedTokenCounter
 from ai_coding_harness.agent.middleware.context_trim import (
     context_token_counter,
 )
-from ai_coding_harness.agent.subagents import build_subagents
-from ai_coding_harness.agent.summarization import (
+from ai_coding_harness.agent.middleware.summarization import (
     CONTEXT_MODE_BURST,
     CONTEXT_MODE_STEADY,
     PRETRIM_LOG_TAG,
@@ -57,6 +56,7 @@ from ai_coding_harness.agent.summarization import (
     summarization_defaults,
     trigger_line,
 )
+from ai_coding_harness.agent.subagents import build_subagents
 from ai_coding_harness.config import Settings
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.safety.policy import policy_for
@@ -175,8 +175,9 @@ class TestTrigger:
             _model(), settings, mode=CONTEXT_MODE_BURST
         )["trigger"]
 
-        assert trigger == ("fraction", 0.40)
-        assert trigger_line(trigger, QWEN_WINDOW) == int(QWEN_WINDOW * 0.40)
+        assert trigger == [("fraction", 0.40), ("tokens", 120_000)]
+        # 两条是 OR，实际生效的是更小的那条（绝对上限）
+        assert trigger_line(trigger, QWEN_WINDOW) == 120_000
 
     def test_steady_uses_70_percent_of_the_window(self):
         settings = _settings()
@@ -185,21 +186,21 @@ class TestTrigger:
             _model(), settings, mode=CONTEXT_MODE_STEADY
         )["trigger"]
 
-        assert trigger == ("fraction", 0.70)
-        assert trigger_line(trigger, QWEN_WINDOW) == int(QWEN_WINDOW * 0.70)
+        assert trigger == [("fraction", 0.70), ("tokens", 200_000)]
+        assert trigger_line(trigger, QWEN_WINDOW) == 200_000
 
-    def test_a_huge_window_compresses_at_the_burst_ratio(self):
-        """①的正题：1M 窗口下，真机那个 152k 峰值**必须**能触发压缩。
+    def test_a_huge_window_compresses_at_the_absolute_cap(self):
+        """1M 窗口下，比例线（40 万）不是唯一的线：绝对上限 12 万也必须能触发。
 
-        只有比例那条时线落在 843k，这一轮压根压不到 —— 这就是「换了中文计数器也没救回来」
-        的原因。绝对那条还有个副作用是好的：上游判它时会顺带看供应商自报的
+        2026-10-20 真机：coder 一路涨到 194k 都没压 —— 只有比例线时线落在 40 万。
+        绝对那条还有个副作用是好的：上游判它时会顺带看供应商自报的
         ``usage_metadata.total_tokens``（真值），所以估算偏了也照样能触发。
         """
         middleware = build_summarization(_model(), _backend(), _settings())
         helper = middleware._lc_helper
 
-        assert helper._should_summarize(_one_message(), int(QWEN_WINDOW * 0.40)) is True
-        assert helper._should_summarize(_one_message(), int(QWEN_WINDOW * 0.39)) is False
+        assert helper._should_summarize(_one_message(), 120_001) is True
+        assert helper._should_summarize(_one_message(), 119_999) is False
 
     def test_the_keep_line_is_absolute_too(self):
         """keep 用绝对值：``("fraction", 0.10)`` 在 1M 窗口下等于「压完还留 100k」，
@@ -224,6 +225,7 @@ class TestTrigger:
     def test_the_values_come_from_the_settings(self):
         settings = _settings(
             context_burst_trigger_fraction=0.5,
+            context_burst_trigger_tokens=6543,
             context_summary_trigger_tokens=4321,
             context_summary_keep_tokens=999,
             context_summary_input_tokens=888,
@@ -232,7 +234,7 @@ class TestTrigger:
             _model(), _backend(), settings, mode=CONTEXT_MODE_BURST
         )._lc_helper
 
-        assert helper._trigger_clauses == [{"fraction": 0.5}]
+        assert helper._trigger_clauses == [{"fraction": 0.5}, {"tokens": 6543}]
         assert helper.keep == ("tokens", 999)
         assert helper.trim_tokens_to_summarize == 888
 
@@ -713,11 +715,14 @@ class TestPreSummaryTrim:
         on = self._middleware()
         off = self._middleware(context_trim_enabled=False)
         flagged = self._middleware(context_trim_clear_inputs=True)
+        unflagged = self._middleware(context_trim_clear_inputs=False)
 
         assert on._pretrim is True
-        assert on._pretrim_clear_inputs is False
+        # 2026-10-20 起默认开：旧 edit/write 的入参不再随每次调用重发
+        assert on._pretrim_clear_inputs is True
         assert off._pretrim is False
         assert flagged._pretrim_clear_inputs is True
+        assert unflagged._pretrim_clear_inputs is False
 
 
 class TestDescribeTrigger:
@@ -736,6 +741,7 @@ class TestDescribeTrigger:
         assert text == (
             f"窗口 {QWEN_WINDOW}×{settings.context_burst_trigger_fraction}"
             f"={int(QWEN_WINDOW * settings.context_burst_trigger_fraction)}"
+            f" 或 {settings.context_burst_trigger_tokens} tokens"
         )
 
     def test_without_a_window_only_the_absolute_line_is_there(self):
@@ -794,7 +800,7 @@ class TestTheWorkingNoteNotice:
     def test_it_is_injected_once_per_agent_and_carries_the_keep_format(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        from ai_coding_harness.agent import summarization as summarization_module
+        from ai_coding_harness.agent.middleware import summarization as summarization_module
 
         state = SimpleNamespace(pretrim_noticed=set())
         monkeypatch.setattr(
@@ -818,7 +824,7 @@ class TestTheWorkingNoteNotice:
     async def test_the_notice_reaches_the_model_call_without_trimming_yet(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        from ai_coding_harness.agent import summarization as summarization_module
+        from ai_coding_harness.agent.middleware import summarization as summarization_module
 
         state = SimpleNamespace(pretrim_noticed=set())
         monkeypatch.setattr(

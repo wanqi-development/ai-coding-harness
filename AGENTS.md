@@ -151,22 +151,44 @@
 - **不要常规剪裁**（2026-10-17 用户口径）：平时**不**按 40k 阈值剪；只有到达压缩线时，
   压缩中间件才做一次**应急裁剪**（`pretrim_tool_results`）。2026-10-19 起按角色分两档：
   主控 `plan` / `review` 与子智能体 `planner` / `coder` / `reviewer` 走**爆发**（窗口 40%），
-  `qa` / `analysis` 与主控 `orchestrate`（coding / rework）走**稳态**（窗口 70%）；到压缩线的 90% 先注入
+  `qa` / `analysis` 与主控 `orchestrate`（coding / rework）走**稳态**（窗口 70%）。
+  **2026-10-20 起再叠一条绝对上限**：爆发 120k、稳态 200k，与比例线是 OR（先到先触发）——
+  1M 窗口的 40% 是 40 万，真机一轮 131 次调用能涨到 194k 都不压。到压缩线的 90% 先注入
   `PRETRIM_NOTICE`，让模型写 `<working-note>` + `KEEP:` 清单；下一轮裁剪保留
   **当前步骤 + KEEP 点名的工具返回**（总额约 20k tokens，最近优先），未点名的一律换成
   带身份占位符。剪完低于线就不摘要，仍高于才压。**不要**改成「最后一条 `HumanMessage`
   之后全部保留」—— 子智能体整轮可能有一百多条工具返回，等于没有裁剪。它跟随
   `CONTEXT_TRIM_TOOL_RESULTS` 总开关；`CONTEXT_TRIM_TRIGGER_TOKENS` / `CONTEXT_TRIM_KEEP`
   / `CONTEXT_TRIM_ROLES` 已作废，别再加回独立剪裁中间件。`CONTEXT_SUMMARY_TRIGGER_TOKENS`
-  现在只在窗口解析不出来时兜底，不再作为 1M 模型的固定小上限。
-- **主控 `task` 前必须先成功 `write_todos`**（2026-10-19 用户口径）：`LoopGuardMiddleware`
-  在 `awrap_tool_call` 里检查 `TurnState`，只认本轮**成功返回**的 `write_todos`；没有就
-  回一条 `ToolMessage(status="error")`、`task` 不执行。被拦的 `task` 不计入循环次数；
-  只约束主控，子智能体不受影响。`LOOP_GUARD_REPEATS=0` 只关重复计数，不关这道闸门。
-- **每轮能力由 `IntentMiddleware` 注入**（`middleware/context_inject.py`）：形态 / 有无
-  `task` / 可派子智能体，**以本次实际绑定的 `request.tools` 为准**，并明写“上一轮的结论
-  不适用于本轮”。rework 与 coding 共用 `orchestrate`；模型若说“没有 task”，先看这条注入
-  与日志里的 `form=`，不要直接怀疑形态映射。
+  只在窗口解析不出来时兜底；有窗口时用「比例线 或 绝对上限」。每轮结束会打一条
+  `本轮成本`（输入/输出/调用/峰值），超过 `TURN_COST_WARN_TOKENS`（默认 300 万）再记 WARNING。
+- **主控每次 `task` 前都要有一段新的 `write_todos`**（2026-10-20 用户口径，
+  `DelegationGateMiddleware`）：第一次派发看最近一条 `HumanMessage` 之后；之后每次派发看
+  上一次 `task` 结果之后。同一条 AI 消息里并行的 `write_todos` + `task` 不算，同一批并行
+  的多个 `task` 共享同一段清单更新。被拦的 `task` 不计入循环次数；只约束主控，子智能体
+  不受影响。`LOOP_GUARD_REPEATS=0` 只关重复计数，不关这道闸门。排查时先看日志里有没有
+  `委派闸门已挂载`：没有这行就是进程没重载。
+- **成本纪律**（2026-10-20）：读码先 `grep` 定位、再用 `read_file` 的 `offset/limit`
+  读片段，同一文件本轮不重读；coder 按模块批量验证，别每改一行跑一次全量；
+  `CONTEXT_TRIM_CLEAR_INPUTS` 默认开（裁剪时清旧 `edit_file` / `write_file` 入参）；
+  rework 的任务描述只给 PR / 问题编号，审查原文由 coder 用 `list_pr_comments` 自取
+  （coder **只读**评论，`comment_pr` 仍归主控）。
+- **读文件红线由中间件拦**（`ReadGuardMiddleware`，主控与三个子智能体都挂）：
+  `read_file` 读 `/ai_coding/policies` 必须显式给 `limit` 且 ≤80 行、`/ai_coding/project`
+  ≤200 行；`execute` 里的 `cat` / `less` / `more` / `nl` / `tac` 读这两处一律拦，
+  `head` / `tail` 超上限与 `sed -n '1,$p'` 也拦。提示词只做前置说明，真正的边界在这一层。
+- **推理规则在基础提示词里**（`prompts._BASE_HEAD`，所有形态共享）：先过**影响面闸门**
+  （会不会改变本次交付 / 低后果还是高后果 / 能不能验证）再决定展开深度；待决清单按
+  `问题 | 影响面 | 处置(答/改/记/上报)` 列；不可验证的问题最多一次检索 + 一次查源码，
+  超预算按固定模板记「残余风险」；同一不确定点连续两次没有新证据就停止推演；
+  确认性检查只写结论 + 证据位置；任何推理必须落到答复 / 代码 / 测试 / 风险记录 / 上报。
+  coder 的 rework 分两阶段：核验阶段只出覆盖清单 + 缺口 + 风险，不设计修法；实施阶段
+  只做确认要改的项、先定验收方式再改。
+- **每轮能力不写进运行期文本**：能力差异由 `prompts._BASE_HEAD` 的通用规则约束（历史轮次
+  的工具可用性不作数），具体动作由 `intent_directive` 给出。`task` 是否存在以装配为准
+  （`profile.subagents` + `SubAgentMiddleware`）；模型若说“没有 task”，先看日志里的
+  `form=` 与实际 `task` 调用，不要直接怀疑形态映射。`IntentMiddleware` 只注入意图指令与
+  澄清块，**不再注入时间**（记忆头行由平台写，散文日期让模型跑 `date`）。
 - **意图判定的两个锚点**（`server/intent.py` / `service._last_intent`）：默认值是
   `coding`；判定输入带**上一轮判定** `previous_intent`（最近一条 assistant 记录的
   `extra.intent`），JEV 与大模型两条路都看它。`analysis` 的裸「为什么」不覆盖

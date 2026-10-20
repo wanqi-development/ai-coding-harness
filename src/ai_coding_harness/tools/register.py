@@ -150,8 +150,9 @@ def build_subagent_tools(
     """子智能体工具：
 
     - planner: web_search_tool + fetch_url_tool + storePlan
-    - coder: get_unexecuted_plan + updatePlanStatus + updatePlanStep + create_pr（**无** ``comment_pr``），
-      PR 上的评论与回复统一由主智能体负责）
+    - coder: get_unexecuted_plan + updatePlanStatus + updatePlanStep + create_pr +
+      list_pr_comments（**只读**评论，用来自取审查原文；``comment_pr`` 仍然不给，
+      PR 上的回复统一由主智能体负责）
     - reviewer: comment_pr + list_pr_comments + get_pr_info
     """
     pr_tools = build_pr_tools(settings, repo)
@@ -165,6 +166,7 @@ def build_subagent_tools(
             + _by_name(plan_tools, "updatePlanStatus")
             + _by_name(plan_tools, "updatePlanStep")
             + _by_name(pr_tools, "create_pr")
+            + _by_name(pr_tools, "list_pr_comments")
         )
     if role == "reviewer":
         return (
