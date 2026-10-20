@@ -77,6 +77,9 @@ SUMMARY_LOG_TAG = "CONTEXT_SUMMARY"
 
 #: 查「压缩前应急裁剪」走这个关键字：grep CONTEXT_PRETRIM logs/agent.log
 PRETRIM_LOG_TAG = "CONTEXT_PRETRIM"
+#: 「摘要成功后计数清零」单独一个前缀 —— 它不属于一次裁剪，别混进 ``grep CONTEXT_PRETRIM``
+#: 的统计里（否则「这一轮剪了几次」会被多算一倍）。
+PRETRIM_RESET_LOG_TAG = "CONTEXT_TRIM_RESET"
 
 #: 临近压缩线时注入的系统提醒：让模型在旧工具返回被剪之前，先把它读到的东西写成
 #: 工作笔记 + ``KEEP:`` 清单。没有额外模型调用 —— 这段文字随本轮正常回复产出。
@@ -170,6 +173,7 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         pretrim_clear_inputs: bool = False,
         notice_at: int = 0,
         trigger_at: int = 0,
+        forced_after: int = 0,
         **kwargs: Any,
     ) -> None:
         """``agent`` 是日志 ``%(agent)s`` 那一列；``trigger_text`` 是触发线的人话版。
@@ -187,6 +191,11 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         ``trigger_at`` 是数值触发线（``trigger_line`` 折出来的最小值）：应急裁剪后
         只有落到它的 80% 以下才允许免压。只勉强压到线边（>80%）时下次调用会再剪一遍
         —— 因为裁剪只改请求副本、不改 checkpoint（2026-10-20 真机 38 次原地裁剪）。
+
+        ``forced_after`` 是「同一轮累计裁剪几次就强制摘要」：应急裁剪只改本次请求，
+        长任务里会反复出现「涨到线 → 剪到 74k → 再涨回去」。同一个数字攒到
+        ``forced_after`` 次（默认 3）后，即使已经低于线也压一次；**摘要成功后计数清零**，
+        之后重新累计。0 = 关闭（退回只剪不压）。
         """
         super().__init__(*args, **kwargs)
         self._agent = agent
@@ -196,6 +205,10 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         self._pretrim_clear_inputs = pretrim_clear_inputs
         self._notice_at = notice_at
         self._trigger_at = trigger_at
+        self._forced_after = max(0, int(forced_after or 0))
+        #: 本轮自上次摘要成功以来攒了几次应急裁剪（每次模型调用一次）。按 middleware
+        #: 实例计 —— 每个角色每轮现建一份（见 ``session/manager.py``），天然按轮重置。
+        self._pretrim_count = 0
 
     async def awrap_model_call(
         self,
@@ -255,6 +268,7 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                 keep_items=keep_items,
             )
             if cleared:
+                self._pretrim_count += 1
                 after = self._count_tokens(
                     pretrimmed, request.system_message, request.tools
                 )
@@ -262,8 +276,20 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                 # 裁剪只改这一次请求：原历史仍在 checkpoint 里。若只是勉强压到线边，
                 # 下一次调用会原样再剪一遍，所以只有落到安全区（≤80% 线）才免压。
                 safe = not self._trigger_at or after <= self._trigger_at * 0.8
-                self._log_pretrim(total, after, cleared, still_over, safe)
-                if not still_over and safe:
+                forced = (
+                    self._forced_after > 0 and self._pretrim_count >= self._forced_after
+                )
+                self._log_pretrim(
+                    total,
+                    after,
+                    cleared,
+                    still_over,
+                    safe,
+                    count=self._pretrim_count,
+                    forced_after=self._forced_after,
+                    forced=forced,
+                )
+                if not still_over and safe and not forced:
                     response = await self._call_without_summary(
                         request, pretrimmed, handler, estimated=after
                     )
@@ -282,6 +308,14 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
 
         started = time.perf_counter()
         result = await super().awrap_model_call(request, spy)
+        if self._pretrim_count:
+            logger.info(
+                "%s 摘要完成，应急裁剪计数清零：%d → 0",
+                PRETRIM_RESET_LOG_TAG,
+                self._pretrim_count,
+                extra={"agent": self._agent},
+            )
+            self._pretrim_count = 0
         if sent is not None:
             cost = time.perf_counter() - started
             self._log_compaction(request, truncated, sent.messages, result, cost)
@@ -379,9 +413,14 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         cleared: int,
         still_over: bool,
         safe: bool,
+        *,
+        count: int = 0,
+        forced_after: int = 0,
+        forced: bool = False,
     ) -> None:
         logger.info(
-            "%s 压缩前应急裁剪工具返回：清掉 %d 条，%d → %d tokens（省 %d；触发线 %s）；%s",
+            "%s 压缩前应急裁剪工具返回：清掉 %d 条，%d → %d tokens（省 %d；触发线 %s）；%s"
+            "%s",
             PRETRIM_LOG_TAG,
             cleared,
             before,
@@ -396,6 +435,12 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                     if safe
                     else "仅勉强低于压缩线（>80%），继续压缩"
                 )
+            ),
+            (
+                f"；应急裁剪计数 {count}/{forced_after}"
+                + ("，强制摘要" if forced else "")
+                if forced_after > 0
+                else ""
             ),
             extra={"agent": self._agent},
         )
@@ -667,4 +712,5 @@ def build_summarization(
         pretrim_clear_inputs=settings.context_trim_clear_inputs,
         notice_at=notice_at,
         trigger_at=line or 0,
+        forced_after=settings.context_pretrim_forced_summary_after,
     )

@@ -572,6 +572,89 @@ class TestPreSummaryTrim:
         assert "已低于压缩线且落在安全区，本轮不压缩" in text
         assert record.agent == "coder"
 
+    @staticmethod
+    def _fake_summary(monkeypatch: pytest.MonkeyPatch, *, fail_times: int = 0):
+        """把上游压缩换成可控假实现：记录调用次数，可选前 N 次抛错。"""
+        state = {"calls": 0}
+
+        async def fake(self: Any, request: ModelRequest, handler: Any) -> Any:
+            state["calls"] += 1
+            if state["calls"] <= fail_times:
+                raise RuntimeError("摘要失败")
+            response = await handler(
+                request.override(
+                    messages=[HumanMessage(content="摘要"), *request.messages[-1:]]
+                )
+            )
+            return ExtendedModelResponse(
+                model_response=response,
+                command=Command(
+                    update={
+                        "_summarization_event": {
+                            "cutoff_index": 1,
+                            "summary_message": HumanMessage(content="摘要"),
+                            "file_path": None,
+                        }
+                    }
+                ),
+            )
+
+        monkeypatch.setattr(SummarizationMiddleware, "awrap_model_call", fake)
+        return state
+
+    async def test_three_pretrims_force_a_summary_even_below_the_line(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """长任务里反复「涨到线 → 剪到 74k」时，第 3 次必须强制摘要。"""
+        middleware = self._middleware()
+        history = _tool_steps(6) + _current_step()
+        state = self._fake_summary(monkeypatch)
+
+        with caplog.at_level(logging.INFO):
+            for _ in range(3):
+                await middleware.awrap_model_call(_request(history), _ok_handler)
+
+        assert state["calls"] == 1, "前两次免压，第三次强制摘要"
+        texts = [r.getMessage() for r in _pretrim_logs(caplog)]
+        assert "应急裁剪计数 1/3" in texts[0]
+        assert "应急裁剪计数 3/3，强制摘要" in texts[-1]
+        assert _summary_logs(caplog), "强制摘要必须真的走压缩"
+
+    async def test_the_counter_resets_after_a_successful_summary(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """摘要成功后计数清零：下一次裁剪从 1/3 重新开始，不会每 3 次就压。"""
+        middleware = self._middleware()
+        history = _tool_steps(6) + _current_step()
+        state = self._fake_summary(monkeypatch)
+
+        with caplog.at_level(logging.INFO):
+            for _ in range(4):
+                await middleware.awrap_model_call(_request(history), _ok_handler)
+
+        assert state["calls"] == 1, "第 4 次只是新一轮的第 1 次裁剪"
+        texts = [r.getMessage() for r in _pretrim_logs(caplog)]
+        assert "应急裁剪计数 1/3" in texts[-1]
+
+    async def test_a_failed_summary_keeps_the_counter(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """摘要失败不能清零 —— 否则一次失败就退回「只剪不压」。"""
+        middleware = self._middleware()
+        history = _tool_steps(6) + _current_step()
+        state = self._fake_summary(monkeypatch, fail_times=1)
+
+        with caplog.at_level(logging.INFO):
+            for _ in range(2):
+                await middleware.awrap_model_call(_request(history), _ok_handler)
+            with pytest.raises(RuntimeError):
+                await middleware.awrap_model_call(_request(history), _ok_handler)
+            await middleware.awrap_model_call(_request(history), _ok_handler)
+
+        assert state["calls"] == 2, "失败后下一次仍然强制摘要"
+        texts = [r.getMessage() for r in _pretrim_logs(caplog)]
+        assert "应急裁剪计数 4/3，强制摘要" in texts[-1]
+
     async def test_it_compresses_when_the_trim_only_barely_gets_under_the_line(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):

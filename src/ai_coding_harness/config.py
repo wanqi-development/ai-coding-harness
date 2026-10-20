@@ -173,6 +173,13 @@ RUNTIME_SETTINGS: tuple[RuntimeSetting, ...] = (
         "float",
         "context_pretrim_notice_ratio",
     ),
+    RuntimeSetting(
+        "context_pretrim_forced_summary_after",
+        "强制摘要阈值（同一轮应急裁剪 N 次后，即使低于线也压；0=关闭）",
+        "上下文压缩配置",
+        "int",
+        "context_pretrim_forced_summary_after",
+    ),
     # -- 意图识别：低置信度时转 qa 追问（0 = 关闭）--
     RuntimeSetting(
         "intent_clarify_confidence",
@@ -471,6 +478,12 @@ class Settings(BaseSettings):
     # 被裁掉的都是「旧步骤」，当前步骤与 KEEP 点名的结果不在清理范围。
     context_trim_clear_inputs: bool = (
         os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "true").strip().lower() in ("1", "true", "yes")
+    )
+    # 同一轮累计应急裁剪几次后**强制摘要**（即使已经低于压缩线）。应急裁剪只改本次请求、
+    # 不改 checkpoint，长任务里会反复「涨到 120k → 剪到 74k → 再涨回去」；真机一轮出现过
+    # 84 次原地裁剪、一次摘要都没有。摘要成功后计数清零，重新累计。0 = 关闭。
+    context_pretrim_forced_summary_after: int = int(
+        os.getenv("CONTEXT_PRETRIM_FORCED_SUMMARY_AFTER", "3")
     )
 
     # 压缩（摘要）：什么时候压 / 压完留多少 / 摘要那次调用最多吃多少。三件都在这组里，
