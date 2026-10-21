@@ -355,6 +355,9 @@ class TurnRunnerMixin:
             delegation_result_limit=self._settings.log_delegation_result_max,
             terms=terms,
         )
+        # 能力交接的内层那一轮把它的用量交回来：它的事件流被摘掉（见 tools/handoff.py），
+        # 不接这一根，Token 面板会漏掉整段。
+        state.usage_sink = run_log.merge_usage
         translator = V3Translator()
         names = ToolNames()
         # task 的 tool_call_id → 派的是哪个子智能体。只为一件事：工具帧上带角色，前端

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +36,7 @@ from ai_coding_harness.tools.handoff import (
     build_handoff_tools,
     final_text,
 )
+from tests.v3_events import message_finish, message_start, tool_finish, tool_start
 
 
 @dataclass
@@ -77,6 +79,33 @@ class _Manager:
 
     def thread_id(self, session: Any) -> str:
         return "thread-1"
+
+
+@dataclass
+class _StreamingInner:
+    """内层那一轮的事件流版本：用来验证 handoff 的日志与用量并账。"""
+
+    messages: list[Any]
+    events: list[dict[str, Any]]
+
+    def __post_init__(self) -> None:
+        self.payloads: list[dict[str, Any]] = []
+        self.configs: list[dict[str, Any]] = []
+
+    async def astream_events(
+        self, payload: dict[str, Any], config: dict[str, Any] | None = None, version: str = "v3"
+    ):
+        self.payloads.append(payload)
+        self.configs.append(config or {})
+
+        async def gen():
+            for event in self.events:
+                yield event
+
+        return gen()
+
+    async def aget_state(self, config: dict[str, Any] | None = None) -> Any:
+        return SimpleNamespace(values={"messages": self.messages})
 
 
 @pytest.fixture
@@ -193,6 +222,31 @@ class TestDispatch:
         assert [p.form for p in ctx.manager.profiles] == ["orchestrate"]
         assert "已交给「coding」形态完成" in out
         assert "方案已经改完了" in out
+
+    async def test_it_logs_the_inner_run_and_merges_usage(self, ambient, caplog):
+        """内层不再「隐形」：LLM/工具日志带 handoff 前缀，用量并回外层账。"""
+        inner = _StreamingInner(
+            [AIMessage("改完了")],
+            [
+                message_start(),
+                message_finish(usage={"input_tokens": 120, "output_tokens": 8}),
+                tool_start("read_file", call_id="c1", input={"file_path": "/a.py"}),
+                tool_finish(call_id="c1", output="class A: pass"),
+            ],
+        )
+        state = TurnState(message="直接改", rejudge=_rejudge("coding"))
+        merged: list[dict[str, Any]] = []
+        state.usage_sink = merged.append
+        ambient(state)
+
+        with caplog.at_level(logging.INFO):
+            out = await _call(build_handoff_tools(_context(inner))[0])
+
+        assert "已交给「coding」形态完成" in out
+        lines = [record.getMessage() for record in caplog.records]
+        assert any(line.startswith("handoff LLM 调用完成") for line in lines), lines
+        assert any(line.startswith("handoff 工具调用 → read_file") for line in lines), lines
+        assert merged and merged[0]["totals"]["input"] == 120
 
     async def test_inner_run_gets_a_derived_thread(self, ambient):
         """内层不能蹭外层线程：``checkpoint_ns`` 会被重置成 ``""``，两边落到同一个根槽。"""
