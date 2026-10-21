@@ -1666,125 +1666,211 @@ body.resizing {
 }
 
 /* ---- 这一轮改了什么（只有建成 PR 的轮次才有）-----------------------------------
-   折叠时只占一行（与 token 角标同一副轻的样子），展开是文件列表，再点某个文件才拉它的 diff。
-   深色下 diff 的 +/- 行色由 --ok / --danger 承担（不走代码高亮的 token 色）。 */
+   消息下只留一个**显眼**的角标；点它打开右栏的「本轮改动」内嵌页（文件列表 + 左右 diff）。
+   2026-10-21 用户口径：原先是 11px 灰字 + 消息内联 diff，太小且不好找。 */
 .msg-changes {
-  margin-top: 4px;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-  max-width: 100%;
+  margin-top: 6px;
 }
 .msg-changes-badge {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  border: none;
-  background: transparent;
-  padding: 1px 0;
+  gap: 7px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
   font: inherit;
-  font-size: 11px;
-  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
   cursor: pointer;
   font-variant-numeric: tabular-nums;
 }
-.msg-changes-badge:hover {
+.msg-changes-badge:hover,
+.msg-changes-badge.open {
+  border-color: var(--accent);
   color: var(--accent);
 }
 .msg-changes-dot {
-  width: 5px;
-  height: 5px;
+  width: 7px;
+  height: 7px;
   border-radius: 999px;
-  background: var(--ok);
-  opacity: 0.8;
+  background: var(--accent);
 }
-.msg-changes-list {
+
+/* ---- 右栏内嵌页：本轮改动 ------------------------------------------------------ */
+.changes-page {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+}
+.changes-page-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.changes-back {
+  flex: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.changes-back:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.changes-page-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.changes-page-sum {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.chg-add {
+  color: var(--ok);
+  font-weight: 600;
+}
+.chg-del {
+  color: var(--danger-text);
+  font-weight: 600;
+}
+.changes-base {
+  margin: 0;
+  flex: none;
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.changes-file-list {
   list-style: none;
   margin: 0;
-  padding: 4px 0 4px 8px;
-  border-left: 2px solid var(--border);
-  width: 100%;
-  max-width: 100%;
+  padding: 0;
+  flex: none;
+  max-height: 34%;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
 }
-.msg-change + .msg-change {
-  margin-top: 2px;
-}
-.msg-change-head {
+.changes-file {
   display: flex;
   align-items: baseline;
-  gap: var(--s-2);
+  gap: 8px;
   width: 100%;
   border: none;
   background: transparent;
-  padding: 1px 0;
+  padding: 5px 8px;
   font: inherit;
   font-size: 12px;
   color: var(--text);
   text-align: left;
   cursor: pointer;
 }
-.msg-change-head:hover .msg-change-path {
+.changes-file:hover {
+  background: var(--accent-soft);
+}
+.changes-file.active {
+  background: var(--accent-soft);
   color: var(--accent);
 }
-/* 状态码一位：新增绿、删红、改中性 —— 与 PR 面板同一套语义色 */
-.msg-change-mark {
+.changes-file-mark {
   flex: none;
   width: 12px;
   font-family: 'Cascadia Mono', Consolas, monospace;
   font-size: 11px;
   color: var(--text-muted);
 }
-.msg-change-mark[data-status='A'] {
+.changes-file-mark[data-status='A'] {
   color: var(--ok);
 }
-.msg-change-mark[data-status='D'] {
+.changes-file-mark[data-status='D'] {
   color: var(--danger-text);
 }
-.msg-change-path {
+.changes-file-path {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: 'Cascadia Mono', Consolas, monospace;
-  font-size: 12px;
 }
-.msg-change-count {
-  flex: none;
+.changes-file-count {
   margin-left: auto;
+  flex: none;
   font-size: 11px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
-.msg-change-note {
-  margin: 2px 0 0 20px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.msg-change-diff {
-  margin: 4px 0 6px 20px;
-  padding: 6px 8px;
-  max-height: 320px;
+.changes-diff-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   overflow: auto;
-  background: var(--code-bg);
-  border-radius: var(--r-xs);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.changes-diff {
+  min-width: max-content;
   font-family: 'Cascadia Mono', Consolas, monospace;
   font-size: calc(var(--code-size) - 1px);
   line-height: 1.5;
-  color: var(--text);
+}
+.changes-diff-row {
+  display: grid;
+  grid-template-columns: minmax(28ch, 1fr) minmax(28ch, 1fr);
+}
+.changes-diff-cell {
+  display: block;
+  padding: 0 8px;
   white-space: pre;
+  border-right: 1px solid var(--border);
 }
-.msg-change-diff .d-add {
-  color: var(--ok);
+.changes-diff-cell:last-child {
+  border-right: none;
 }
-.msg-change-diff .d-del {
+.changes-diff-cell.is-del {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
   color: var(--danger-text);
 }
-.msg-change-diff .d-hunk {
-  color: var(--accent);
+.changes-diff-cell.is-add {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  color: var(--ok);
 }
-.msg-change-diff .d-meta {
+.changes-diff-cell.is-ctx {
   color: var(--text-muted);
+}
+.changes-diff-cell.is-empty {
+  background: var(--surface);
+}
+.changes-diff-meta {
+  grid-column: 1 / -1;
+  padding: 2px 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+}
+.changes-note {
+  margin: 0;
+  padding: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.changes-error {
+  color: var(--danger-text);
 }
 
 /* ---------------- 输入框上方的上下文压力条 ---------------- */
