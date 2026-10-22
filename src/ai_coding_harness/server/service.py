@@ -6,8 +6,10 @@ API 路由只做 HTTP 转换，业务逻辑集中在这一层。
 
 import asyncio
 
+from deepagents.backends import StoreBackend
 from langchain_core.language_models.chat_models import BaseChatModel
 
+from ai_coding_harness.backends.composite import MEMORIES_NAMESPACE
 from ai_coding_harness.config import Settings
 from ai_coding_harness.db import Database, dao
 from ai_coding_harness.infra import repo_cache
@@ -92,9 +94,21 @@ class HarnessService(
         self._last_usage_frame = 0.0
         #: 影子路由器的后台 task（只记日志、不改变本轮形态）；持有引用防止被 GC。
         self._shadow_tasks: set[asyncio.Task[None]] = set()
-        #: 会话 → 最近一次可执行意图（coding/rework/plan/review）；analysis/qa 不覆盖。
+        #: 会话 → 最近一次可执行意图（coding/rework/plan）；qa 不覆盖。
         #: 进程重启后从最近 assistant 记录回溯，不引入新表。
         self._active_tasks: dict[str, str] = {}
+        #: 仓库记忆在沙箱准备前也要读写：直连 StoreBackend，路径用 store key。
+        store = getattr(manager, "store", None)
+        self._memory_backend = (
+            StoreBackend(
+                store=store,
+                namespace=lambda _runtime: MEMORIES_NAMESPACE,
+            )
+            if store is not None
+            else None
+        )
+        #: 新 PR 批量摘要模型；只在新 PR 出现时懒建 / 调用。
+        self._memory_model: BaseChatModel | None = None
 
 
 __all__ = [

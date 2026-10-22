@@ -6,15 +6,13 @@ from deepagents.backends.protocol import BackendProtocol
 from langchain_core.tools import BaseTool
 
 from ai_coding_harness.agent.profiles import (
-    ANALYSIS_FORM,
     ORCHESTRATE_FORM,
     PLAN_FORM,
     QA_FORM,
-    REVIEW_FORM,
 )
 from ai_coding_harness.config import Settings
 from ai_coding_harness.db import Database
-from ai_coding_harness.tools.git import RepoSpec, build_git_client, build_pr_tools
+from ai_coding_harness.tools.git import RepoSpec, build_pr_tools
 from ai_coding_harness.tools.handoff import HandoffContext, build_handoff_tools
 from ai_coding_harness.tools.memory import MemoryContext, build_memory_tools
 from ai_coding_harness.tools.plan import PlanContext, build_plan_tools
@@ -25,21 +23,17 @@ from ai_coding_harness.tools.plan import PlanContext, build_plan_tools
 _FORM_TOOLS: dict[str, tuple[str, ...]] = {
     # 问答：读仓库、读记忆走 `read_file`（本就是只读工具，无需在此列出）。PR 的**读**工具
     # 要给 —— 「有哪些未关闭的 PR」「当前代码在 PR 里还是已合并」是它的常见问法；**写**工具
-    # （create_pr / close_pr / comment_pr / save_repo_memory / storePlan）一概不给：
+    # （create_pr / close_pr / comment_pr / save_repo_memory / storePlan）一概不给。
+    # 记忆正文只在 coding / rework 收尾写，qa 已合并原 analysis，但不再有写记忆权限。
     # 看不见比提示词里劝阻有效。
     QA_FORM: ("get_pr_info", "list_pr_comments"),
-    # 分析：同样不碰仓库（PR 只读、不写文件），但它**多一件写工具**：`save_repo_memory` ——
-    # 分析结论（仓库基本信息 + 当前缺口）是仓库记忆的正文来源，由这一轮收尾写回
-    # （2026-09-26 定）。写的是 StoreBackend 上的记忆文件，不是沙箱、也不是目标仓库，
-    # 所以 `policy_for("analysis")` 的写根仍然是空的（只留 tmp），两边不冲突。
-    ANALYSIS_FORM: ("get_pr_info", "list_pr_comments", "save_repo_memory"),
     # 出方案：主控自己出方案并 storePlan 落库；**方案对象本身的增删改查全归它**
     # （getPlan / updatePlan / updatePlanSteps / deletePlan，2026-09-25 加）——
-    # 别的形态要么没有写方案的工具（qa / analysis / review），要么只管实施进度
+    # 别的形态没有写方案的工具（qa），要么只管实施进度
     # （coder 的 updatePlanStatus / updatePlanStep）。PR 只读：**开工前**要查未合并 PR
     # 决定放不放行（闸门在 middleware/memory.py，不是靠提示词）。
-    # **没有 save_repo_memory**：出方案阶段还没动代码，记忆正文的写入只在 coding / review /
-    # analysis 三类轮的收尾时发生（见 ``REVIEW_FORM`` 的注释与 prompts 里的收尾口径）。
+    # **没有 save_repo_memory**：出方案阶段还没动代码，记忆正文的写入只在
+    # coding / rework 收尾时发生。
     PLAN_FORM: (
         "get_pr_info",
         "storePlan",
@@ -50,9 +44,6 @@ _FORM_TOOLS: dict[str, tuple[str, ...]] = {
         "updatePlanSteps",
         "deletePlan",
     ),
-    # 审查：主控自己审、自己回评，故要 `comment_pr`；审完（收尾）把审查结论写回仓库记忆，
-    # 故**也要** save_repo_memory —— 记忆正文的写入点只有这一处与 coding / analysis 收尾。
-    REVIEW_FORM: ("get_pr_info", "list_pr_comments", "comment_pr", "save_repo_memory"),
     # 编码：全流程。需要 `comment_pr`（审查结论由主控呈给用户、也由它按用户指示回评 PR）；
     # 没有 `merge_pr`（合并由人工在 Gitee 页面上处理）；记忆统一由它 `save_repo_memory` 写回。
     # **只读的 `get_unexecuted_plan`**（2026-09-27 加）：用户明确说「直接做」时，主控自己先查
@@ -113,9 +104,7 @@ def build_main_tools(
 
     pool: dict[str, BaseTool] = {t.name: t for t in build_pr_tools(settings, repo)}
     if "save_repo_memory" in wanted:
-        # 落盘前要查本仓库的 PR（既做拒写检查，也用来盖文件头的「最近 PR」）。令牌仍只待在
-        # RepoSpec 里，只把查询方法递给工具 —— 记忆工具本身不需要知道平台的存在。
-        client = build_git_client(settings, repo)
+        # PR 查询与状态对账在轮首 / coding/rework 轮末完成；此工具只合并并落盘正文。
         pool.update(
             {
                 t.name: t
@@ -125,7 +114,6 @@ def build_main_tools(
                         repo=repo.repo,
                         backend=backend,
                         prefix=settings.memories_prefix,
-                        all_prs=client.all_pulls,
                     )
                 )
             }

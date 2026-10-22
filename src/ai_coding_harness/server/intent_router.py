@@ -55,7 +55,7 @@ TARGETS: tuple[str, ...] = (
 CONTINUATIONS: tuple[str, ...] = ("new", "continue_previous", "unknown")
 
 #: 可执行意图（与 ``server/intent.py`` 的七类同名，但这里只用于“上一轮可执行意图”）
-ACTIONABLE = frozenset({"coding", "rework", "plan", "review", "analysis"})
+ACTIONABLE = frozenset({"coding", "rework", "plan"})
 
 #: PR 已合并 / 已关闭之后的收尾动作归 analysis；“刚提交 / 待合并”不算。
 _POST_PR_CLOSE_MARKERS: tuple[str, ...] = (
@@ -251,7 +251,7 @@ def suggest_intent(
         and context in ACTIONABLE
         and any(m in text for m in _OBSERVE_MARKERS)
     ):
-        return "analysis"
+        return "qa"
     # 长句里的“不对”后面常跟着“应该先……再派 coder 执行”：这是**新指令**，不是单纯纠正
     # 上一轮。只有短句或 wants 不是 change 时，才把“不是/不对”当沿用未完成任务的信号。
     correction_only = (
@@ -273,7 +273,7 @@ def suggest_intent(
     if context == "plan" and wants == "change" and target in {"execution", "code"}:
         return "coding"
     if context in ACTIONABLE and any(m in text for m in _POST_PR_CLOSE_MARKERS):
-        return "analysis"
+        return "qa"
 
     # 短追问 + 继续上一轮：target 经常漂（「b」被判成 execution、「修复P2」被判成 code），
     # 但用户只是在接着上一轮做。沿用 context（analysis/qa 也保留），不要因为 target 换形态。
@@ -292,7 +292,7 @@ def suggest_intent(
     # 「为什么不派 / 为什么没改」这类追问上一轮动作的句子会先命中上面的 continue marker，
     # 仍按未完成任务处理，不受这条影响。
     if wants in {"lookup", "analyze"} and any(m in text for m in _WHY_MARKERS):
-        return "analysis"
+        return "qa"
 
     # 明确的“问已有数据”（有什么/是什么/有哪些/多少）：即使 wants 被判成 decide，
     # 也只是问答，不要因为上下文里有未完成任务就变成 action。
@@ -305,7 +305,7 @@ def suggest_intent(
         return "qa"
 
     if target in {"execution", "code"} and any(m in text for m in _QUESTION_MARKERS):
-        return "analysis" if target == "execution" else "qa"
+        return "qa"
     # 短追问（“B”“确认事实”“修复吧”）：不要因为 router 的 target 漂移就换形态。
     if (
         len(text) <= 8
@@ -337,53 +337,53 @@ def suggest_intent(
                 # 计划类一律 plan（用户口径：任务完成多少、方案本身都归 plan）
                 return "plan"
             if target == "pr_status":
-                return "qa" if wants == "lookup" else "analysis"
+                return "qa"
             if target == "pr_review":
-                return "review"
+                return "rework"
             if target == "pr_change":
-                return "review" if wants in {"lookup", "analyze"} else "rework"
+                return "qa" if wants in {"lookup", "analyze"} else "rework"
             if target == "memory":
-                return "qa" if wants == "lookup" else "analysis"
+                return "qa"
             if target == "code":
-                return "qa" if wants == "lookup" else "analysis"
-            return "analysis" if wants == "analyze" else "qa"
+                return "qa"
+            return "qa"
         if target == "plan":
             return "plan"
         if target == "pr_change":
             return "rework"
         if target == "pr_review":
-            return "review"
+            return "rework"
         if target == "pr_status":
             return "qa"
         if target == "memory":
-            return "analysis"
+            return "qa"
         if target == "code":
             return "coding"
         # execution / unknown：上一轮是可执行意图就沿用，否则按要干活处理
         return context if context in ACTIONABLE else "coding"
     # new_task
     if target == "pr_change":
-        return "rework" if wants == "change" else "review"
+        return "rework"
     if target == "pr_review":
-        return "review"
+        return "rework"
     if target == "pr_status":
-        return "qa" if wants in {"lookup", "unknown"} else "analysis"
+        return "qa"
     if target == "plan":
         return "plan"
     if target == "memory":
-        return "analysis" if wants in {"change", "decide"} else "qa"
+        return "qa"
     if target == "code":
         if wants == "lookup":
             return "qa"
-        return "analysis" if wants == "analyze" else "coding"
+        return "qa" if wants == "analyze" else "coding"
     if target == "general" and any(word in text for word in ("如何", "怎么", "方法", "步骤")):
-        return "analysis"
+        return "qa"
     if target == "general" and wants == "decide":
         return "qa"
     if wants == "lookup":
         return "qa"
     if wants == "analyze":
-        return "analysis"
+        return "qa"
     return "coding"
 
 

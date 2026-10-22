@@ -25,6 +25,10 @@ from ai_coding_harness.server.intent_router import (
     route,
     suggest_intent,
 )
+from ai_coding_harness.server.repo_state import (
+    PullSnapshot,
+    load_pull_snapshot,
+)
 from ai_coding_harness.session.manager import (
     Session,
 )
@@ -55,7 +59,7 @@ class TurnIntentMixin:
         if not self._settings.intent_llm_enabled:
             return None
         if self._router_model is None:
-            for role in ("qa", "analysis", "coding", "plan", "review"):
+            for role in ("qa", "coding", "plan"):
                 model = self._build_role_model(role)
                 if model is not None:
                     self._router_model = model
@@ -66,6 +70,14 @@ class TurnIntentMixin:
         try:
             return build_model(self._settings, role=role)
         except Exception:  # noqa: BLE001 —— 某一行没配就试下一行
+            return None
+
+    async def _repo_snapshot(self, session: Session) -> PullSnapshot | None:
+        """每轮实时查一次 PR 列表；失败时只保留只读问答候选。"""
+        try:
+            return await load_pull_snapshot(self._settings, session.repo)
+        except Exception:
+            logger.exception("仓库 PR 状态查询失败（本轮只保留只读问答候选）")
             return None
 
     async def _intent_history(self, session: Session) -> list[str]:
@@ -167,7 +179,7 @@ class TurnIntentMixin:
         if intent in EXECUTION_INTENTS:
             self._active_tasks[key] = intent
             return
-        if intent == "analysis" and any(
+        if intent == "qa" and any(
             marker in message
             for marker in ("已合并", "合并了", "已关闭", "关闭了", "merged", "closed")
         ):
@@ -249,6 +261,8 @@ class TurnIntentMixin:
         previous_intent: str | None = None,
         active_intent: str | None = None,
         dialogue: Sequence[Mapping[str, str]] = (),
+        allowed_intents: Sequence[str] | None = None,
+        repo_state: str | None = None,
     ) -> IntentDecision:
         """判定本轮意图：口令 → JEV → 大模型（都带最近几轮用户消息）→ 关键字口径。
 
@@ -266,6 +280,8 @@ class TurnIntentMixin:
             previous_intent=previous_intent,
             active_intent=active_intent,
             dialogue=dialogue,
+            allowed_intents=allowed_intents,
+            repo_state=repo_state,
             # 意图识别走哪一关：jev（三关，默认）/ llm（三关，不碰 JEV）—— 见 intent.detect_intent
             mode=self._settings.intent_mode,
         )
@@ -280,6 +296,8 @@ class TurnIntentMixin:
         previous_intent: str | None = None,
         active_intent: str | None = None,
         dialogue: Sequence[Mapping[str, str]] | None = None,
+        allowed_intents: Sequence[str] | None = None,
+        repo_state: str | None = None,
     ) -> IntentDecision:
         """跳过口令层重判一次意图（``handoffTask`` 用，签名与它约定好）。
 
@@ -315,4 +333,6 @@ class TurnIntentMixin:
             previous_intent=previous_intent,
             active_intent=active_intent,
             dialogue=dialogue or (),
+            allowed_intents=allowed_intents,
+            repo_state=repo_state,
         )

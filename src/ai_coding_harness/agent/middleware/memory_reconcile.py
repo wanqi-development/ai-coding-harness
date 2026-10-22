@@ -188,6 +188,11 @@ def _pull_state(pull: Mapping[str, Any]) -> str:
     return _LABEL_BY_CODE.get(pull_state(pull), "")
 
 
+def memory_pull_state(pull: Mapping[str, Any]) -> str:
+    """公开版：PR → 记忆里的状态词（``待合并`` / ``已合并`` / ``已关闭`` / 空串）。"""
+    return _pull_state(pull)
+
+
 def _pull_fields(pull: Mapping[str, Any]) -> tuple[str, str, str]:
     """``(编号, 链接, 分支)`` —— 与面板同一个取法（``tools/pr_client.pull_summary``）。"""
     summary = pull_summary(pull)
@@ -292,6 +297,21 @@ def rows_to_verify(text: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def recorded_pull_numbers(text: str) -> tuple[str, ...]:
+    """记忆「变更记录」里已经出现过的 PR 编号（去重、按出现顺序）。"""
+    numbers: list[str] = []
+    for _si, _li, row in _pr_rows(_split(text.split("\n"))):
+        if row.number and row.number not in numbers:
+            numbers.append(row.number)
+    return tuple(numbers)
+
+
+def newest_recorded_pull(text: str) -> int | None:
+    """记忆里最大的 PR 编号；没有带编号的 PR 行时返回 ``None``。"""
+    values = [int(number) for number in recorded_pull_numbers(text) if number.isdigit()]
+    return max(values) if values else None
+
+
 def _states_by_number(pulls: Sequence[Mapping[str, Any]]) -> dict[str, str]:
     """``编号 → 实际状态``（认不出状态的编号不入表）。"""
     out: dict[str, str] = {}
@@ -306,18 +326,14 @@ def _states_by_number(pulls: Sequence[Mapping[str, Any]]) -> dict[str, str]:
 def _restate(
     sections: list[_Section], states: Mapping[str, str]
 ) -> tuple[str, ...]:
-    """把写着 ``待合并`` 的行按实况改成 ``已合并`` / ``已关闭``；返回被改的编号。
+    """把记忆状态与平台不一致的行改成实况；返回被改的编号。
 
-    **只动状态那一格**（按 ``_STATUS_FIELD`` 给出的区间就地替换），行里其余字段 —— 链接、
-    涉及文件、变更内容 —— 一个字节都不碰。三种情形不写：行里没写状态那一格（认不出位置）、
-    行里写的不是 ``待合并``（人工或模型已经给了结论）、线上状态认不出或还开着。
+    只动状态那一格；行里没写状态栏、平台状态认不出、或两边已经一致时不改。
     """
     changed: list[str] = []
     for si, li, row in _pr_rows(sections):
-        if row.span is None or row.state != PENDING:
-            continue
         live = states.get(row.number, "")
-        if live not in (MERGED, DISCARDED):
+        if row.span is None or not live or row.state == live:
             continue
         line = sections[si].body[li]
         start, end = row.span

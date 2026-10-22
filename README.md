@@ -4,14 +4,14 @@
 
 ## 是什么
 
-单用户 HTTP 服务。每轮先判定**意图**（`qa` / `analysis` / `plan` / `review` / `rework` / `coding` / `sync`），再由意图映射到**形态**取对应的智能体装配；文件与命令操作全部在隔离的 OpenSandbox 沙箱内执行，结果经 SSE 流式返回（支持断线续传与中途终止）。
+单用户 HTTP 服务。每轮先按仓库 PR 状态收口候选，再判定**意图**（`qa` / `plan` / `coding` / `rework`），由意图映射到**形态**取对应装配；文件与命令操作全部在隔离的 OpenSandbox 沙箱内执行，结果经 SSE 流式返回（支持断线续传与中途终止）。
 
 ## 架构
 
 - **接口**：FastAPI，SSE 流式。一轮对话分两段：`POST /chat/{id}` 起一轮并就地订阅，`GET /chat/{id}/stream` 供刷新后接回（帧带自增 id 作游标）。暂无鉴权。
 - **LLM**：按**角色 → 设置页里的一行**选模型（映射只有一份：`agent/llm.py::_AGENT_KEY`，行清单见 `config.MODEL_AGENT_ROWS`）。**没有 `.env` 出厂默认**（2026-10-15 起）：一行没配，用到这个角色的那一轮就当场报错并指认是哪一行。解析顺序 **① 该行的配置 → ②「统一模型」那一行（只兜底没配的行）**。全部走 OpenAI 兼容协议（`langchain-openai`）。主模型重试耗尽时切设置页「兜底模型」那一行；连续失败到阈值开**熔断**，冷却期内不再撞主导。
-- **意图判定**（`server/intent.py`）：口令级强关键字直通 → **JEV 或 大模型（严格二选一，设置页里选）** → 关键字口径。选中的那一侧没配齐 / 判不出来时直接落关键字口径（不借另一侧）。判定来源（`intent_source`）进日志与业务记录；`sync` 只能从口令层产出。低置信度时 qa 输出 `<CLARIFY>` 固定协议，后端落 `clarifications` 表并发 SSE `clarification`，前端用弹窗选项；点选项确定性执行原始消息，点“其他”/自由输入才重新判定。
-- **形态**（`agent/profiles.py`）：**唯一的装配轴**，一处定下三件事 —— 挂哪些子智能体、给哪些主工具（`tools/register.py`）、用哪套角色提示词（`agent/prompts.py`）。五种形态：`qa` / `analysis`（只读自答）、`plan`（自己出方案并落库）、`review`（自己审、自己回评）、`orchestrate`（**唯一挂子智能体的形态**：planner / coder / reviewer）。`coding` 与 `rework` 都落 `orchestrate`（`FORM_ALIASES` 显式登记共用装配，差别只在记忆闸门）；`sync` 走直接执行，不经智能体。
+- **意图判定**（`server/intent.py`）：每轮只查一次全量 PR，不做跨轮接口缓存。轮首同步仓库记忆：比记忆水印新的 PR 批量摘要一次并落盘，已有 PR 只修正不一致的状态；随后按 open PR 收口候选（无 open PR：`qa / plan / coding`，有 open PR：`qa / rework`，查询失败：`qa`）。再走口令 → **JEV 或 大模型（严格二选一）** → 关键字口径和函数闸门。
+- **形态**（`agent/profiles.py`）：**唯一的装配轴**，一处定下挂哪些子智能体、给哪些主工具、用哪套角色提示词。三种形态：`qa`（只读问答 / 解释 / 排查）、`plan`（自己出方案并落库）、`orchestrate`（唯一挂 planner / coder / reviewer 的形态）。`coding` 与 `rework` 共用 `orchestrate`，差别由逐轮意图指令决定。
 - **中间件**（`agent/middleware/` 与 `agent/summarization.py`，装配点在 `agent/graph.py` 与 `agent/subagents.py`，逐角色各建实例）：
 
 | 模块 | 作用 |
@@ -23,7 +23,7 @@
 | `read_guard` | 读文件红线：policies ≤80 行、project ≤200 行；`cat` 等整文件命令直接拦 |
 | `guard` | 本轮**空转刹车**：同一工具同一参数反复调用时，先劝、再停 |
 | `fallback` | 主导失败时切兜底，并留一条 `MODEL_FALLBACK` 的痕 |
-| `summarization` | 压缩（摘要）。按角色分档：`qa` / `analysis` / 主控 `orchestrate` 稳态（窗口 70%），主控 `plan` / `review` 与子智能体 `planner` / `coder` / `reviewer` 爆发（窗口 40%）。到线先做一次**应急工具裁剪**：保留当前步骤 + 模型工作笔记 `KEEP:` 点名的结果，其余换成带身份的占位符——**只改这一次请求**；剪完低于线就不摘要，仍高于才压。另留 `CONTEXT_PRETRIM` / `CONTEXT_SUMMARY` 两条账 |
+| `summarization` | 压缩（摘要）。按角色分档：`qa` / `coding` / `orchestrate` / `rework` 稳态（窗口 70%），主控 `plan` 与子智能体 `planner` / `coder` / `reviewer` 爆发（窗口 40%）。到线先做一次**应急工具裁剪**：保留当前步骤 + 模型工作笔记 `KEEP:` 点名的结果，其余换成带身份的占位符——**只改这一次请求**；剪完低于线就不摘要，仍高于才压 |
 
 - **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
 - **文件后端**：混合 `CompositeBackend` —— default 走自定义 OpenSandbox 后端，`/memories/` 走 `StoreBackend`。
@@ -40,17 +40,14 @@
 
 | 意图 | 说明 | 形态 | 该形态特有的工具 |
 |---|---|---|---|
-| `qa` | 知识问答 | `qa` | `get_pr_info`、`list_pr_comments` |
-| `analysis` | 代码 / 问题分析；也接「刷新 / 更新仓库记忆」这类请求（拉一次 PR 列表，把记忆里缺的 PR 补进「变更记录」） | `analysis` | `get_pr_info`、`list_pr_comments`、`save_repo_memory`（分析结论收尾沉淀进记忆；它是**唯一带记忆写回的只读形态**） |
+| `qa` | 只读问答、解释、排查、需求澄清；也回答仓库 / PR / 记忆现状 | `qa` | `get_pr_info`、`list_pr_comments`；可写 `/ai_coding/tmp` 取证台账，不改任务代码 |
 | `plan` | 技术方案 / 设计 | `plan` | `get_pr_info`、`storePlan`、`getPlan`、`updatePlan`、`updatePlanSteps`、`deletePlan`（方案增删改查全归这一态；**不写记忆** —— 这一轮还没动代码） |
-| `review` | 代码审查 / PR 评审 | `review` | `get_pr_info`、`list_pr_comments`、`comment_pr`、`save_repo_memory`（收尾写回） |
 | `coding` | 写代码 | `orchestrate` | `task`（派子智能体）、`get_pr_info`、`list_pr_comments`、`comment_pr`、`close_pr`、`get_unexecuted_plan`（**只读**：主控先查有没有可执行的方案）、`save_repo_memory`。明确要动手时：查到方案直接派 coder；没有先派 planner，**落库后不等确认**，一路 coder → reviewer 跑完；只是描述需求时，方案出来先停下等确认 |
-| `rework` | 按评审意见改代码（改的是那份还开着的 PR） | `orchestrate`（与 `coding` 共用装配） | 同上；差别只在记忆闸门 —— `coding` 有未合入 PR 就拦，`rework` 反过来（没有待合并的 PR 才拦） |
-| `sync` | 同步仓库 | —— | 直接执行，不经智能体 |
+| `rework` | PR 跟进：审查 open PR、回评、按意见或用户新要求继续改既有分支 | `orchestrate`（与 `coding` 共用装配） | 同上。只审查时派 reviewer；要改代码时派 coder，改完再派 reviewer 复查；不新建分支 / PR |
 
-`qa` 拿不到任何写侧工具（`create_pr` / `close_pr` / `comment_pr` / `save_repo_memory` / `storePlan`）—— 看不见比提示词里劝阻有效；`analysis` 只多一件 `save_repo_memory`，仓库与 PR 仍全是只读。
+`qa` 与 `plan` 都拿不到记忆写工具；仓库记忆正文只在 `coding` / `rework` 收尾由主控写回。PR 的新增记录与状态由轮首 / 轮末平台同步维护。
 
-意图判定走**四关瀑布**（`server/intent.py`，顺序不可颠倒）：**口令**（强关键字命中即定，`sync` 只能从这关出）→ **JEV / SystemOne**（决策型模型，一个 `Choice` 问 6 个候选意图，拿回选项 + 置信度 + 各候选概率）→ **大模型判定**（JEV 没配 / 超时 / 报错时的退路）→ **关键字口径**（两个模型都判不出来时，关键字也没命中就是默认值 `coding`）。每一关的结论都如实标在日志的 `source=` 上（`keyword` / `jev` / `llm` / `fallback`）。
+意图判定走**状态候选 + 四关瀑布**：候选集先按 open PR 收口，再走 **口令** → **JEV / SystemOne** → **大模型** → **关键字口径**。每一关的结论都如实标在日志的 `source=` 上（`keyword` / `jev` / `llm` / `fallback` / `state`）。
 
 > 三个子智能体（`planner` / `coder` / `reviewer`）由 `coding` 与 `rework` 通过 `task` 派下去，各自取自己的模型（见 `agent/llm.py` 的角色路由表）。
 
@@ -154,7 +151,7 @@ npm --prefix frontend run dev          # 前端 http://localhost:5173
 
 `.env` 关键配置：
 
-- **模型**：**不在 `.env` 里配了**（2026-10-15 起）—— 谁用哪个模型在设置页 →「模型配置」里按智能体填，存表 `model_endpoints`、**下一轮生效**。唯一还用 `.env` 的是 `GLM_API_KEY` / `GLM_BASE_URL`（web 搜索那条工具）；`DEEPSEEK_*` / `KIMI_*` / `GPT_*` / `QWEN_*` / `*_CONTEXT_WINDOW` / `FALLBACK_PROVIDER` / `INTENT_MODEL|BASE_URL|API_KEY` / `TYPESAFE_API_KEY|BASE_URL|MODEL_NAME` 均已作废（`.env.example` 里逐条标注）。压缩（摘要）按角色分两档：**稳态** `qa` / `analysis` / 主控 `orchestrate` 按窗口 **70%** 触发，**爆发** 主控 `plan` / `review` 与子智能体 `planner` / `coder` / `reviewer` 按窗口 **40%** 触发；压完保留最近 20k，摘要那次调用最多吃 40k（`CONTEXT_STEADY_TRIGGER_FRACTION` / `CONTEXT_BURST_TRIGGER_FRACTION`，窗口解析不出来时才用 `CONTEXT_SUMMARY_TRIGGER_TOKENS` 兜底）。**平时不再做 40k 常规剪裁**，到压缩线的提醒线（默认 90%）先提醒模型写工作笔记与 `KEEP:` 清单，到线后的应急裁剪保留当前步骤 + KEEP 点名的工具返回，剪完低于线就不摘要。压缩那份中间件的取值由我们自己构造，上游那份按类排掉（`agent/summarization.py`）。两条**只提醒不改行为**的线不变：`CONTEXT_WARN_RATIO`（默认 0.6，输入框上方画细进度条）/ `CONTEXT_ALERT_RATIO`（默认 0.8，给警示语）。
+- **模型**：**不在 `.env` 里配了**（2026-10-15 起）—— 谁用哪个模型在设置页 →「模型配置」里按智能体填，存表 `model_endpoints`、**下一轮生效**。唯一还用 `.env` 的是 `GLM_API_KEY` / `GLM_BASE_URL`（web 搜索那条工具）；`DEEPSEEK_*` / `KIMI_*` / `GPT_*` / `QWEN_*` / `*_CONTEXT_WINDOW` / `FALLBACK_PROVIDER` / `INTENT_MODEL|BASE_URL|API_KEY` / `TYPESAFE_API_KEY|BASE_URL|MODEL_NAME` 均已作废（`.env.example` 里逐条标注）。压缩（摘要）按角色分两档：**稳态** `qa` / 主控 `orchestrate`（coding / rework）按窗口 **70%** 触发，**爆发** 主控 `plan` 与子智能体 `planner` / `coder` / `reviewer` 按窗口 **40%** 触发；压完保留最近 20k，摘要那次调用最多吃 40k（`CONTEXT_STEADY_TRIGGER_FRACTION` / `CONTEXT_BURST_TRIGGER_FRACTION`，窗口解析不出来时才用 `CONTEXT_SUMMARY_TRIGGER_TOKENS` 兜底）。**平时不再做 40k 常规剪裁**，到压缩线的提醒线（默认 90%）先提醒模型写工作笔记与 `KEEP:` 清单，到线后的应急裁剪保留当前步骤 + KEEP 点名的工具返回，剪完低于线就不摘要。压缩那份中间件的取值由我们自己构造，上游那份按类排掉（`agent/summarization.py`）。两条**只提醒不改行为**的线不变：`CONTEXT_WARN_RATIO`（默认 0.6，输入框上方画细进度条）/ `CONTEXT_ALERT_RATIO`（默认 0.8，给警示语）。
 - **兜底与熔断**：兜底只有设置页「兜底模型」那一行（留空＝关掉）；`FALLBACK_CIRCUIT_THRESHOLD` / `FALLBACK_CIRCUIT_COOLDOWN_SECONDS` 仍从 `.env` 读。
 - **意图分类**：**严格二选一**（设置页 →「模型配置」→ 意图识别里选）—— JEV 那一行（供应商锁 `typesafe`，填 base_url + api_key）或「意图识别（大模型）」那一行。`INTENT_JEV_ENABLED` / `INTENT_LLM_ENABLED`（关掉某一侧）、`INTENT_TIMEOUT_SECONDS` / `INTENT_HISTORY_TURNS` / `TYPESAFE_TIMEOUT_SECONDS` 仍在 `.env`。
 - **运行约束**：`AGENT_RECURSION_LIMIT`、`LOOP_GUARD_REPEATS`（`0` = 关掉空转刹车）、`HANDOFF_RESULT_MAX`。

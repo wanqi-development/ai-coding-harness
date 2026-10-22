@@ -542,15 +542,13 @@ CONTEXT_MODE_LABELS = {
 }
 
 _STEADY_AGENTS = frozenset(
-    {"qa", "analysis", "coding", "orchestrate", "rework"}
+    {"qa", "coding", "orchestrate", "rework"}
 )
 _BURST_AGENTS = frozenset(
-    {"plan", "planner", "coder", "review", "reviewer"}
+    {"plan", "planner", "coder", "reviewer"}
 )
-_STEADY_FORMS = frozenset(
-    {"qa", "analysis", "coding", "orchestrate", "rework"}
-)
-_BURST_FORMS = frozenset({"plan", "review"})
+_STEADY_FORMS = frozenset({"qa", "coding", "orchestrate", "rework"})
+_BURST_FORMS = frozenset({"plan"})
 
 
 def resolve_context_mode(agent: str = MAIN_AGENT, form: str | None = None) -> str:

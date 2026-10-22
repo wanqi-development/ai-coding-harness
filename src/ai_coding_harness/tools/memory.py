@@ -12,12 +12,9 @@
 * ``decisions``：整节替换「长期约束」（``items: [{decision, reason, impact}]``）；
 * ``basic``：按字段替换「仓库基本信息」（``fields: {字段: 值}``，字段有白名单）。
 
-**服务端打底**：合并后拿服务端刚查到的 PR 列表跑一遍 ``reconcile``，重算文件头那行、
-把「变更记录」里写着「待合并」的状态改成实际结论，并摘掉老模板的两张表。
-
-**没事就不查**（2026-09-26 起，与开工前的刷新同一条纪律）：提交的内容里没有待核对的 PR
-（``rows_to_verify`` —— 都写着已合并 / 已关闭，或压根没有 PR 行）时，这一次平台往返省掉，
-落盘前只做摘老表与盖时间戳这两件不需要 PR 事实的事。
+**职责边界**：PR 查询、新 PR 摘要与状态对账只在轮首记忆拦截点和 coding/rework 轮末发生
+（``server/repo_memory_sync.py``）。本工具只合并模型提交的各节正文、摘老表并盖时间戳，
+不再额外查平台。
 
 后端是 deepagents 的 ``StoreBackend``，它的 ``awrite`` **只在文件不存在时新建**，
 已存在一律报 ``already exists`` 拒绝。记忆要能逐轮覆盖，就得对已存在的文件走
@@ -35,7 +32,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from deepagents.backends.protocol import BackendProtocol
@@ -43,9 +39,7 @@ from langchain_core.tools import BaseTool, tool
 
 from ai_coding_harness.agent.middleware.context_inject import now_stamp
 from ai_coding_harness.agent.middleware.memory_reconcile import (
-    reconcile,
     restamp,
-    rows_to_verify,
     same_except_stamp,
     strip_legacy,
 )
@@ -56,6 +50,7 @@ from ai_coding_harness.agent.middleware.memory_sections import (
     SECTION_GAPS,
     SECTIONS,
     add_change,
+    empty_memory,
     parse,
     patch_basic,
     render_memory,
@@ -64,7 +59,6 @@ from ai_coding_harness.agent.middleware.memory_sections import (
     section_sizes,
 )
 from ai_coding_harness.backends.composite import memory_path
-from ai_coding_harness.tools.git import PrLookupError
 
 logger = logging.getLogger(__name__)
 
@@ -87,15 +81,8 @@ MAX_ITEM = 200
 
 
 def _skeleton(owner: str, repo: str) -> str:
-    """首次建档的最小骨架：四节标题 + 平台维护的头行。"""
-    return (
-        f"# 仓库记忆：{owner}/{repo}\n\n"
-        "> 最后更新：—　｜　最近 PR：—\n\n"
-        "## 一、仓库基本信息\n\n"
-        "## 二、变更记录（最新在上）\n\n"
-        "## 三、当前缺口（按模块）\n\n"
-        "## 四、长期约束\n"
-    )
+    """兼容旧调用：骨架定义已移到 ``memory_sections.empty_memory``。"""
+    return empty_memory(owner, repo)
 
 
 def _as_dict(payload: object) -> dict:
@@ -127,9 +114,6 @@ class MemoryContext:
     repo: str
     backend: BackendProtocol
     prefix: str = "/memories/"
-    # 查本仓库**全部** PR（含已合入与已废弃）—— 拒写检查与文件头的「最近 PR」共用这一次查询。
-    # None 表示这项能力没接上：既不查也不盖章，内容原样落盘（脚本与单测会这么用）。
-    all_prs: Callable[[], Awaitable[list[dict]]] | None = None
 
 
 def build_memory_tools(ctx: MemoryContext) -> list[BaseTool]:
@@ -155,7 +139,7 @@ def build_memory_tools(ctx: MemoryContext) -> list[BaseTool]:
           项目地址 / 技术栈 / 目录结构 / 启动方式 / 测试 / 构建 / 已知约定 ——
           **本次改动不要写进这一节**，用 `change`。
 
-        文件头的「最后更新 / 最近 PR」由平台盖章；「变更记录」的状态平台按代码平台实况回填。
+        文件头与 PR 状态由轮首 / 轮末同步维护；本工具只写正文各节。
         超长会被拒绝并告诉你是哪一节超了 —— 缩短后再提交，平台不会静默截断。
         """
         if section not in SECTIONS:
@@ -286,34 +270,8 @@ def build_memory_tools(ctx: MemoryContext) -> list[BaseTool]:
                 + "。"
             )
 
-        # 只有「有要核对的 PR」时才查平台（与开工前刷新同一条纪律）：提交的内容里没有
-        # 待核对的 PR 行时，这一次往返省掉 —— 代价是文件头里的「最近 PR」保持原样（没查
-        # 就不知道新值），所以那一格不动，而不是写成「—」。
-        pulls: list[dict] | None = None
-        if ctx.all_prs is not None and rows_to_verify(rendered):
-            try:
-                pulls = await ctx.all_prs()
-            except PrLookupError as exc:
-                logger.warning("查询 PR 失败，跳过记忆回写：%s", exc)
-                return (
-                    f"未能确认本仓库的 PR 状态，仓库记忆本次未更新：{exc}\n"
-                    "先解决这个问题（凭据 / 网络 / 代码平台可用性）再重试。在确认之前，"
-                    "不要把它当成「仓库没有未合入的 PR」，也不要凭这条回报用户。"
-                )
-
-        if pulls is not None:
-            reconciled = reconcile(rendered, pulls, now=now)
-            filled = reconciled.text
-            if filled != rendered:
-                noted += "；文件头已按代码平台实际状态盖章"
-            if reconciled.restated:
-                noted += (
-                    f"；{len(reconciled.restated)} 条变更记录的状态已按"
-                    f"实际结果更新（{'、'.join('#' + n for n in reconciled.restated)}）"
-                )
-        else:
-            # 没查 PR：老表照样摘（摘表不需要 PR 事实），头行的时间戳照盖
-            filled = strip_legacy(rendered)
+        # PR 对账只在轮首拦截点和 coding/rework 轮末发生；这里只合并模型提交的正文。
+        filled = strip_legacy(rendered)
         # 头行的时间戳由平台盖：模型提交的正文里也带着它自己写的时间（模版里就有那一行），
         # 那个时刻与真实写盘时刻对不上，「最后更新」就失去意义了。
         filled = restamp(filled, now=now)

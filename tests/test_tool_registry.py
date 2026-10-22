@@ -15,11 +15,9 @@ from types import SimpleNamespace
 import pytest
 
 from ai_coding_harness.agent.profiles import (
-    ANALYSIS_FORM,
     ORCHESTRATE_FORM,
     PLAN_FORM,
     QA_FORM,
-    REVIEW_FORM,
 )
 from ai_coding_harness.config import Settings
 from ai_coding_harness.tools.git import GiteeRepo
@@ -120,8 +118,10 @@ def test_main_cannot_merge_pr():
 
 
 def test_only_main_writes_repo_memory():
-    """记忆写回统一由主智能体负责，子智能体只回报结论。"""
+    """记忆写回统一由 coding / rework 主控负责，子智能体只回报结论。"""
     assert "save_repo_memory" in _main()
+    assert "save_repo_memory" not in _main_with_handoff(QA_FORM)
+    assert "save_repo_memory" not in _main_with_handoff(PLAN_FORM)
     for role in ("planner", "coder", "reviewer"):
         assert "save_repo_memory" not in _subagent(role)
 
@@ -164,10 +164,9 @@ def test_plan_exists_is_the_cheap_lookup():
     assert "planExists" in _main_with_handoff(ORCHESTRATE_FORM)
 
 
-@pytest.mark.parametrize("form", [ORCHESTRATE_FORM, QA_FORM, ANALYSIS_FORM, REVIEW_FORM])
+@pytest.mark.parametrize("form", [ORCHESTRATE_FORM, QA_FORM])
 def test_other_forms_have_no_plan_crud_tools(form):
-    """别的形态不该拿到改方案的工具：qa / analysis / review 不碰方案，
-    orchestrate 只管编排（实施进度由 coder 回写）。"""
+    """别的形态不该拿到改方案的工具：qa 不碰方案，orchestrate 只管编排。"""
     names = set(_main_with_handoff(form))
 
     assert not (names & {"getPlan", "updatePlan", "updatePlanSteps", "deletePlan"}), form
@@ -191,14 +190,14 @@ def test_orchestrate_can_look_up_an_unexecuted_plan_but_not_edit_one():
 
 
 @pytest.mark.parametrize(
-    "form", [ORCHESTRATE_FORM, PLAN_FORM, QA_FORM, ANALYSIS_FORM, REVIEW_FORM]
+    "form", [ORCHESTRATE_FORM, PLAN_FORM, QA_FORM]
 )
 def test_every_form_can_hand_off(form):
-    """五个形态都拿得到 ``handoffTask``。
+    """三个形态都拿得到 ``handoffTask``。
 
     形态裁掉的能力模型看不见，没有这个出口它就只能对用户说「我做不了」—— 2026-09-21
     那轮 686 秒正是这么来的（plan 形态手上没有写权限，于是复述一遍方案再问用户）。
-    所以哪怕是最窄的 qa / analysis 也得有这个工具。
+    所以哪怕是最窄的 qa 也得有这个工具。
     """
     assert "handoffTask" in _main_with_handoff(form)
 

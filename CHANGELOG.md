@@ -23,6 +23,50 @@
 
 ## 修改记录
 
+### 2026-10-22
+
+#### 意图改为状态优先：每轮 PR 同步、函数闸门、qa/analysis 合并
+
+- **动机**（用户口径 2026-10-22）：`coding ↔ rework` 并不是同一场景下的两个选项 ——
+  没有 open PR 时只能 coding，有 open PR 时只能 rework。继续把所有意图一次性交给模型，
+  再靠提示词和记忆中间件补边界，既不准确也挡不住模型“接力做”。同时去掉场景极少的独立
+  `review` 主控形态与已无必要的 `sync`，把 qa / analysis 合并成一个只读形态。
+- **改动**：
+  - `server/repo_state.py` 每轮实时查询一次全量 PR，不做跨轮接口缓存；同一份列表同时
+    用于意图候选和仓库记忆同步。
+  - 新增 `server/repo_memory_sync.py`：比记忆里最新 PR 编号更新的 PR，用一次 `qa` 模型
+    批量生成摘要后落盘；已有 PR 只修正与平台不一致的状态。写入直接进 StoreBackend。
+  - 意图候选按状态收口：无 open PR 为 `qa / plan / coding`，有 open PR 为 `qa / rework`，
+    状态未知时只留 `qa`。同一候选集同时作用于口令、JEV、大模型与关键字兜底，澄清选项
+    也按本轮候选过滤。
+  - PR 拦截从 `MemoryMiddleware` 移到意图判定后的纯函数闸门：待合并 PR 时拦截
+    `coding / plan`，放行 `qa / rework`；无 PR 的 `rework`、状态未知的写操作在建模前
+    直接停下。记忆中间件只保留加载与注入。
+  - 删除 `review` 主控形态和 `sync` 直接执行路径；保留 `reviewer` 子智能体。`rework`
+    扩成“PR 跟进”：可只派 reviewer 审查，也可派 coder 在既有分支修改；改码后必须再派一次
+    reviewer 复查，但本轮不自动无限闭环。
+  - `analysis` 合并进 `qa`：问答、解释、排查、需求澄清共用同一形态；qa 可写
+    `/ai_coding/tmp` 取证台账，但仍不能改任务代码。仓库记忆正文只允许 coding / rework
+    收尾写回，qa / plan 只读。
+  - `_ROLE_ORCHESTRATE` 收敛为纯编排角色：删除与 qa 重复的“直接处理”职责，把 coding /
+    rework 的具体流程留给逐轮指令；PR 合并、关闭、回评只保留红线与必要时的工作流说明。
+    仓库记忆收成基础规则与 coding/rework 共用写回格式两层。
+  - 读文件规则合并回唯一条“读码纪律”：默认先定位，已知文件可直接分段读；禁止用不同
+    offset 拆段扫全文；保留 policies ≤80 / project ≤200 的硬上限，并要求读后立即记结论。
+  - 模型配置删除 analysis 行；“评审”行只服务 reviewer。Token 面板只保留 qa / plan 两个
+    独立主控形态，rework 仍并入 coding 组。
+- **关键决策**：
+  - **状态候选在分类前收口，拦截在分类后立即执行**。这比把同一套规则塞进系统提示词更硬，
+    模型不会先拿到任务、再在中间件里被中止。
+  - **PR 同步只保留两个入口**：轮首记忆拦截点，以及 coding / rework 轮末。`save_repo_memory`
+    不再自行查 PR，只负责合并正文与落盘，避免第三处隐式刷新。
+  - **review 是动作，不是主控形态**；reviewer 是 coding / rework 的内部角色。删除独立
+    review 形态不会削弱审查，反而减少一个意图候选。
+- **验证**：全量 `pytest` **1280 passed**；`scripts/check_prompts.py` 渲染 6 份提示词、
+  **0 条冲突**；本次改动文件 `ruff check` 干净。
+- **遗留**：plan 的仓库级旧方案冲突检查、一个仓库多会话并行与用户隔离 / 仓库级编码锁、
+  coder ↔ reviewer 自动闭环均记入 `docs/backlog.md`。
+
 ### 2026-10-21
 
 #### 能力交接的内层不再「隐形」：日志与用量并回外层

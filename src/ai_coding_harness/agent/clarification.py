@@ -14,12 +14,10 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-#: 澄清选项允许指向的意图。``sync`` 是直接执行路径，不走澄清。
+#: 澄清选项的静态全集；运行时还会按当前 PR 状态再收一次候选。
 CLARIFY_INTENTS: tuple[str, ...] = (
     "qa",
-    "analysis",
     "plan",
-    "review",
     "coding",
     "rework",
 )
@@ -72,7 +70,9 @@ def _strip_fence(raw: str) -> str:
     return "\n".join(lines).strip()
 
 
-def parse_clarification(text: str) -> ClarificationRequest | None:
+def parse_clarification(
+    text: str, allowed_intents: tuple[str, ...] | None = None
+) -> ClarificationRequest | None:
     """从 qa 回复里取出合法的澄清块；不合法返回 ``None``。
 
     约束是刻意收窄的：2~3 个选项、``intent`` 必须在白名单里、问题与 label 非空。
@@ -96,6 +96,7 @@ def parse_clarification(text: str) -> ClarificationRequest | None:
         return None
     if not isinstance(raw_options, list) or not 2 <= len(raw_options) <= 3:
         return None
+    allowed = set(allowed_intents or CLARIFY_INTENTS)
     options: list[ClarificationOption] = []
     seen: set[str] = set()
     for item in raw_options:
@@ -104,7 +105,7 @@ def parse_clarification(text: str) -> ClarificationRequest | None:
         intent = str(item.get("intent") or "").strip().lower()
         label = str(item.get("label") or "").strip()
         description = str(item.get("description") or "").strip()
-        if intent not in CLARIFY_INTENTS or not label:
+        if intent not in allowed or not label:
             return None
         if intent in seen:
             return None

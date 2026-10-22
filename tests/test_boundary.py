@@ -27,11 +27,9 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from ai_coding_harness.agent.middleware import BoundaryMiddleware
 from ai_coding_harness.agent.profiles import (
-    ANALYSIS_FORM,
     ORCHESTRATE_FORM,
     PLAN_FORM,
     QA_FORM,
-    REVIEW_FORM,
 )
 from ai_coding_harness.config import Settings
 from ai_coding_harness.safety.permissions import CommandSafety
@@ -63,12 +61,8 @@ class TestPolicyTable:
             ),
             # 出方案：与子智能体 planner 同形 —— 方案 storePlan 落库、结论进回复，一个文件都不落
             (PLAN_FORM, (), ("edit_file", "write_file")),
-            # 问答：一个文件都不落（与 planner 同形），清单工具也一并撤掉（提示词里那段也摘了）
-            (QA_FORM, (), ("write_todos", "write_file", "edit_file")),
-            # 分析：与 qa 同形，结论进回复，只留 tmp 放取证的中间产物；进度靠取证台账，
-            # 清单工具一并撤掉
-            (ANALYSIS_FORM, ("/ai_coding/tmp",), ("write_todos",)),
-            (REVIEW_FORM, ("/ai_coding/review",), ()),
+            # qa 合并原 analysis：结论进回复，只留 tmp 放取证台账。
+            (QA_FORM, ("/ai_coding/tmp",), ("write_todos", "write_file", "edit_file")),
             # 子智能体 planner 不写文件，写工具一并撤掉
             ("planner", (), ("edit_file", "write_file")),
             ("coder", ("/ai_coding/project", "/ai_coding/tmp"), ()),
@@ -155,19 +149,19 @@ class TestDirectoryRange:
 
 
 class TestVerificationCommands:
-    """2026-10-20 用户口径：qa / analysis 允许跑测试与构建，但不改任务代码。
+    """2026-10-20 用户口径：qa 允许跑测试与构建，但不改任务代码。
 
     装依赖允许，但只能落在 ``/tmp`` 的仓库副本里 —— 项目目录里不留 node_modules /
     lockfile 改动，「清理」是结构性的，不靠模型自觉。
     """
 
-    @pytest.mark.parametrize("name", [QA_FORM, ANALYSIS_FORM])
+    @pytest.mark.parametrize("name", [QA_FORM])
     def test_tests_and_builds_are_allowed(self, name):
         policy = policy_for(name)
         for command in ("pytest -q", "npm test", "npm run build", "mvn test", "python -c 'print(1)'"):
             assert policy.check_tool("execute", {"command": command}) is None, command
 
-    @pytest.mark.parametrize("name", [QA_FORM, ANALYSIS_FORM])
+    @pytest.mark.parametrize("name", [QA_FORM])
     def test_installing_is_only_allowed_inside_tmp(self, name):
         policy = policy_for(name)
         assert policy.check_tool("execute", {"command": "cd /tmp/verify && npm ci"}) is None
@@ -182,7 +176,7 @@ class TestVerificationCommands:
             is not None
         )
 
-    @pytest.mark.parametrize("name", [QA_FORM, ANALYSIS_FORM])
+    @pytest.mark.parametrize("name", [QA_FORM])
     def test_git_writes_and_in_place_fixes_are_blocked(self, name):
         policy = policy_for(name)
         for command in (
@@ -226,8 +220,6 @@ class TestProtectedPaths:
             ORCHESTRATE_FORM,
             PLAN_FORM,
             QA_FORM,
-            ANALYSIS_FORM,
-            REVIEW_FORM,
             "coder",
             "reviewer",
         ],
@@ -244,8 +236,6 @@ class TestProtectedPaths:
             ORCHESTRATE_FORM,
             PLAN_FORM,
             QA_FORM,
-            ANALYSIS_FORM,
-            REVIEW_FORM,
             "coder",
             "reviewer",
         ],

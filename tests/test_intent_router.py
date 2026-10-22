@@ -62,7 +62,7 @@ class TestPolicy:
                 R("meta_question", "analyze", "execution", "continue_previous"),
                 previous_intent="rework",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_meta_question_that_asks_to_continue_keeps_rework(self):
@@ -100,7 +100,7 @@ class TestPolicy:
                 previous_intent="coding",
                 message="你执行的任务，我怎么感觉没有向前推进呢",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_post_merge_or_close_is_analysis(self):
@@ -111,7 +111,7 @@ class TestPolicy:
                 previous_intent="analysis",
                 message="pr7 已合并，更新记忆",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_plan_always_wins_even_for_a_question(self):
@@ -176,7 +176,7 @@ class TestPolicy:
                 previous_intent="coding",
                 message="你继续做，我只想知道判定结果",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_a_discussion_question_is_not_a_change(self):
@@ -186,7 +186,7 @@ class TestPolicy:
                 previous_intent="coding",
                 message="那是不是可以读一部分，总结一部分",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_a_general_how_to_question_is_analysis(self):
@@ -195,7 +195,7 @@ class TestPolicy:
                 R("new_task", "decide", "general"),
                 message="如何初始化数据库以及 nacos、redis",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_a_general_suggestion_is_not_forced_into_analysis(self):
@@ -234,7 +234,7 @@ class TestPolicy:
                 message="b",
                 active_intent="coding",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_a_short_followup_after_a_review_keeps_review(self):
@@ -243,9 +243,9 @@ class TestPolicy:
                 R("follow_up", "analyze", "pr_review", "continue_previous"),
                 previous_intent="coding",
                 message="这个",
-                active_intent="review",
+            active_intent="rework",
             )
-            == "review"
+            == "rework"
         )
 
     def test_a_bare_why_question_is_analysis_even_when_wants_is_lookup(self):
@@ -256,7 +256,7 @@ class TestPolicy:
                 previous_intent="coding",
                 message="为什么nacos之后还要bootstrap.yaml？",
             )
-            == "analysis"
+            == "qa"
         )
 
     def test_why_did_you_not_delegate_still_keeps_the_task(self):
@@ -289,8 +289,8 @@ class TestPolicy:
     def test_new_task_change_on_code_is_coding(self):
         assert suggest_intent(R("new_task", "change", "code")) == "coding"
 
-    def test_new_task_analyze_on_code_is_analysis(self):
-        assert suggest_intent(R("new_task", "analyze", "code")) == "analysis"
+    def test_new_task_analyze_on_code_is_qa(self):
+        assert suggest_intent(R("new_task", "analyze", "code")) == "qa"
 
     def test_new_task_lookup_on_code_is_qa(self):
         assert suggest_intent(R("new_task", "lookup", "code")) == "qa"

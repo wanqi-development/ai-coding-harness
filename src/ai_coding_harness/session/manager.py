@@ -175,6 +175,11 @@ class SessionManager:
         self._runtimes: dict[str, SessionRuntime] = {}
         self._pending: dict[str, _Pending] = {}
 
+    @property
+    def store(self) -> BaseStore:
+        """持久 Store；仓库记忆在沙箱建立前也要读写。"""
+        return self._store
+
     # -- 会话（只落库）-----------------------------------------------------
     async def create_session(
         self,

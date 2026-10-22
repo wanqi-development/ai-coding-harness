@@ -484,40 +484,6 @@ class TestServiceOutputs:
         assert FAKE not in recorded[-1]["content"]
         assert "思考里带了" not in str(recorded[-1].get("extra"))
 
-    async def test_direct_intent_output_is_masked(self, monkeypatch):
-        """sync 不经智能体，中间件够不着 —— 这条最容易被漏掉。"""
-        recorded: list[dict] = []
-
-        async def fake_add_record(db: Any, **kwargs: Any) -> None:
-            recorded.append(kwargs)
-
-        async def fake_title(db: Any, session_id: int, title: str) -> None:
-            return None
-
-        monkeypatch.setattr(service_mod.dao, "add_record", fake_add_record)
-        monkeypatch.setattr(service_mod.dao, "set_session_title_if_empty", fake_title)
-
-        svc = HarnessService(
-            settings=Settings(intent_llm_enabled=False, intent_history_turns=0),
-            manager=_FakeManager([]),
-            database=_FakeDb(),
-        )
-        session = SimpleNamespace(
-            public_id=uuid.uuid4(),
-            db_id=1,
-            repo=GiteeRepo(owner="o", repo="r", token=FAKE),
-            repo_url="https://gitee.com/o/r.git",
-            sandbox=_FakeSandbox(stdout=f"远端的 origin 带上了 {FAKE}"),
-        )
-
-        out = [e async for e in svc.chat(session, "同步仓库")]
-
-        ai_events = [e for e in out if e["type"] == "ai"]
-        assert ai_events, "直接执行没有产出"
-        assert FAKE not in ai_events[0]["content"]
-        assert REDACTED in ai_events[0]["content"]
-        assert FAKE not in recorded[-1]["content"]
-
     async def test_error_text_is_masked(self, monkeypatch):
         """异常文本常把工具返回值整段带上，直接从 SSE 漏出去。"""
         monkeypatch.setattr(service_mod.dao, "add_record", _noop_record)
@@ -661,5 +627,5 @@ class TestIntentDecisionPassthrough:
     """脱敏不改判定：词表是另一条通道，别把两者搅在一起。"""
 
     async def test_decision_from_keyword_ignores_terms(self):
-        decision = await service_mod.detect_intent("同步仓库", model=None)
-        assert decision == IntentDecision("sync", "keyword", "命中口令关键字")
+        decision = await service_mod.detect_intent("开始实施", model=None)
+        assert decision == IntentDecision("coding", "keyword", "命中口令关键字")

@@ -436,12 +436,12 @@ def test_an_unrecognized_live_state_leaves_the_row_alone():
     assert result.restated == ()
 
 
-def test_a_settled_row_is_not_rewritten_even_when_it_disagrees():
-    """人工已经改成「已合并」的行，线上后来变成「已关闭」也不回改 —— 那是结论，不是缓存。"""
+def test_a_row_is_rewritten_when_live_state_disagrees():
+    """记忆状态与平台不一致时按平台实况改写。"""
     result = reconcile(RECORDS, [pull(30, state="closed")], now=NOW)
 
-    assert "**状态**：已合并" in result.text
-    assert result.restated == ()
+    assert "**状态**：已关闭" in result.text
+    assert result.restated == ("30",)
 
 
 def test_the_status_rewrite_alone_marks_the_memory_as_changed():

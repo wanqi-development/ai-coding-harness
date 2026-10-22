@@ -6,8 +6,8 @@
    塞进「仓库基本信息」）要被当场拒掉。
 2. **落盘**：``StoreBackend.awrite`` 只新建，已存在的文件必须走 ``aedit`` 全文替换；
    内容没变就不写。
-3. **平台打底**：文件头的时间与最近 PR 由平台盖章；「变更记录」里写着「待合并」的状态
-   按代码平台实况回填；查 PR 失败就整次不写。
+3. **职责边界**：PR 查询和新 PR / 状态同步在轮首拦截点与 coding/rework 轮末完成；
+   `save_repo_memory` 只负责合并正文并落盘。
 """
 
 from __future__ import annotations
@@ -19,8 +19,7 @@ import pytest
 from ai_coding_harness.backends.composite import memory_path
 from ai_coding_harness.config import Settings
 from ai_coding_harness.tools import memory as memory_mod
-from ai_coding_harness.tools import register as register_mod
-from ai_coding_harness.tools.git import GiteeRepo, PrLookupError
+from ai_coding_harness.tools.git import GiteeRepo
 from ai_coding_harness.tools.register import build_main_tools
 
 REPO = GiteeRepo(owner="acme", repo="demo", token="test-token")
@@ -47,20 +46,6 @@ BASE = """# 仓库记忆：acme/demo
 ## 四、长期约束
 - **约束**：不引入新依赖　｜　**原因**：沙箱离线　｜　**影响**：新增依赖要先问
 """
-
-
-def _pr(
-    number: int, *, state: str = "open", title: str = "改点东西", branch: str = "feat"
-) -> dict:
-    return {
-        "number": number,
-        "state": state,
-        "title": title,
-        "html_url": f"https://gitee.com/acme/demo/pulls/{number}",
-        "user": {"login": "alice"},
-        "head": {"ref": branch},
-        "base": {"ref": "master"},
-    }
 
 
 class _FakeBackend:
@@ -110,28 +95,6 @@ class _FakeBackend:
             return SimpleNamespace(error=f"old_string not found in {file_path}", path=None)
         self.files[file_path] = new_string
         return SimpleNamespace(error=None, path=file_path)
-
-
-class _FakeGitee:
-    """假代码平台：把「查本仓库 PR」这一步从网络里摘出来。"""
-
-    def __init__(self) -> None:
-        self.pulls: list[dict] = []
-        self.error: PrLookupError | None = None
-        self.calls = 0
-
-    async def all_pulls(self) -> list[dict]:
-        self.calls += 1
-        if self.error is not None:
-            raise self.error
-        return self.pulls
-
-
-@pytest.fixture(autouse=True)
-def gitee(monkeypatch) -> _FakeGitee:
-    fake = _FakeGitee()
-    monkeypatch.setattr(register_mod, "build_git_client", lambda *_a, **_kw: fake)
-    return fake
 
 
 @pytest.fixture(autouse=True)
@@ -357,41 +320,6 @@ async def test_an_oversized_section_is_rejected_with_its_size():
 
     assert "超出上限" in out and "当前缺口" in out
     assert backend.aedits == []
-
-
-# -- PR 对账 -------------------------------------------------------------------
-
-
-async def test_lookup_failure_blocks_the_write(gitee):
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE
-    gitee.error = PrLookupError("平台挂了")
-
-    out = await _call(_tool(backend), "change", {"kind": "修改", "summary": "x", "pr": 13})
-
-    assert "未更新" in out and "平台挂了" in out
-    assert backend.aedits == [] and backend.awrites == []
-
-
-async def test_the_recorded_status_follows_the_live_pull(gitee):
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE
-    gitee.pulls = [_pr(12, state="merged"), _pr(13)]
-
-    await _call(_tool(backend), "change", {"kind": "修改", "summary": "x", "pr": 13})
-
-    text = backend.files[PATH]
-    assert "**PR**：#12　｜　**状态**：已合并" in text
-    assert "**PR**：#13　｜　**状态**：待合并" in text
-
-
-async def test_nothing_to_verify_skips_the_lookup(gitee):
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE.replace("待合并", "已合并")
-
-    await _call(_tool(backend), "gaps", {"items": [{"module": "订单", "text": "退款"}]})
-
-    assert gitee.calls == 0
 
 
 async def test_legacy_tables_are_dropped_on_write():

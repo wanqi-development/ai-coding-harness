@@ -1,12 +1,17 @@
 """Server 轮次编排：records。"""
 
 
+import json
 import logging
+import re
 from collections.abc import Mapping
 from typing import Any
 
-from ai_coding_harness.agent.middleware import refresh_memory
-from ai_coding_harness.backends.composite import memory_path
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from ai_coding_harness.agent.llm import build_model
+from ai_coding_harness.agent.middleware.context_inject import now_stamp
+from ai_coding_harness.backends.composite import memory_path, memory_store_key
 from ai_coding_harness.core.stream import (
     V3Translator,
 )
@@ -14,11 +19,16 @@ from ai_coding_harness.db import dao
 from ai_coding_harness.safety.redact import (
     redact,
 )
+from ai_coding_harness.server.repo_memory_sync import (
+    PrMemorySummary,
+    sync_repo_memory,
+)
 from ai_coding_harness.session.manager import (
     Session,
     SessionRuntime,
 )
 from ai_coding_harness.tools.git import PrLookupError, build_git_client
+from ai_coding_harness.tools.pr_client import pull_summary
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +40,35 @@ from .common import (
     _title_from,
     plan_payload,
 )
+
+_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def _parse_pr_summaries(text: str) -> dict[int, PrMemorySummary]:
+    """解析模型给出的一次性 PR 摘要；坏条目跳过，调用方再按标题兜底。"""
+    raw = _FENCE.sub("", text.strip())
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {}
+    items = value.get("items") if isinstance(value, dict) else value
+    if not isinstance(items, list):
+        return {}
+    out: dict[int, PrMemorySummary] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            number = int(item.get("number"))
+        except (TypeError, ValueError):
+            continue
+        kind = str(item.get("kind") or "修改").strip()
+        if kind not in {"新增", "修改", "删除", "修复"}:
+            kind = "修改"
+        summary = str(item.get("summary") or "").strip()[:120]
+        if number > 0 and summary:
+            out[number] = PrMemorySummary(kind, summary)
+    return out
 
 
 class TurnRecordsMixin:
@@ -160,32 +199,103 @@ class TurnRecordsMixin:
         except Exception:
             logger.exception("写会话标题失败（不影响主流程）")
 
+    async def _summarize_new_pulls(
+        self, pulls: tuple[dict[str, Any], ...]
+    ) -> dict[int, PrMemorySummary]:
+        """用一次模型调用批量摘要本轮新出现的 PR。"""
+        if self._memory_model is None:
+            self._memory_model = build_model(self._settings, role="qa")
+        compact = []
+        for pull in pulls:
+            summary = pull_summary(pull)
+            compact.append(
+                {
+                    "number": summary["number"],
+                    "title": summary["title"],
+                    "state": summary["state"],
+                    "branch": summary["branch"],
+                    "url": summary["url"],
+                    "body": str(pull.get("body") or "").strip()[:800],
+                }
+            )
+        reply = await self._memory_model.ainvoke(
+            [
+                SystemMessage(
+                    content=(
+                        "你在维护仓库记忆。根据给定的新 PR，为每个 PR 生成一条中文摘要。"
+                        "只输出 JSON 数组，不要 Markdown。格式："
+                        '[{"number": 12, "kind": "新增|修改|删除|修复", '
+                        '"summary": "不超过80字的一行摘要"}]。'
+                        "kind 根据 PR 标题和正文判断；无法判断时用“修改”。"
+                    )
+                ),
+                HumanMessage(
+                    content=json.dumps(compact, ensure_ascii=False)
+                ),
+            ]
+        )
+        content = getattr(reply, "content", "")
+        return _parse_pr_summaries(content if isinstance(content, str) else str(content))
+
+    async def _sync_memory(
+        self,
+        session: Session,
+        backend: Any,
+        path: str,
+        pulls: tuple[dict[str, Any], ...],
+    ):
+        """共享写入口：新 PR 摘要 + 状态对账 + 真实落盘。"""
+        return await sync_repo_memory(
+            backend,
+            path,
+            owner=session.repo.owner,
+            repo=session.repo.repo,
+            pulls=pulls,
+            now=now_stamp(),
+            summarize=self._summarize_new_pulls,
+        )
+
+    async def _sync_repo_memory_before_turn(
+        self, session: Session, pulls: tuple[dict[str, Any], ...]
+    ) -> Any:
+        """每轮拦截点：在沙箱准备前直接读写持久 Store。"""
+        if self._memory_backend is None:
+            return None
+        path = memory_store_key(
+            session.repo.owner, session.repo.repo, self._settings.memories_prefix
+        )
+        result = await self._sync_memory(
+            session, self._memory_backend, path, pulls
+        )
+        logger.info(
+            "仓库记忆轮前同步：new=%s restated=%s pending=%s changed=%s",
+            result.new_prs,
+            result.restated,
+            [pull.number for pull in result.pending],
+            result.changed,
+        )
+        return result
+
     async def _refresh_repo_memory(
         self, session: Session, runtime: SessionRuntime
     ) -> None:
-        """轮末按 Gitee 的实际 PR 状态刷新仓库记忆（coding / review / analysis 收尾时的打底）。
-
-        与启动闸门（``middleware/memory.py`` 的 ``refresh_memory``）是同一件事的
-        两次机会，读→对账→写回与「查不到就不写」的纪律都复用那一个函数。打底只补事实
-        （PR 编号 / 分支 / 状态），不替模型写散文 —— 散文由 ``save_repo_memory`` 负责。
-
-        **失败不改本轮结论。** 记忆是副产物：查不到 PR 也好、写盘报错也好，都只记日志，
-        交给下一轮（或下一次 ``save_repo_memory``）再刷。同理不建新记忆，只刷已存在的
-        那份（见 ``refresh_memory``）。
-
-        判据是**形态**（coding / review / analysis 即「这一轮有要沉淀的事实」），
-        不是「本轮建出过 PR」—— 后者要对工具返回文案做字符串匹配，改一次文案就会静默失效。
-        """
+        """coding / rework 轮末再查一次 PR 并走同一套记忆同步。"""
         path = memory_path(
             session.repo.owner, session.repo.repo, self._settings.memories_prefix
         )
         try:
-            # 刷没刷由 refresh_memory 自己记（成功 info、失败 warning）
-            await refresh_memory(
-                runtime.backend,
-                path,
-                build_git_client(self._settings, session.repo).all_pulls,
-                session.repo,
+            pulls = await build_git_client(
+                self._settings, session.repo
+            ).all_pulls()
+            result = await self._sync_memory(
+                session, runtime.backend, path, tuple(pulls)
+            )
+            logger.info(
+                "仓库记忆轮末同步：new=%s restated=%s pending=%s changed=%s",
+                result.new_prs,
+                result.restated,
+                [pull.number for pull in result.pending],
+                result.changed,
             )
         except PrLookupError as exc:
             logger.warning("查询仓库 PR 失败，仓库记忆本轮未刷新：%s", exc)

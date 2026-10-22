@@ -33,13 +33,14 @@ from ai_coding_harness.safety.redact import (
     secret_terms,
 )
 from ai_coding_harness.server.intent import (
-    DIRECT_INTENTS,
     SOURCE_ACTIVE,
     SOURCE_CLARIFY_CHOICE,
     IntentDecision,
     active_task_override,
     clarification_decision,
+    gate_intent_for_state,
 )
+from ai_coding_harness.server.repo_state import describe_snapshot, intent_candidates
 from ai_coding_harness.session.manager import (
     Session,
     SessionRuntime,
@@ -118,6 +119,15 @@ class TurnRunnerMixin:
         dialogue = await self._dialogue(session)
         # 最近一次可执行任务：analysis/qa 不覆盖它，短追问优先沿用它
         active_intent = await self._active_task(session)
+        # 每轮实时查一次全量 PR；同一份列表用于记忆同步与意图候选。
+        snapshot = await self._repo_snapshot(session)
+        if snapshot is not None:
+            try:
+                await self._sync_repo_memory_before_turn(session, snapshot.pulls)
+            except Exception:
+                logger.exception("轮前仓库记忆同步失败（本轮继续，轮末会再试）")
+        allowed_intents = intent_candidates(snapshot)
+        repo_status = describe_snapshot(snapshot)
         # 每轮一份：累加器挂在服务实例上（重判要跨调用累加），所以必须逐轮清零 ——
         # 不清就会把上一轮的判定开销带到这一轮的账上。
         self._intent_usage = {}
@@ -137,6 +147,8 @@ class TurnRunnerMixin:
                 previous_intent,
                 active_intent,
                 dialogue,
+                allowed_intents=allowed_intents,
+                repo_state=repo_status,
             )
         override = (
             active_task_override(message, decision.intent, active_intent)
@@ -147,10 +159,14 @@ class TurnRunnerMixin:
             decision = IntentDecision(
                 override, SOURCE_ACTIVE, f"沿用未完成任务 {active_intent}"
             )
+        state_block: str | None = None
+        gate = gate_intent_for_state(decision.intent, allowed_intents)
+        if gate.intent is None:
+            state_block = gate.reason
         # 低置信度：先转 qa 向用户确认，避免拿一个猜出来的形态直接干活。
         # active_task_override 命中时不动 —— 用户明确在继续未完成任务，那是更强的信号。
         clarification: dict[str, Any] | None = None
-        if not override and (
+        if not override and state_block is None and (
             clarified := clarification_decision(
                 decision, self._settings.intent_clarify_confidence
             )
@@ -179,8 +195,12 @@ class TurnRunnerMixin:
             self._shadow_tasks.add(shadow)
             shadow.add_done_callback(self._shadow_tasks.discard)
         logger.info(
-            "意图分析：intent=%s source=%s 理由=%s public_id=%s",
-            intent, decision.source, decision.reason or "-", session.public_id,
+            "意图分析：intent=%s source=%s 理由=%s pr_state=%s public_id=%s",
+            intent,
+            decision.source,
+            decision.reason or "-",
+            repo_status,
+            session.public_id,
         )
         if chosen is not None:
             record_content = f"选择：{chosen_label}"
@@ -203,6 +223,18 @@ class TurnRunnerMixin:
         )
         await self._name_session(session, message)
 
+        if state_block is not None:
+            await self._record(
+                session,
+                type="assistant",
+                summary=state_block,
+                content=state_block,
+                extra={"intent": intent, "aborted": "intent_state_gate"},
+            )
+            yield {"type": "ai", "content": state_block}
+            yield {"type": "done"}
+            return
+
         # 每轮一份运行时状态：循环守卫拿它数重复，``handoffTask`` 拿它重判意图并把原话
         # 交给另一个形态（分类模型与超时都在这一层，所以回调也从这里给）。
         # 智能体是长期存活对象，逐轮变化的东西只能经 config 注入。
@@ -210,6 +242,9 @@ class TurnRunnerMixin:
             message=message,
             history=history,
             repeats=self._settings.loop_guard_repeats,
+            open_prs=tuple(snapshot.open_prs) if snapshot is not None else (),
+            pr_state_known=snapshot is not None,
+            allowed_intents=allowed_intents,
             # 回调契约是 (message, history)：把 session 与「助手上一轮末尾」先绑进去，
             # 让重判也能看到「用户在回答哪个问题」（不绑的话它只看得到用户那几句）。
             rejudge=partial(
@@ -218,6 +253,8 @@ class TurnRunnerMixin:
                 previous_reply=previous_reply,
                 previous_intent=previous_intent,
                 dialogue=dialogue,
+                allowed_intents=allowed_intents,
+                repo_state=repo_status,
             ),
         )
 
@@ -234,33 +271,19 @@ class TurnRunnerMixin:
             return
 
         try:
-            if intent in DIRECT_INTENTS:
-                # 可直接执行的任务：不走智能体，直接返回（这条路径中间件够不着，得自己拦）
-                result = redact(
-                    await self._execute_direct(session, runtime, intent, message), terms
-                )
-                await self._record(
-                    session, type="assistant", summary=result[:200], content=result,
-                    extra={"intent": intent, "direct": True},
-                )
-                yield {"type": "ai", "content": result}
-            else:
-                async for event in self._run_agent(
-                    session,
-                    runtime,
-                    message,
-                    intent,
-                    terms,
-                    state=state,
-                    clarification=clarification,
-                ):
-                    yield event
-                # 轮末打底：coding / rework / review / analysis 这几轮才有要沉淀的事实，
-                # 按 Gitee 实况再刷一遍。
-                # 放在这一层（而不是 ``_run_agent`` 里）有三个好处：中止与正常收尾两条
-                # 出口都覆盖得到、``_run_agent`` 只管事件流不新增依赖、只读轮不查 PR。
-                if profile_for(intent).form in _MEMORY_WRITE_FORMS:
-                    await self._refresh_repo_memory(session, runtime)
+            async for event in self._run_agent(
+                session,
+                runtime,
+                message,
+                intent,
+                terms,
+                state=state,
+                clarification=clarification,
+            ):
+                yield event
+            # 轮末打底：只有 coding / rework 共用的 orchestrate 形态才有要沉淀的事实。
+            if profile_for(intent).form in _MEMORY_WRITE_FORMS:
+                await self._refresh_repo_memory(session, runtime)
         except Exception as exc:
             # exception() 自带堆栈，别再把 exc 塞进 msg（TRY401）
             logger.exception("处理失败")
@@ -289,28 +312,6 @@ class TurnRunnerMixin:
             session, type="assistant", summary=notice, content=notice,
             extra={"rejected": label},
         )
-
-    async def _execute_direct(
-        self, session: Session, runtime: SessionRuntime, intent: str, message: str
-    ) -> str:
-        if intent == "sync":
-            return await self._direct_sync(session, runtime)
-        return "（无对应的直接执行处理器）"
-
-    async def _direct_sync(self, session: Session, runtime: SessionRuntime) -> str:
-        """同步仓库：不存在 clone，已存在 pull。"""
-        repo_dir = f"{self._settings.sandbox_project_dir}/{session.repo.repo}"
-        exists = await runtime.sandbox.run(f"test -d {repo_dir}/.git && echo yes || echo no")
-        if "yes" in exists.stdout:
-            result = await runtime.sandbox.run(f"git -C {repo_dir} pull")
-            action = "git pull"
-        else:
-            result = await runtime.sandbox.run(
-                f"git clone {session.repo_url} {repo_dir}"
-            )
-            action = "git clone"
-        out = (result.stdout or result.stderr or "").strip()
-        return f"已同步仓库（{action}，exit={result.exit_code}）：\n{out[-1000:]}"
 
     async def _run_agent(
         self,
@@ -523,7 +524,7 @@ class TurnRunnerMixin:
 
         clarification_frame: dict[str, Any] | None = None
         if clarification is not None:
-            parsed = parse_clarification(text)
+            parsed = parse_clarification(text, state.allowed_intents or None)
             if parsed is not None:
                 clarification_frame = await self._save_clarification(
                     session,

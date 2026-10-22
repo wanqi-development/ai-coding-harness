@@ -11,9 +11,8 @@
   调用 ``task``；
 - ``read_guard``：读文件红线 —— policies ≤80 行、project ≤200 行；``cat`` 等整文件
   命令直接拦；
-- ``memory``：仓库记忆 —— 每轮开始把它注入系统提示；plan / orchestrate 主控那份还按 Gitee
-  的真实 PR 状态先对账，再按**本轮意图**判闸门（plan / coding 有未合入的 PR 就拦，rework
-  反过来：没有待合并的 PR 才拦）；
+- ``memory``：仓库记忆 —— 每轮开始把它注入系统提示；PR 状态闸门在 server 层意图判定后
+  一次完成，不再由中间件承担；
 - ``fallback``：主导模型彻底失败时切兜底，并留一条 ``MODEL_FALLBACK`` 的痕。
 - ``stream_usage``：流式响应也要 token 用量；网关不认 ``stream_options`` 时按地址自动降级。
 - ``context_trim``：压缩线处的**应急裁剪**辅助函数（保留当前步骤 + 模型工作笔记
@@ -52,18 +51,9 @@ from ai_coding_harness.agent.middleware.guard import (
     TurnStop,
 )
 from ai_coding_harness.agent.middleware.memory import (
-    BLIND_MARKER,
-    BLOCKING_FORMS,
-    GATE_ABORT_REASON,
-    GATE_MARKER,
     MEMORY_BLOCK_TITLE,
-    NO_TARGET_ABORT_REASON,
-    NOTHING_TO_FIX_MARKER,
-    REFRESH_FORMS,
     MemoryMiddleware,
-    Refreshed,
     build_memory_middleware,
-    refresh_memory,
 )
 from ai_coding_harness.agent.middleware.read_guard import ReadGuardMiddleware
 from ai_coding_harness.agent.middleware.redaction import (
@@ -82,17 +72,10 @@ from ai_coding_harness.agent.middleware.tool_integrity import (
 
 __all__ = [
     "ABORT_REASON",
-    "BLIND_MARKER",
-    "BLOCKING_FORMS",
     "FALLBACK_LOG_TAG",
-    "GATE_ABORT_REASON",
-    "GATE_MARKER",
     "LOOP_ABORT_MARKER",
     "MEMORY_BLOCK_TITLE",
-    "NOTHING_TO_FIX_MARKER",
-    "NO_TARGET_ABORT_REASON",
     "PRETRIM_KEEP_RECENT_TOOL_RESULTS",
-    "REFRESH_FORMS",
     "STREAM_USAGE_LOG_TAG",
     "BoundaryMiddleware",
     "DelegationGateMiddleware",
@@ -104,7 +87,6 @@ __all__ = [
     "ModelRedactionMiddleware",
     "ReadGuardMiddleware",
     "RedactionMiddleware",
-    "Refreshed",
     "StreamUsageMiddleware",
     "ToolCallIdMiddleware",
     "ToolErrorGuardMiddleware",
@@ -114,5 +96,4 @@ __all__ = [
     "keep_items_from_messages",
     "now_stamp",
     "pretrim_tool_results",
-    "refresh_memory",
 ]

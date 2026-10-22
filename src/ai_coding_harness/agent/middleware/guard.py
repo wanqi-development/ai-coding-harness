@@ -106,11 +106,18 @@ class TurnState:
         repeats: int = 5,
         max_handoffs: int = 1,
         rejudge: Callable[[str, Sequence[str]], Awaitable[Any]] | None = None,
+        open_prs: Sequence[Mapping[str, Any]] = (),
+        pr_state_known: bool = True,
+        allowed_intents: Sequence[str] = (),
     ) -> None:
         self.message = message
         self.history: tuple[str, ...] = tuple(history)
         self.repeats = repeats
         self.max_handoffs = max_handoffs
+        #: 本轮仓库状态快照：中间件只读，不负责刷新或拦业务。
+        self.open_prs: tuple[dict[str, Any], ...] = tuple(dict(pull) for pull in open_prs)
+        self.pr_state_known = pr_state_known
+        self.allowed_intents: tuple[str, ...] = tuple(allowed_intents)
         #: 重判意图的回调（``force_llm`` 那条路，超时与模型都在 server 层）。签名
         #: ``(消息, 历史) -> IntentDecision``（读 ``.intent`` / ``.source``）；这里不
         #: import 那个类型 —— 中间件层不该反过来依赖 server 层。

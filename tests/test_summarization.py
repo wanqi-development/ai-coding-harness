@@ -246,18 +246,16 @@ class TestTrigger:
 
 class TestModeMapping:
     def test_burst_roles(self):
-        for role in ("plan", "planner", "coder", "review", "reviewer"):
+        for role in ("plan", "planner", "coder", "reviewer"):
             assert resolve_context_mode(role) == CONTEXT_MODE_BURST
 
     def test_steady_roles(self):
-        for role in ("qa", "analysis", "coding", "orchestrate", "rework"):
+        for role in ("qa", "coding", "orchestrate", "rework"):
             assert resolve_context_mode(role) == CONTEXT_MODE_STEADY
 
     def test_the_main_agent_uses_its_form(self):
         assert resolve_context_mode(MAIN_AGENT, "qa") == CONTEXT_MODE_STEADY
-        assert resolve_context_mode(MAIN_AGENT, "analysis") == CONTEXT_MODE_STEADY
         assert resolve_context_mode(MAIN_AGENT, "plan") == CONTEXT_MODE_BURST
-        assert resolve_context_mode(MAIN_AGENT, "review") == CONTEXT_MODE_BURST
         assert resolve_context_mode(MAIN_AGENT, "orchestrate") == CONTEXT_MODE_STEADY
         assert resolve_context_mode(MAIN_AGENT, "coding") == CONTEXT_MODE_STEADY
         assert resolve_context_mode(MAIN_AGENT, "rework") == CONTEXT_MODE_STEADY

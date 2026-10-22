@@ -20,19 +20,16 @@ from ai_coding_harness.config import FALLBACK_CONTEXT_WINDOW, ModelConfig, Setti
 _EXPECTED = {
     "orchestrate": "m-coding",
     "qa": "m-qa",
-    "analysis": "m-analysis",
     "plan": "m-plan",
-    "review": "m-review",
     # 子智能体：planner 复用「方案」、reviewer 复用「审查」、coder 单占「编码」
     "planner": "m-plan",
     "coder": "m-coder",
     "reviewer": "m-review",
 }
 
-#: 六个「各智能体」行 → 模型名（与上面的期望对得上）
+#: 五个「各智能体」行 → 模型名（与上面的期望对得上）
 _ROWS: dict[str, str] = {
     "qa": "m-qa",
-    "analysis": "m-analysis",
     "plan": "m-plan",
     "review": "m-review",
     "coding": "m-coding",
@@ -65,9 +62,7 @@ def test_the_row_map_is_the_only_route() -> None:
     assert _AGENT_KEY == {
         "orchestrate": "coding",
         "qa": "qa",
-        "analysis": "analysis",
         "plan": "plan",
-        "review": "review",
         "planner": "plan",
         "coder": "coder",
         "reviewer": "review",

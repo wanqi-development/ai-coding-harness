@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -27,7 +27,11 @@ from langchain_core.messages import SystemMessage
 
 from ai_coding_harness.agent.clarification import CLARIFY_CLOSE, CLARIFY_INTENTS, CLARIFY_OPEN
 from ai_coding_harness.agent.prompts import intent_directive
-from ai_coding_harness.tools.context import get_clarification, get_intent
+from ai_coding_harness.tools.context import (
+    get_clarification,
+    get_configurable,
+    get_intent,
+)
 
 # 平台面向国内 Gitee 用户，日志与记忆里的日期都按这个时区口径
 _TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -38,7 +42,10 @@ def now_stamp() -> str:
     return f"{datetime.now(_TIMEZONE):%Y-%m-%d %H:%M}"
 
 
-def clarification_block(info: Mapping[str, Any] | None) -> str:
+def clarification_block(
+    info: Mapping[str, Any] | None,
+    allowed_intents: Sequence[str] | None = None,
+) -> str:
     """低置信度澄清轮：让 qa 先追问，不直接执行。
 
     这个块放在所有注入内容的**最后** —— qa 的常规指令是“回答问题”，这里要压过它。
@@ -64,7 +71,8 @@ def clarification_block(info: Mapping[str, Any] | None) -> str:
         lines.append("- 候选（按可能性从高到低）：" + " / ".join(ranked))
     else:
         lines.append("- 候选：按你从上下文判断的可能性自行排序（最多 3 个）")
-    allowed = " / ".join(CLARIFY_INTENTS)
+    choices = tuple(allowed_intents or CLARIFY_INTENTS)
+    allowed = " / ".join(choices)
     lines += [
         "- 先用只读工具了解必要上下文；可以按你的判断改写候选，不要机械照抄后端候选。",
         "- 不要直接执行、不要改文件、不要创建方案。",
@@ -82,6 +90,31 @@ def clarification_block(info: Mapping[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+def repo_state_block(state: Any) -> str:
+    """本轮 PR 快照与状态闸门的结果说明。"""
+    if state is None:
+        return ""
+    known = bool(getattr(state, "pr_state_known", True))
+    pulls = tuple(getattr(state, "open_prs", ()) or ())
+    lines = ["## 本轮仓库状态（平台已经查过，不要重复查）"]
+    if not known:
+        lines.append("- PR 状态查询失败：本轮不能安全区分 coding 与 rework。")
+    elif not pulls:
+        lines.append("- 当前没有 open PR。")
+    else:
+        lines.append(f"- 当前有 {len(pulls)} 个 open PR：")
+        for pull in pulls[:5]:
+            number = str(pull.get("number") or "?").strip()
+            title = str(pull.get("title") or "").strip()
+            branch = ""
+            head = pull.get("head")
+            if isinstance(head, Mapping):
+                branch = str(head.get("ref") or "").strip()
+            suffix = f"（分支 {branch}）" if branch else ""
+            lines.append(f"  - #{number} {title}{suffix}".rstrip())
+    return "\n".join(lines)
+
+
 class IntentMiddleware(AgentMiddleware):
     """在系统消息末尾追加本轮意图指令与澄清块。"""
 
@@ -92,11 +125,14 @@ class IntentMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         base = request.system_message
         intent = get_intent()
+        state = get_configurable("turn_state")
+        allowed = getattr(state, "allowed_intents", ()) or None
         parts = (
             base.text if base else "",
+            repo_state_block(state),
             intent_directive(intent),
             # 澄清轮放最最后：它要压过 qa 的常规“回答问题”指令
-            clarification_block(get_clarification()),
+            clarification_block(get_clarification(), allowed),
         )
         text = "\n\n".join(part for part in parts if part)
         return await handler(request.override(system_message=SystemMessage(content=text)))

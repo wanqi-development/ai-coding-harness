@@ -43,12 +43,11 @@ class ModelConfig:
 #: 「模型配置」界面上的行：稳定键 → 中文名（2026-10-13 用户口径：按**智能体**配，名字用中文）。
 #: 接口按这张表下发，前端不自己映射 —— 免得两处各写一份中文、漂了还看不出来。
 #: 三个子智能体（planner / coder / reviewer）不各占一行：planner 复用「方案」、
-#: reviewer 复用「审查」、coder 单占「编码」（见 ``agent/llm._AGENT_KEY``）。
+#: reviewer 复用「评审」、coder 单占「编码」（见 ``agent/llm._AGENT_KEY``）。
 MODEL_AGENT_ROWS: tuple[tuple[str, str], ...] = (
     ("qa", "问答"),
-    ("analysis", "分析"),
     ("plan", "方案"),
-    ("review", "审查"),
+    ("review", "评审"),
     # 「编码」是一主三从：主控与 coder 各占一行（2026-10-14 用户口径），
     # 另外两个角色**复用已有的两行** —— planner 用「方案」、reviewer 用「审查」
     # （见 ``agent/llm._AGENT_KEY``），所以这里不再为它们各开一行。
@@ -72,7 +71,6 @@ MODEL_SECTIONS: tuple[tuple[str, str], ...] = (
 )
 MODEL_AGENT_SECTION: dict[str, str] = {
     "qa": "agents",
-    "analysis": "agents",
     "plan": "agents",
     "review": "agents",
     "coding": "agents",
@@ -86,9 +84,8 @@ MODEL_AGENT_SECTION: dict[str, str] = {
 #: 每一行**服务哪些角色**（口径与 ``agent/llm._AGENT_KEY`` 同一份事实，反着写一遍给界面用）
 MODEL_AGENT_ROLES: dict[str, tuple[str, ...]] = {
     "qa": ("qa",),
-    "analysis": ("analysis",),
     "plan": ("plan", "planner"),
-    "review": ("review", "reviewer"),
+    "review": ("reviewer",),
     "coding": ("orchestrate",),
     "coder": ("coder",),
     "unified": ("*",),
@@ -120,9 +117,8 @@ MODEL_AGENT_PROVIDER_LOCK: dict[str, str] = {"jev": "typesafe"}
 #: ``fallback`` / ``jev`` 不在表里：它们不是主模型，没有「生效值」这一说。
 MODEL_AGENT_EFFECTIVE_ROLE: dict[str, str] = {
     "qa": "qa",
-    "analysis": "analysis",
     "plan": "plan",
-    "review": "review",
+    "review": "reviewer",
     "coding": "orchestrate",
     "coder": "coder",
     # 「统一模型」那一行看的是**它自己**：拿 orchestrate 去算会让它显示成「编码主控」的模型

@@ -371,14 +371,13 @@ def test_the_compression_count_comes_from_the_internal_call() -> None:
 
 
 def test_the_window_follows_the_rounds_main_model() -> None:
-    """窗口按**本轮主控形态**取：coding / plan 看「编码主控」「方案」两行，review 看「审查」。"""
+    """窗口按**本轮主控形态**取：coding / plan 看「编码主控」「方案」两行。"""
     from ai_coding_harness.server.service import _main_window
 
     settings = _service()._settings
 
     assert _main_window(settings, "coding") == WINDOW_GLM
     assert _main_window(settings, "plan") == WINDOW_GLM
-    assert _main_window(settings, "review") == WINDOW_KIMI
     assert _main_window(settings, "qa") == WINDOW_GPT
 
 
@@ -391,7 +390,6 @@ def test_the_answer_carries_the_main_model_name() -> None:
 
     assert service._turn_usage(_session(), "coding", _log())["model"] == "glm"
     assert service._turn_usage(_session(), "plan", _log())["model"] == "glm"
-    assert service._turn_usage(_session(), "review", _log())["model"] == "kimi"
     assert service._turn_usage(_session(), "qa", _log())["model"] == "gpt"
 
 

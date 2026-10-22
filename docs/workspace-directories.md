@@ -30,9 +30,7 @@
 |--------|---------|-----|--------|--------|
 | 主控 `orchestrate`（编码） | **读写** | 可写 | — | 可写 |
 | 主控 `plan`（出方案） | — | — | — | — |
-| 主控 `qa`（问答） | — | — | — | — |
-| 主控 `analysis`（分析） | — | 可写 | — | — |
-| 主控 `review`（审查） | — | — | — | 可写 |
+| 主控 `qa`（问答 / 解释 / 排查） | — | 可写（取证台账） | — | — |
 | 子智能体 `planner` | — | — | — | — （写工具已撤掉） |
 | 子智能体 `coder` | **读写** | 可写 | — | — |
 | 子智能体 `reviewer` | — | 可写 | — | 可写 |
@@ -41,16 +39,12 @@
 在调用前被拦下。**没登记名字的智能体按最保守处理**（一律不写），而不是放开。
 
 > **这张表只管沙箱目录。** 仓库记忆（`/memories/<owner>/<repo>.md`）在 StoreBackend 上，
-> 不在沙箱里、也不受上表约束：能写它的形态是 `orchestrate`（coding / rework）、`review`、
-> `analysis`（2026-09-26 起 —— 分析结论就是记忆「仓库基本信息」与「当前缺口」两节的来源；
-> 2026-09-27 起它也接「刷新 / 更新仓库记忆」这类请求，把 Gitee 上缺的 PR 补进「变更记录」），
-> `qa` 与 `plan` 没有这件工具。工具子集见 `tools/register.py` 的 `_FORM_TOOLS`。
+> 不在沙箱里、也不受上表约束：模型正文由 `orchestrate`（coding / rework）写；
+> PR 新增记录与状态由轮首 / 轮末平台同步写。`qa` 与 `plan` 没有写正文的工具。
+> 工具子集见 `tools/register.py` 的 `_FORM_TOOLS`。
 
-> 意图 `rework`（按评审意见修改）**复用** `orchestrate` 这一行：它与 `coding` 共用同一份
-> 装配（同一批工具、同一段角色提示词、同样三个子智能体），差别只在记忆闸门 —— `coding` 有
-> 未合入的 PR 就拦，`rework` 反过来（没有待合并的 PR 才拦，它要改的正是那份还开着的 PR）。
-> 判据先看**仓库记忆里记着的待合并 PR**（2026-09-26 起）：都写着已合并 / 已关闭时连 PR 查询
-> 都不发，也就不会拦；只有从没写过记忆的仓库才无条件查一次。别名登记见
+> 意图 `rework`（PR 跟进）**复用** `orchestrate` 这一行：它与 `coding` 共用装配，
+> 差别由逐轮意图指令和意图后的状态闸门决定。别名登记见
 > `src/ai_coding_harness/agent/profiles.py` 的 `FORM_ALIASES`。
 
 > 沙箱之外还有两个前缀，**不在沙箱里、也不受上表约束**：`/conversation_history/`
@@ -76,5 +70,5 @@
 ## 与 skill 的对应
 
 - `ai-coding-implementation`（coding）：写 `/ai_coding/project`，其余只读 —— 由主控编码形态与 `coder` 执行。
-- `repo-bootstrap-analysis`：project 只读，中间文件写 `/ai_coding/tmp`，**报告进回复、不落文件** —— 它的三种执行者（编码形态 / 分析形态 / `planner`）因此口径一致；`planner` 只跑其中的只读部分，产物并入方案。它的结论最终**沉淀到仓库记忆的「仓库基本信息」与「当前缺口」两节**（由主控在 coding / review / analysis 收尾写回），不另存文件。
+- `repo-bootstrap-analysis`：project 只读，中间文件写 `/ai_coding/tmp`，**报告进回复、不落文件** —— 执行者（编码形态 / qa / `planner`）口径一致；`planner` 只跑其中的只读部分，产物并入方案。结论最终由 coding / rework 收尾写回仓库记忆。
 - `code-review`：project 只读，写 `/ai_coding/review` + `/ai_coding/tmp` —— 由 `reviewer` 执行。

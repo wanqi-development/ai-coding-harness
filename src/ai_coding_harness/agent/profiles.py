@@ -20,12 +20,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # 形态名：同时是缓存键、主工具子集与角色提示词的索引，三者由它一处对齐。
-# 单智能体的四种形态装配相同（都不挂子智能体），但角色与主工具各不相同，所以各占一种：
-# 共用一种形态，就会让某一轮拿到另一轮的口径（qa 与 analysis 曾共用，plan/review 同理）。
+# 单智能体形态都不挂子智能体，但 qa / plan 的工具与角色提示词不同，所以各占一种。
 QA_FORM = "qa"
-ANALYSIS_FORM = "analysis"
 PLAN_FORM = "plan"
-REVIEW_FORM = "review"
 ORCHESTRATE_FORM = "orchestrate"
 
 # 子智能体的固定顺序（deepagents 会把清单写进 `task` 工具描述，顺序稳定便于对照）
@@ -45,30 +42,21 @@ class AgentProfile:
 _PROFILES: dict[str, AgentProfile] = {
     # 问答：只读、自己答，产出只进回复
     "qa": AgentProfile(QA_FORM),
-    # 分析：只读、自己分析，产出只进回复（output 没有回传通路，写进去用户取不到）
-    "analysis": AgentProfile(ANALYSIS_FORM),
     # 出方案：主控自己出方案并 storePlan 落库（多智能体形态下这一步归 planner 子智能体），
     # 不落文件 —— 与子智能体 planner 同形
     "plan": AgentProfile(PLAN_FORM),
-    # 审查：主控自己审、自己 comment_pr
-    "review": AgentProfile(REVIEW_FORM),
     # 编码：全流程（唯一挂子智能体的形态）
     "coding": AgentProfile(ORCHESTRATE_FORM, subagents=_SUBAGENT_ORDER),
 }
 
-#: 与某个已有意图**共用同一份装配**的意图。唯一一例：``rework``（按评审意见修改）复用
+#: 与某个已有意图**共用同一份装配**的意图。唯一一例：``rework``（PR 跟进）复用
 #: ``coding`` 的全流程 —— 要改的代码一样、要走的环路一样（coder 改 → reviewer 审），差别
-#: 只在**记忆闸门**（coding 有未合入 PR 就拦；rework 反过来，没有可修的对象才拦，见
-#: ``agent/middleware/memory.py``）。
+#: 只在逐轮意图指令。开 / 关 PR 的状态候选已经在分类前收口，记忆中间件只负责注入。
 #:
 #: 共用是**有意**的，所以写成显式登记，而不是再抄一份同形 profile：抄一份就会漂，而形态一
 #: 漂，工具子集与角色提示词跟着一起漂（缓存键正是形态名）。反过来，真要给 rework 不同的
 #: 工具或提示词，就得把它从这张表里摘出去、单开一种形态。
 #:
-#: 「刷新仓库记忆」当初也加过一条独立意图（复用 ``analysis``），2026-09-27 按用户口径撤回：
-#: ``analysis`` 本来就有 `get_pr_info` 与 `save_repo_memory`，多一个意图等于多一份分类面与
-#: 装配登记，收益为零 —— 现在它走 ``analysis`` 意图本身（见 ``server/intent.py`` 的 analysis
-#: 规则与 ``prompts.py`` 的 analysis 指令）。
 FORM_ALIASES: dict[str, str] = {"rework": "coding"}
 
 # 别名在 ``_PROFILES`` 建好之后再挂上 —— 共用必须是**同一个对象**，不能是两条内容相同的
@@ -80,7 +68,7 @@ _FULL = _PROFILES["coding"]
 
 # 有专属装配的意图（含 `FORM_ALIASES` 里的别名）。与 ``server/intent.py`` 的 ``TASK_TYPES``
 # 对表：新增意图若忘了在这里登记，它会**静默**落到全量装配（挂着 create_pr 与三个子智能体）
-# —— 正是本次要去掉的那种误选。``sync`` 走直接执行，本来就不该在这里。
+# —— 正是本次要去掉的那种误选。
 PROFILED_INTENTS: frozenset[str] = frozenset(_PROFILES)
 
 
@@ -88,7 +76,7 @@ def profile_for(intent: str | None) -> AgentProfile:
     """取意图对应的 profile。
 
     未知意图按**全量**装配：不知道用户要干什么时，少给能力的代价（这轮做不了）比
-    多给能力的代价（可能误用）更难挽回。``sync`` 走直接执行，到不了这里。
+    多给能力的代价（可能误用）更难挽回。
 
     别名意图（``FORM_ALIASES``）拿到的是被复用那一份**同一个对象** —— 形态相同即装配相同，
     而形态正是 ``SessionManager`` 的缓存键，所以同一会话里 coding 与 rework 共用同一个

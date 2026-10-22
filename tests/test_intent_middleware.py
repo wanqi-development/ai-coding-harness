@@ -92,19 +92,17 @@ class TestIntentMiddleware:
         assert "确认实施" in text and "coder" in text
 
     async def test_rework_intent_reaches_model(self):
-        """按评审意见改的这轮要拿到：先取原文、只改用户点名的、不派 planner、闸门归平台判。"""
+        """PR 跟进轮要分流「只审查」与「要修改」，改码后还要复查。"""
         text = _first_system_text(await _run("rework"))
-        assert "按评审意见修改" in text
-        assert "先取回审查原文" in text
-        assert "不需要 `planner`" in text
+        assert "PR 跟进" in text
+        assert "只审查 / 只回评" in text
+        assert "要修改代码" in text
+        assert "必须再派一次 `reviewer` 复查" in text
 
-    async def test_analysis_intent_carries_the_memory_writeback(self):
-        """分析轮是唯一带记忆写回的只读形态：指令里要写清「收尾把结论沉淀进记忆」，
-        且明确不写变更记录（这一轮没有代码改动、也没有 PR）。"""
+    async def test_analysis_is_merged_into_qa_and_has_no_directive(self):
+        """analysis 不再是意图；旧值不会注入任何独立指令。"""
         text = _first_system_text(await _run("analysis"))
-        assert "只读分析" in text
-        assert "save_repo_memory" in text
-        assert "不写「变更记录」" in text
+        assert "本轮意图" not in text
 
     async def test_qa_intent_adds_no_directive(self):
         """无指令的意图（qa）不塞意图指令，也不注入时间。"""
@@ -118,7 +116,7 @@ class TestIntentMiddleware:
 
     async def test_no_time_block_is_injected(self):
         """时间不再注入：记忆头行由平台写，散文日期让模型自己跑 date。"""
-        for intent in ("plan", "coding", "review", "qa", None):
+        for intent in ("plan", "coding", "rework", "qa", None):
             text = _first_system_text(await _run(intent))
             assert "## 当前时间" not in text
 
@@ -165,7 +163,7 @@ def test_clarification_block_ranks_candidates_and_forbids_execution():
     assert "不要直接执行" in text
     assert "<CLARIFY>" in text
     assert '"options"' in text
-    assert "qa / analysis / plan / review / coding / rework" in text
+    assert "qa / plan / coding / rework" in text
 
 
 def test_no_clarification_means_no_block():

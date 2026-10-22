@@ -68,6 +68,18 @@ MAX_CHANGES = 8
 DIGEST_KEYS: tuple[str, ...] = (SECTION_BASIC, SECTION_GAPS, SECTION_DECISIONS)
 
 
+def empty_memory(owner: str, repo: str) -> str:
+    """首次建档的最小骨架：四节标题 + 平台维护的头行。"""
+    return (
+        f"# 仓库记忆：{owner}/{repo}\n\n"
+        "> 最后更新：—　｜　最近 PR：—\n\n"
+        "## 一、仓库基本信息\n\n"
+        "## 二、变更记录（最新在上）\n\n"
+        "## 三、当前缺口（按模块）\n\n"
+        "## 四、长期约束\n"
+    )
+
+
 def _key_of(title: str) -> str | None:
     """标题 → 节键。按关键词判，``二、`` 这种节号不影响。"""
     bare = re.sub(r"^[一二三四五六七八九十百\d]+\s*[、.．]\s*", "", title).strip()

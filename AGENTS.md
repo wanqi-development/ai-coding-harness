@@ -34,7 +34,7 @@
   输出较多时会只回一句 conda 自己的 ERROR / 插件告警，把检查结果吞掉，别指望它稳定。）
   那套 venv（`D:\python-venv\ai_coding`）依赖也齐、且是把本项目 editable 装进去的，但它依赖的
   基座解释器曾经被删过一次；跑测试与跑代码默认仍走 conda。
-- **提示词自检**：`python scripts/check_prompts.py` —— 渲染八份成品提示词并扫跨形态冲突，
+- **提示词自检**：`python scripts/check_prompts.py` —— 渲染六份成品提示词并扫跨形态冲突，
   **必须是 0 条**。它零第三方依赖，任何 Python ≥3.11 都能跑。
 - **前端**：`npm --prefix frontend run build`（含 `vue-tsc`）。PowerShell 里 `npm.ps1` 可能被
   执行策略挡住，那就用 `npm.cmd --prefix frontend run build`。dev 在 5173、后端在 8000，
@@ -65,17 +65,17 @@
   （基本信息 2000 / 缺口 1500 / 长期约束 1500 / 全文 6000 字，变更记录只留最近 8 条）。
   **整篇覆盖写已经取消**；模型往「基本信息」塞本次改动会被白名单拒掉。
   平台维护文件头（最后更新 / 最近 PR）、PR 状态格，并摘掉老模板的两张表。
-  正文只在 **coding / review / analysis 的收尾**由主控写；`plan` 与三个子智能体都不写。
-  **注入按形态分档**（`memory_sections_for`）：qa / analysis 全文；coding / plan 主控与
-  planner / coder 只给「基本信息 + 当前缺口 + 长期约束」；review 主控与 reviewer 子智能体
+  正文只在 **coding / rework 的收尾**由主控写；`qa`、`plan` 与三个子智能体都不写。
+  **注入按形态分档**（`memory_sections_for`）：qa 全文；coding / plan 主控与
+  planner / coder 只给「基本信息 + 当前缺口 + 长期约束」；reviewer 子智能体
   **不注入**（`MemoryMiddleware(sections=())`，连读都不读）。
 - **拦截一律是代码拦，不是提示词**：`BoundaryMiddleware` 管「这个角色能用哪些工具、能写哪些
-  目录」，`MemoryMiddleware` 管「仓库还有 open PR 就拦下 plan / orchestrate」（review **不**拦：
-  它要审的那个 PR 本身就是 open 的），`LoopGuardMiddleware` 管空转。提示词只做前置劝阻。
+  目录」，`LoopGuardMiddleware` 管空转。PR 状态拦截在意图判定后由
+  `server/intent.gate_intent_for_state` 一次性完成；`MemoryMiddleware` 只加载 / 注入记忆。
 - **两份记忆模板必须逐字一致**：`docs/repo-memory-template.md` 与
   `sandbox/policies/repo-memory-template.md`（有测试钉着）。
 - **模型配置按智能体存库，而且没有「出厂默认」**（2026-10-15 用户口径：干掉 `.env` 那套回落）：
-  表 `model_endpoints`（键：qa / analysis / plan / review / coding / coder / unified / fallback /
+  表 `model_endpoints`（键：qa / plan / review / coding / coder / unified / fallback /
   jev / classifier / `intent_mode`，行清单一处定义在 `config.MODEL_AGENT_ROWS`）；**启动时**读进
   `Settings`（`api/app.py::apply_model_endpoints`），界面上保存 / 清空之后**当场再刷一次**
   （那个函数是**先清空再落**）。因为**主智能体每轮现建、不缓存**（`session/manager.py::get_agent`），
@@ -90,10 +90,17 @@
   但只有两行要配。映射在 `agent/llm._AGENT_KEY`（守卫测试逐个角色钉住；界面上的分组与
   「这一行服务哪些角色」由 `config.MODEL_AGENT_ROLES` / `CODING_GROUP` 下发，**前端不硬编码行名**），
   别再把三个子智能体都塞进 `coding`。
-- **意图识别是严格二选一**（2026-10-15 用户口径）：JEV / 大模型各自一行配置（JEV 那一行供应商
+- **意图识别是状态候选 + 严格二选一**（2026-10-22 用户口径）：先按仓库 open PR 状态收口候选
+  （无 open PR：qa / plan / coding；有 open PR：qa / rework；未知：qa），JEV / 大模型各自一行配置（JEV 那一行供应商
   锁死 `typesafe`），选了哪一侧就只走哪一侧 —— 没配齐 / 判不出来一律落**关键字口径**，
   **不互借**（`server/intent.detect_intent`）。JEV 的凭据也走界面（`typesafe_*` 由那一行灌入），
   `.env` 的 `TYPESAFE_*` / `INTENT_MODEL|BASE_URL|API_KEY` 全部作废。
+- **PR 列表每轮只查一次，不做接口缓存**（`server/repo_state.py`）：轮首查全量 PR，
+  同一份列表同时用于意图候选与仓库记忆同步。`server/repo_memory_sync.py` 按记忆里最新 PR
+  编号识别新增 PR，批量调用一次 `qa` 模型生成摘要；已有 PR 只更新与平台不一致的状态，
+  有差异就真实写回 StoreBackend。PR 查询失败时本轮只保留 qa。
+- **仓库记忆的 PR 同步只有两个入口**：轮首记忆拦截点，以及 coding / rework 轮末。
+  `save_repo_memory` 不再查 PR，只合并模型提交的正文与落盘。
 - **运行期配置是表 `app_settings`**（迁移 `e3f4a5b6c7d8`）：代码缓存路径 / 默认分支 / 上下文告警线
   与各家窗口。**键与类型只认 `config.RUNTIME_SETTINGS` 那一张表**，接口 `GET/PUT /app-settings`，
   写入后赋回 `Settings` 实例 → **改完立刻生效**（配合「agent 不缓存」）。新增可配项就在那张表里加一行，
@@ -158,8 +165,8 @@
   `message.reasoning` 或把思考固定渲染在正文上方（2026-10-19 用户口径）。
 - **不要常规剪裁**（2026-10-17 用户口径）：平时**不**按 40k 阈值剪；只有到达压缩线时，
   压缩中间件才做一次**应急裁剪**（`pretrim_tool_results`）。2026-10-19 起按角色分两档：
-  主控 `plan` / `review` 与子智能体 `planner` / `coder` / `reviewer` 走**爆发**（窗口 40%），
-  `qa` / `analysis` 与主控 `orchestrate`（coding / rework）走**稳态**（窗口 70%）。
+  主控 `plan` 与子智能体 `planner` / `coder` / `reviewer` 走**爆发**（窗口 40%），
+  `qa` 与主控 `orchestrate`（coding / rework）走**稳态**（窗口 70%）。
   **2026-10-20 起再叠一条绝对上限**：爆发 120k、稳态 200k，与比例线是 OR（先到先触发）——
   1M 窗口的 40% 是 40 万，真机一轮 131 次调用能涨到 194k 都不压。到压缩线的 90% 先注入
   `PRETRIM_NOTICE`，让模型写 `<working-note>` + `KEEP:` 清单；下一轮裁剪保留
@@ -207,28 +214,29 @@
   （`profile.subagents` + `SubAgentMiddleware`）；模型若说“没有 task”，先看日志里的
   `form=` 与实际 `task` 调用，不要直接怀疑形态映射。`IntentMiddleware` 只注入意图指令与
   澄清块，**不再注入时间**（记忆头行由平台写，散文日期让模型跑 `date`）。
-- **意图判定的两个锚点**（`server/intent.py` / `service._last_intent`）：默认值是
-  `coding`；判定输入带**上一轮判定** `previous_intent`（最近一条 assistant 记录的
-  `extra.intent`），JEV 与大模型两条路都看它。`analysis` 的裸「为什么」不覆盖
+- **意图判定的两个锚点**（`server/intent.py` / `service._last_intent`）：无状态限制时默认值是
+  `coding`，有 open PR 时状态候选会把默认兜底压到 `qa`；判定输入带**上一轮判定**
+  `previous_intent`（最近一条 assistant 记录的 `extra.intent`），JEV 与大模型两条路都看它。
+  `qa` 的裸「为什么」不覆盖
   「为什么不派 / 为什么没改」这类对上一轮动作的追问。
 - **意图上下文是最近两轮对话**（`dao.recent_dialogue` / `service._dialogue`）：用户消息
   **全文**，助手消息用 `head_tail_excerpt`（前 200 / 后 300 字）截断。语义口径：
-  `analysis` 管解释功能/用户疑问、刷新仓库记忆、**PR 已合并或已关闭之后的收尾动作**；
-  `qa` 只对已有数据问答（已有哪些功能/PR/文件内容）；**计划、方案、任务完成度一律 plan**；
+  `qa` 合并原 `analysis`，管已有数据问答、解释功能/用户疑问、排查原因与需求澄清；
+  **计划、方案、任务完成度一律 plan**；
   「继续 / 修正 / 纠正 / 重来」按未完成轮次沿用上一轮可执行意图。短追问（B/确认事实/
-  修复吧）不要因为 target 漂移换形态；明确「实施/执行方案」归 coding；「只想知道/不要做」
-  归 analysis。
+  修复吧）不要因为 target 漂移换形态；明确「实施/执行方案」无 open PR 时归 coding，
+  有 open PR 时归 rework；「只想知道/不要做」归 qa。
 - **会话 active task**（`service._active_tasks`）：只记最近一次**可执行**意图
-  （coding/rework/plan/review），analysis/qa 不覆盖；短追问/“继续”优先沿用它。PR 已合并/
-  已关闭后的 analysis 收尾、关闭/删除方案时清空。路由 JSON 解析失败重试一次。
+  （coding/rework/plan），qa 不覆盖；短追问/“继续”优先沿用它。PR 已合并/已关闭后的
+  收尾、关闭/删除方案时清空。路由 JSON 解析失败重试一次。
 - **低置信度转 qa 澄清**（`config.intent_clarify_confidence`，默认 **0.55**，0=关闭）：
   JEV/LLM 的 confidence 低于阈值时转 `qa` + `SOURCE_CLARIFY`，qa 用**提示词澄清模式**
   （先只读了解上下文、列 2~3 个按可能性排序的候选、最后只问一个问题），**不把
   `write_todos` 还给 qa**。`active_task_override` 命中时优先继续干活，不追问。
   阈值来自 200 条实测：JEV <0.55 的 16 条只对 43.8%，≥0.55 的 147 条对 91.2%。
 - **澄清是结构化弹窗，不是自由文本追问**（2026-10-19）：qa 仍可自由措辞，但必须输出
-  `<CLARIFY>` + JSON（`question` + 2~3 个 `{intent,label,description}`，intent 限
-  qa/analysis/plan/review/coding/rework）；后端解析后落表 `clarifications`（每会话最多一条）
+  `<CLARIFY>` + JSON（`question` + 2~3 个 `{intent,label,description}`，intent 还必须属于
+  本轮状态候选集）；后端解析后落表 `clarifications`（每会话最多一条）
   并发 SSE `clarification` 帧。**任何新的用户消息先让旧 pending 失效**；前端点候选项走
   `clarification_id + choice` 确定性映射、跳过意图模型，用**原始用户消息**执行；点“其他”
   或关掉弹窗后自由输入，才重新走意图识别。别把它做成“让模型自己理解第一个/第二个”。
