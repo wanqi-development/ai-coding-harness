@@ -271,7 +271,8 @@ const contextTitle = computed(() => {
   const ctx = latestContext.value
   if (!ctx) return ''
   const num = (n: number) => n.toLocaleString('en-US')
-  const parts = [`上下文已用 ${contextPercent.value}%（${num(ctx.max_input)} / ${num(ctx.window)}）`]
+  const used = ctx.input ?? ctx.max_input ?? 0
+  const parts = [`上下文已用 ${contextPercent.value}%（${num(used)} / ${num(ctx.window)}）`]
   if (ctx.ratio >= (ctx.alert_ratio ?? 0.8)) {
     parts.push('接近压缩线：下一条消息可能触发压缩，回复会变短')
   }

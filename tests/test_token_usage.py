@@ -448,8 +448,12 @@ async def test_the_round_streams_the_account_while_it_runs(monkeypatch) -> None:
     assert usages[-1]["model"], "每帧都带上模型名"
 
 
-def test_the_context_state_survives_across_rounds() -> None:
-    """峰值与压缩次数**跨轮累计**：压力问的是「这个会话涨到多大了」，逐轮算看不到。"""
+def test_the_context_state_keeps_the_latest_call_across_rounds() -> None:
+    """「最近值」与压缩次数**跨轮保留**（2026-10-20 用户口径）。
+
+    环图说的是「现在这条历史有多长」：本轮没有主控调用（这里只有一次摘要调用）时沿用
+    上一轮记下的值；一旦本轮有主控调用，就换成**那一次**的输入 —— 不是历史峰值。
+    """
     service = _service()
     session = _session()
 
@@ -462,11 +466,17 @@ def test_the_context_state_survives_across_rounds() -> None:
     usage = service._turn_usage(session, "coding", second)
 
     ctx = usage["context"]
-    assert ctx["max_input"] == 50000, "峰值跨轮保留（本轮只有 30000）"
+    assert ctx["input"] == 50000, "本轮没有主控调用：沿用上一轮的值"
     assert ctx["compressed"] == 1, "压缩次数跨轮累加"
     assert ctx["compressed_now"] is True
     assert ctx["window"] == WINDOW_GLM
     assert ctx["ratio"] == round(50000 / WINDOW_GLM, 3)
+
+    third = _log()
+    _feed(third).llm(_finish(inp=30000, outp=100))  # 本轮主控真的调了，且比上一轮小
+    assert service._turn_usage(session, "coding", third)["context"]["input"] == 30000, (
+        "取最近一次调用，不是历史峰值"
+    )
 
 
 def test_the_context_state_is_per_session() -> None:
@@ -479,7 +489,7 @@ def test_the_context_state_is_per_session() -> None:
     service._turn_usage(_session(), "coding", log)
     other = service._turn_usage(other_session, "coding", _log())
 
-    assert other["context"]["max_input"] == 0
+    assert other["context"]["input"] == 0
 
 
 def test_a_compressed_round_drops_the_pressure_back_down() -> None:
@@ -505,7 +515,7 @@ def test_a_compressed_round_drops_the_pressure_back_down() -> None:
     feed.llm(_finish(inp=int(window * 0.14), outp=100))  # 压缩之后主控的真实占用
     ctx = service._turn_usage(session, "coding", compressed)["context"]
 
-    assert ctx["max_input"] == int(window * 0.14), "水位跟着压缩掉下来"
+    assert ctx["input"] == int(window * 0.14), "水位跟着压缩掉下来"
     assert ctx["ratio"] < 0.6, "掉到 60% 以下，那条提示就不该再画"
     assert ctx["compressed"] == 1
     assert ctx["compressed_now"] is True
@@ -685,49 +695,82 @@ async def test_rounds_without_usage_are_reported_not_counted_as_zero(
     assert body["totals"]["total"] == 11
 
 
-async def test_the_endpoint_reports_the_tightest_context(
+async def test_the_endpoint_no_longer_carries_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """会话级的 context 取**最紧**的一档：峰值最大、窗口最小、压缩次数最多。
+    """上下文压力挪到输入框右边的环图（2026-10-20 用户口径）。
 
-    用户问的是「这个会话现在有多满」，报最松的那一轮等于粉饰；而换过形态就会换窗口
-    （coding 是 GLM 128k、review 是 Kimi 256k），所以三个极值不一定来自同一轮。
+    Token 面板只留 token 账；会话级那份「最小窗口 + 最大峰值」的聚合会把两个来自
+    不同轮次的数拼成一个假比例（实测 298277 / 128000 = 233%），所以整格删掉。
     """
     rows = [
         _record(
             usage={
                 "totals": {"input": 100, "output": 10},
                 "by_actor": {},
-                "context": {
-                    "max_input": 90000,
-                    "window": 256000,
-                    "ratio": 0.352,
-                    "compressed": 0,
-                },
+                "context": {"input": 90000, "window": 256000, "ratio": 0.352},
             }
-        ),
-        _record(
-            usage={
-                "totals": {"input": 100, "output": 10},
-                "by_actor": {},
-                "context": {
-                    "max_input": 105000,
-                    "window": 128000,
-                    "ratio": 0.82,
-                    "compressed": 2,
-                },
-            }
-        ),
+        )
     ]
 
     resp = await _get(f"/sessions/{SESSION}/usage", rows, monkeypatch)
 
-    ctx = resp.json()["context"]
-    assert ctx["max_input"] == 105000, "取峰值"
-    assert ctx["window"] == 128000, "取更紧的窗口"
-    assert ctx["compressed"] == 2
-    # ratio 由服务端按取到的极值重算，不抄某一轮那个（否则会出现 105000/256000 这种假比例）
-    assert ctx["ratio"] == round(105000 / 128000, 3)
+    assert "context" not in resp.json()
+
+
+async def test_the_endpoint_splits_the_main_actor_by_form(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """主控在事件流里只有一个名字，按形态拆要读每轮的 ``extra.intent``（2026-10-20）。
+
+    面板上 analysis / qa / plan / review 各占一行，coding 与 rework 并进同一组
+    （rework 不单列）；子智能体不进 ``by_form`` —— 它们本来就是独立的执行主角。
+    """
+    rows = [
+        _record(
+            extra={
+                "intent": "analysis",
+                "usage": _usage(
+                    inp=100,
+                    outp=10,
+                    by_actor={"main": {"input": 100, "output": 10, "calls": 1}},
+                ),
+            }
+        ),
+        _record(
+            extra={
+                "intent": "coding",
+                "usage": _usage(
+                    inp=300,
+                    outp=30,
+                    by_actor={
+                        "main": {"input": 100, "output": 10, "calls": 1},
+                        "coder": {"input": 200, "output": 20, "calls": 2},
+                    },
+                ),
+            }
+        ),
+        _record(
+            extra={
+                # 老记录里主控记在真名下：按形态拆之前也要先归一到 main
+                "intent": "rework",
+                "usage": _usage(
+                    inp=50,
+                    outp=5,
+                    by_actor={"ai-coding-harness": {"input": 50, "output": 5, "calls": 1}},
+                ),
+            }
+        ),
+    ]
+
+    body = (await _get(f"/sessions/{SESSION}/usage", rows, monkeypatch)).json()
+
+    assert set(body["by_form"]) == {"analysis", "coding", "rework"}
+    assert body["by_form"]["analysis"]["total"] == 110
+    assert body["by_form"]["coding"]["total"] == 110
+    assert body["by_form"]["rework"]["total"] == 55
+    # 子智能体不进形态那一格：coding 的 110 只含主控那一次
+    assert body["by_form"]["coding"]["calls"] == 1
 
 
 async def test_a_session_without_any_usage_returns_an_empty_snapshot(
@@ -788,7 +831,7 @@ class TestTurnCostLog:
                 "coder": {"input": 9},
                 "main": {"input": 3},
             },
-            "context": {"max_input": 8},
+            "context": {"input": 8},
         }
         with caplog.at_level(logging.INFO):
             HarnessService._log_turn_cost(
@@ -806,7 +849,7 @@ class TestTurnCostLog:
 
         assert "本轮成本" in caplog.text
         assert "输入 12" in caplog.text
-        assert "主控峰值上下文 8" in caplog.text
+        assert "主控最近上下文 8" in caplog.text
         assert "本轮 token 偏高" not in caplog.text
 
     def test_over_the_threshold_it_warns_and_names_the_top_actor(self, caplog):
