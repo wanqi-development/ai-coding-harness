@@ -118,6 +118,9 @@ class TurnState:
         self.rejudge = rejudge
         self._counts: dict[str, int] = {}
         self._handoffs = 0
+        #: 能力交接内层那一轮把用量交回来（runner 在拿到 ``AgentRunLog`` 后挂上）；
+        #: 没有它（单测 / 非服务路径）就只记日志、不并账。
+        self.usage_sink: Callable[[Mapping[str, Any]], None] | None = None
         #: 被守卫记下的中止（守卫抛出的那个异常对象本身）。service 层在流结束后再看一眼：
         #: 万一某层把异常吃成了 ToolMessage，这一轮也得落下来。
         self.aborted: TurnStop | None = None

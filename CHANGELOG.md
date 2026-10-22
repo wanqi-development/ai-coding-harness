@@ -23,6 +23,25 @@
 
 ## 修改记录
 
+### 2026-10-21
+
+#### 能力交接的内层不再「隐形」：日志与用量并回外层
+
+- **动机**：真机一轮 `handoffTask` 之后 8 分钟里日志一片空白、Token 面板也没有任何数字。
+  内层为了不把正文混进外层流，用 `ainvoke` + 摘掉 `var_child_runnable_config` 跑整轮 ——
+  代价是 LLM 调用、工具调用、耗时、用量全都看不到。
+- **改动**：
+  - `tools/handoff.py`：内层改用 `astream_events(version="v3")`，自己消费事件流，喂给一份
+    **带 `handoff ` 前缀**的 `AgentRunLog` —— 日志里能看到 `handoff LLM 调用完成` /
+    `handoff 工具调用 → …` 与耗时；**正文仍然不流给前端**（保持隔离）。
+  - 内层用量通过 `TurnState.usage_sink` 交回外层 `AgentRunLog.merge_usage`，轮末并进本轮
+    账；上下文压力（主控峰值/末值）不混入内层的窗口。
+  - 交接开始/结束各加一条 info（形态、线程、耗时、回正文长度）。
+  - `AgentRunLog` 增加 `prefix` 参数与 `merge_usage()`；`runner._run_agent` 挂上
+    `state.usage_sink`。
+- **验证**：`tests/test_handoff_tool.py` + `tests/test_run_logging.py` **61 passed**；
+  全量 `pytest` **1615 passed**；`ruff check` 干净。
+
 ### 2026-10-20
 
 #### 应急裁剪复发时强制摘要（同一轮 3 次）

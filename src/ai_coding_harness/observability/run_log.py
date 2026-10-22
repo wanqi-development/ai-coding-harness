@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ai_coding_harness.core.stream import (
@@ -214,6 +214,7 @@ class AgentRunLog:
         result_limit: int,
         delegation_result_limit: int | None = None,
         terms: Sequence[str] = (),
+        prefix: str = "",
     ) -> None:
         self._arg_limit = arg_limit
         self._result_limit = result_limit
@@ -225,6 +226,9 @@ class AgentRunLog:
         )
         # 本轮凭据词表：日志是四条出口里唯一「写下去就撤不回」的一条
         self._terms = tuple(terms)
+        #: 日志行前缀。默认空；能力交接的内层那一轮用 ``"handoff "`` —— 它跑在
+        #: 同名 logger 上，不加前缀就与外层完全混在一起，事后分不清是谁的调用。
+        self._prefix = prefix
         # namespace → 子智能体名（由 messages 事件的 lc_agent_name 登记，工具事件靠它反查）
         self._ns_agents: dict[tuple[str, ...], str] = {}
         # task 工具调用 id → 子智能体名（委派那两行日志的夹子）
@@ -287,9 +291,8 @@ class AgentRunLog:
             return self._named(event) or MAIN_AGENT
         return self._ns_agents.get(namespace_of(event)) or MAIN_AGENT
 
-    @staticmethod
-    def _log(actor: str, message: str, *args: Any) -> None:
-        logger.info(message, *args, extra={"agent": actor})
+    def _log(self, actor: str, message: str, *args: Any) -> None:
+        logger.info(f"{self._prefix}{message}", *args, extra={"agent": actor})
 
     # -- 记账 --------------------------------------------------------------
     def _accumulate(self, actor: str, numbers: tuple[int, int] | None) -> None:
@@ -312,6 +315,25 @@ class AgentRunLog:
         if key == MAIN_ACTOR:
             self._main_peak_input = max(self._main_peak_input, numbers[0])
             self._main_last_input = numbers[0]
+
+    def merge_usage(self, snapshot: Mapping[str, Any]) -> None:
+        """把**另一份账**并进本轮（能力交接的内层那一轮用）。
+
+        内层跑在派生线程、事件流被摘掉，它自己的 ``AgentRunLog`` 记的账不会经过外层；
+        交接工具在收尾时把那份快照交回来，这里按主角累加。上下文压力（主控峰值/末值）
+        **不动** —— 内层有自己的窗口，混进来会把环图推错。
+        """
+        by_actor = snapshot.get("by_actor") if isinstance(snapshot, Mapping) else None
+        if isinstance(by_actor, Mapping):
+            for actor, row in by_actor.items():
+                if not isinstance(row, Mapping):
+                    continue
+                lines = self._usage.setdefault(account_key(str(actor)), [0, 0, 0])
+                lines[0] += int(row.get("input", 0) or 0)
+                lines[1] += int(row.get("output", 0) or 0)
+                lines[2] += int(row.get("calls", 0) or 0)
+        if isinstance(snapshot, Mapping):
+            self._usage_missing += int(snapshot.get("missing", 0) or 0)
 
     # -- 产出明细（「这次调用为什么慢」） ----------------------------------
     def _note_delta(self, event: dict) -> None:

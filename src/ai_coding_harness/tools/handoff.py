@@ -42,6 +42,8 @@ from langchain_core.tools import BaseTool, tool
 
 from ai_coding_harness.agent.middleware import TurnState
 from ai_coding_harness.agent.profiles import profile_for
+from ai_coding_harness.core.stream import ToolNames, event_name, method_of
+from ai_coding_harness.observability.run_log import AgentRunLog
 from ai_coding_harness.server.intent import SOURCE_LLM
 from ai_coding_harness.tools.context import get_configurable, get_redact_terms
 
@@ -204,14 +206,54 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
         # ContextVar 把回调管理器传给子 run，而 ``ensure_config`` 对 callbacks 只叠加、
         # 不改写（显式传 ``callbacks=[]`` 无效 —— 空列表被忽略）。不断开的话，内层模型
         # 的事件会带着**空 namespace** 混进外层 v3 流，被 ``V3Translator`` 当成外层
-        # 自己的正文下发并落库。代价是内层这一轮不进 agent.log（日志由外层事件流驱动），
-        # 下面那条 info 与用户看到的工具卡足够定位。
+        # 自己的正文下发并落库。
+        #
+        # 但「不混进外层流」不等于「什么日志都没有」：这里自己消费内层的 v3 事件流，
+        # 用一份**带 ``handoff `` 前缀**的 AgentRunLog 记 LLM / 工具调用与耗时，并把
+        # 用量交回外层（``state.usage_sink``）。正文仍然不往下发 —— 用户看到的是
+        # handoff 工具卡 + 外层最后的回报。
         token = var_child_runnable_config.set({})
         started = time.monotonic()
+        run_log = AgentRunLog(
+            arg_limit=ctx.settings.log_tool_arg_max,
+            result_limit=ctx.settings.log_tool_result_max,
+            delegation_result_limit=ctx.settings.log_delegation_result_max,
+            terms=get_redact_terms(),
+            prefix="handoff ",
+        )
+        logger.info(
+            "能力交接开始：public_id=%s %s→%s 线程=%s",
+            ctx.session.public_id,
+            ctx.form,
+            decision.intent,
+            thread,
+        )
+        result: Any = None
         try:
-            result = await inner.ainvoke(payload, config=config)
+            streamer = getattr(inner, "astream_events", None)
+            if streamer is None:
+                # 单测 / 脚本里的假 agent 可能只有 ainvoke：退回旧路径，日志与账就不记。
+                result = await inner.ainvoke(payload, config=config)
+            else:
+                stream = await streamer(payload, config=config, version="v3")
+                names = ToolNames()
+                async for event in stream:
+                    method = method_of(event)
+                    if method == "messages":
+                        run_log.on_message(event)
+                    elif method == "tools":
+                        kind = event_name(event)
+                        if kind == "tool-started":
+                            run_log.on_tool_start(event, names.remember(event))
+                        elif kind == "tool-finished":
+                            run_log.on_tool_end(event, names.resolve(event))
+                snapshot = await inner.aget_state(config)
+                result = snapshot.values
         finally:
             var_child_runnable_config.reset(token)
+            usage = run_log.usage_snapshot()
+            if state.usage_sink is not None:
+                state.usage_sink(usage)
         body = final_text(result)
         logger.info(
             "能力交接：public_id=%s %s→%s 线程=%s 用时=%.1fs 回正文 %d 字",
