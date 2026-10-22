@@ -653,14 +653,14 @@ class TestPreSummaryTrim:
         texts = [r.getMessage() for r in _pretrim_logs(caplog)]
         assert "应急裁剪计数 4/3，强制摘要" in texts[-1]
 
-    async def test_it_compresses_when_the_trim_only_barely_gets_under_the_line(
+    async def test_it_compresses_when_the_trim_stays_above_the_safe_zone(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        """只压到线边（>80%）不算免压：原历史还在，下一次会原样重剪。
+        """只压到安全区外（>70%）不算免压：原历史还在，下一次会原样重剪。
 
         2026-10-20 真机：coder 每次 121~135k 剪到 103~117k，刚好低于 120k 的线，
         于是一轮 38 次原地裁剪、一次摘要都没有。这里用 3000 字当前步骤造同样的形状：
-        低于 2000 的线、但高于 80%（1600）。
+        低于 2000 的线、但高于 70%（1400）。
         """
         middleware = self._middleware()
         history = _tool_steps(1) + _current_step(chars=2_600)
@@ -692,7 +692,7 @@ class TestPreSummaryTrim:
             await middleware.awrap_model_call(_request(history), _ok_handler)
 
         (record,) = _pretrim_logs(caplog)
-        assert "仅勉强低于压缩线（>80%），继续压缩" in record.getMessage()
+        assert "仅勉强低于压缩线（>70%），继续压缩" in record.getMessage()
         assert _summary_logs(caplog), "勉强压到线边时必须真的摘要"
 
     async def test_it_compresses_from_the_untrimmed_baseline_when_the_trim_is_not_enough(
@@ -980,7 +980,7 @@ class TestTheWorkingNoteNotice:
             _model(window=None),
             _backend(),
             _settings(
-                context_summary_trigger_tokens=4_000,
+                context_summary_trigger_tokens=5_000,
                 context_summary_keep_tokens=100,
                 context_pretrim_notice_ratio=0.0,
             ),

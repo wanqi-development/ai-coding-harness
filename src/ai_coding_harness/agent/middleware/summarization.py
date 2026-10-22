@@ -21,7 +21,7 @@
 
 4. **压缩前先剪工具**（2026-10-17，2026-10-19 加工作笔记）：到线后先做一次应急裁剪，
    保留「当前这一步」以及模型在 90% 提醒后写下的 ``KEEP:`` 清单点名的工具返回；
-   **剪完只有落到触发线的 80% 以下才免压**（裁剪只改请求副本，勉强压到线边会让原历史
+   **剪完只有落到触发线的 70% 以下才免压**（裁剪只改请求副本，勉强压到线边会让原历史
    在下次调用再剪一遍，2026-10-20 真机 38 次原地裁剪）；否则继续压。供应商自报的
    上一轮用量只用来触发节点，剪完后按估算值决定；估算偏小导致真实调用溢出时，回退压缩兜底。
 
@@ -77,6 +77,8 @@ SUMMARY_LOG_TAG = "CONTEXT_SUMMARY"
 
 #: 查「压缩前应急裁剪」走这个关键字：grep CONTEXT_PRETRIM logs/agent.log
 PRETRIM_LOG_TAG = "CONTEXT_PRETRIM"
+#: 应急裁剪后只有落到触发线以内这个比例才算安全，避免下一轮继续原地重剪。
+PRETRIM_SAFE_RATIO = 0.7
 #: 「摘要成功后计数清零」单独一个前缀 —— 它不属于一次裁剪，别混进 ``grep CONTEXT_PRETRIM``
 #: 的统计里（否则「这一轮剪了几次」会被多算一倍）。
 PRETRIM_RESET_LOG_TAG = "CONTEXT_TRIM_RESET"
@@ -274,8 +276,11 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                 )
                 still_over = self._should_summarize_estimate(pretrimmed, after)
                 # 裁剪只改这一次请求：原历史仍在 checkpoint 里。若只是勉强压到线边，
-                # 下一次调用会原样再剪一遍，所以只有落到安全区（≤80% 线）才免压。
-                safe = not self._trigger_at or after <= self._trigger_at * 0.8
+                # 下一次调用会原样再剪一遍，所以只有落到安全区（≤70% 线）才免压。
+                safe = (
+                    not self._trigger_at
+                    or after <= self._trigger_at * PRETRIM_SAFE_RATIO
+                )
                 forced = (
                     self._forced_after > 0 and self._pretrim_count >= self._forced_after
                 )
@@ -433,7 +438,9 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                 else (
                     "已低于压缩线且落在安全区，本轮不压缩"
                     if safe
-                    else "仅勉强低于压缩线（>80%），继续压缩"
+                    else (
+                        f"仅勉强低于压缩线（>{PRETRIM_SAFE_RATIO:.0%}），继续压缩"
+                    )
                 )
             ),
             (
