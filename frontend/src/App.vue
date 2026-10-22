@@ -22,8 +22,6 @@ import {
   type UsageContext,
   type UsageDetail,
   type ChangesInfo,
-  type FileChange,
-  getRepoDiff,
   type WorkspaceStatus,
 } from './lib/api'
 import { renderMarkdown } from './lib/markdown'
@@ -32,6 +30,7 @@ import LogPanel from './components/panels/LogPanel.vue'
 import PrPanel from './components/panels/PrPanel.vue'
 import UsagePanel from './components/panels/UsagePanel.vue'
 import RepoPanel from './components/panels/RepoPanel.vue'
+import ChangesPanel from './components/panels/ChangesPanel.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
 import ClarificationDialog from './components/ClarificationDialog.vue'
 import { defaultPanelTab } from './lib/prefs'
@@ -116,11 +115,19 @@ function toggleUsage(index: number) {
   usageOpen.value[index] = !usageOpen.value[index]
 }
 
-/** 「这一轮改了什么」的展开状态，同样按**绝对**下标记（与 token 明细一个口径）。 */
-const changesOpen = ref<Record<number, boolean>>({})
+/**
+ * 右栏里的「本轮改动」内嵌页：`null` ＝ 没开；有值 ＝ 盖在当前标签页上。
+ * 再点同一个角标会关掉它（返回原来的标签）。
+ */
+const changesPage = ref<ChangesInfo | null>(null)
 
-function toggleChanges(index: number) {
-  changesOpen.value[index] = !changesOpen.value[index]
+function openChanges(info: ChangesInfo) {
+  if (changesPage.value === info && !panelCollapsed.value) {
+    changesPage.value = null
+    return
+  }
+  changesPage.value = info
+  panelCollapsed.value = false
 }
 
 const REASONING_AGENT_LABEL: Record<string, string> = {
@@ -166,44 +173,6 @@ function changesSummary(info: ChangesInfo): string {
   return `改动 ${files} 个文件 · +${added} −${deleted}`
 }
 
-/** 状态码 → 一个字母（界面上那一位要窄）：新增 / 改 / 删 / 改名 / 其它。 */
-function changeMark(status: string): string {
-  const head = status.charAt(0).toUpperCase()
-  return { A: 'A', M: 'M', D: 'D', R: 'R' }[head] ?? head
-}
-
-/** 点一个文件：没加载过就现拉一次（服务端在本地缓存里算 + 脱敏 + 截断）。 */
-async function loadDiff(msg: Message, file: FileChange) {
-  if (file.diff !== undefined || file.diffState === '加载中…') return
-  const info = msg.changes
-  if (!info || !currentId.value) return
-  file.diffState = '加载中…'
-  try {
-    const result = await getRepoDiff(currentId.value, info.base, info.head, file.path)
-    file.diff = result.text
-    file.diffTruncated = result.truncated
-    file.diffState = ''
-  } catch (e: any) {
-    file.diffState = `读不到：${e?.message ?? e}`
-  }
-}
-
-/**
- * diff 正文按行拆开，好给 +/- 上色。
- *
- * 只做「加/删/位置/元信息」四类，不做行号也不做语法高亮 —— 这一块是**看改动**，
- * 不是编辑器；真要看代码上下文的去看右栏的代码面板。
- */
-function diffLines(text: string): { text: string; kind: string }[] {
-  return text.split('\n').map((line) => {
-    if (line.startsWith('+++') || line.startsWith('---')) return { text: line, kind: 'meta' }
-    if (line.startsWith('+')) return { text: line, kind: 'add' }
-    if (line.startsWith('-')) return { text: line, kind: 'del' }
-    if (line.startsWith('@@')) return { text: line, kind: 'hunk' }
-    if (line.startsWith('diff ') || line.startsWith('index ')) return { text: line, kind: 'meta' }
-    return { text: line, kind: 'ctx' }
-  })
-}
 
 /**
  * 这一轮跑了多久：`working… 12s` 的依据。
@@ -1154,8 +1123,21 @@ const panelTabs = computed<
   { key: 'usage', label: 'Token' },
 ])
 
-/** 点竖标签：切过去并展开（收起状态下点一下就展开到那个标签）。 */
+/**
+ * 点竖标签：切过去并展开；**再点当前标签＝收起**（2026-10-21 用户口径）。
+ * 「本轮改动」内嵌页开着时，点任意标签先关掉那一页、再切过去。
+ */
 function selectTab(tab: 'code' | 'memory' | 'pulls' | 'logs' | 'usage') {
+  if (changesPage.value) {
+    changesPage.value = null
+    rightTab.value = tab
+    panelCollapsed.value = false
+    return
+  }
+  if (tab === rightTab.value && !panelCollapsed.value) {
+    panelCollapsed.value = true
+    return
+  }
   rightTab.value = tab
   panelCollapsed.value = false
 }
@@ -1874,38 +1856,16 @@ onUnmounted(() => {
           <div
             v-if="m.changes"
             class="msg-changes"
-            :class="{ open: changesOpen[hiddenCount + i] }"
+            :class="{ open: changesPage === m.changes }"
           >
             <button
               class="msg-changes-badge"
-              :title="changesOpen[hiddenCount + i] ? '收起改动' : '展开改动'"
-              @click="toggleChanges(hiddenCount + i)"
+              :title="changesPage === m.changes ? '收起改动' : '在右侧查看本轮改动'"
+              @click="openChanges(m.changes)"
             >
               <span class="msg-changes-dot"></span>
               {{ changesSummary(m.changes) }}
             </button>
-            <ul v-if="changesOpen[hiddenCount + i]" class="msg-changes-list">
-              <li v-for="file in m.changes.files" :key="file.path" class="msg-change">
-                <button class="msg-change-head" @click="loadDiff(m, file)">
-                  <span class="msg-change-mark" :data-status="changeMark(file.status)">
-                    {{ changeMark(file.status) }}
-                  </span>
-                  <span class="msg-change-path">{{ file.path }}</span>
-                  <span class="msg-change-count">+{{ file.added }} −{{ file.deleted }}</span>
-                </button>
-                <p v-if="file.diffState" class="msg-change-note">{{ file.diffState }}</p>
-                <template v-else-if="file.diff !== undefined">
-                  <pre class="msg-change-diff"><span
-                    v-for="(line, li) in diffLines(file.diff)"
-                    :key="li"
-                    :class="`d-${line.kind}`"
-                  >{{ line.text + '\n' }}</span></pre>
-                  <p v-if="file.diffTruncated" class="msg-change-note">
-                    改动太长，只显示前一段
-                  </p>
-                </template>
-              </li>
-            </ul>
           </div>
           <div
             v-if="showUsage && m.role === 'assistant' && m.usage"
@@ -2146,9 +2106,19 @@ onUnmounted(() => {
 
       <div v-if="!panelCollapsed" class="panel-body">
 
-        <!-- 计划：有方案才渲染 -->
+        <!-- 本轮改动：从聊天流的角标点进来的内嵌页（盖在当前标签上，不占竖标签） -->
+        <ChangesPanel
+          v-if="changesPage"
+          :session-id="currentId"
+          :changes="changesPage"
+          @close="changesPage = null"
+        />
         <!-- 代码：本机那份只读缓存（与沙箱无关）。方案不再是标签 —— 它进了聊天流 -->
-        <RepoPanel v-if="activeTab === 'code'" :session-id="currentId" :target="codeTarget" />
+        <RepoPanel
+          v-else-if="activeTab === 'code'"
+          :session-id="currentId"
+          :target="codeTarget"
+        />
         <!-- 记忆：StoreBackend 上那份仓库记忆（只读；正文由 coding / review 收尾写） -->
         <MemoryPanel v-else-if="activeTab === 'memory'" :session-id="currentId" />
         <!-- PR：本仓库的 PR 列表（查不到会显示成错误，不是空列表） -->
