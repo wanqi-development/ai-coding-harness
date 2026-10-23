@@ -21,6 +21,7 @@ from ai_coding_harness.core.stream import (
     V3Translator,
     call_id_of,
     event_name,
+    last_ai_text,
     method_of,
     payload_of,
     subagent_name,
@@ -537,6 +538,24 @@ class TurnRunnerMixin:
             # 模型没按协议输出 / 落库失败：把攒着的文本补发，用户至少能看到回答。
             if clarification_frame is None and text:
                 yield {"type": "ai", "content": text}
+
+        if not text and clarification_frame is None:
+            # 流事件只带模型原始 delta；中间件在 handler 返回后补的正文（例如
+            # invalid tool call 的降级说明）没有对应 delta。正常结束后从最终
+            # state 补发一次，避免“模型明明回复了，前端却是 0 字”。
+            get_state = getattr(agent, "aget_state", None)
+            if callable(get_state):
+                try:
+                    snapshot = await get_state(config)
+                    final_messages = snapshot.values.get("messages") or []
+                except Exception:
+                    logger.warning("读取最终消息失败，跳过正文兜底", exc_info=True)
+                else:
+                    final_text = redact(last_ai_text(final_messages).strip(), terms)
+                    if final_text:
+                        text += final_text
+                        translator.parts.add_text(final_text)
+                        yield {"type": "ai", "content": final_text}
 
         logger.info(
             "智能体完成：public_id=%s intent=%s LLM %d 次 / 工具 %d 次 / 输出 %d 字",

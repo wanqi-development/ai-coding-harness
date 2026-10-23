@@ -49,6 +49,7 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     RemoveMessage,
+    SystemMessage,
     ToolMessage,
 )
 from langgraph.errors import GraphBubbleUp
@@ -69,6 +70,9 @@ TOOL_CALL = "tool_call"
 #: 异常正文写进日志的字符上限：够放一句上游的错误原文，又不至于把整段 traceback 灌进
 #: agent.log。**给模型的那条响应不截断** —— 它要照着这句话决定下一步。
 _ERROR_LOG_LIMIT = 500
+
+#: invalid tool call 在模型出口最多重试几次。重试仍失败才降级为普通文本。
+MAX_INVALID_TOOL_RETRIES = 3
 
 
 def _clip(text: str) -> str:
@@ -276,6 +280,48 @@ def _normalize_response(response: Any) -> Any:
     return _normalized_ids(response)
 
 
+def _response_messages(response: Any) -> list[Any]:
+    """把三种模型响应形态统一成消息列表。"""
+    if isinstance(response, ExtendedModelResponse):
+        return _response_messages(response.model_response)
+    if isinstance(response, ModelResponse):
+        return list(response.result)
+    return [response]
+
+
+def _invalid_calls(response: Any) -> list[dict[str, Any]]:
+    """取这次响应里所有无法执行的工具调用。"""
+    invalid: list[dict[str, Any]] = []
+    for message in _response_messages(response):
+        if not isinstance(message, AIMessage):
+            continue
+        invalid.extend(
+            call for call in _calls_of(message) if call.get("type") == INVALID
+        )
+    return invalid
+
+
+def _retry_request(
+    request: ModelRequest,
+    invalid: Sequence[dict[str, Any]],
+) -> ModelRequest:
+    """把失败原因作为本轮附加约束，让模型重新生成完整调用。"""
+    details = "；".join(
+        f"{call.get('name') or 'unknown'}: "
+        f"{call.get('error') or '工具参数 JSON 不完整'}"
+        for call in invalid
+    )
+    notice = (
+        "## 工具调用修复\n"
+        f"上一次响应的工具调用无法解析：{details}。\n"
+        "请重新生成完整、合法的工具调用 JSON。不要依赖半截 JSON；"
+        "如果参数太长，先拆分任务或缩短正文，不要再次输出 invalid_tool_call。"
+    )
+    base = request.system_message.text if request.system_message else ""
+    text = f"{base}\n\n{notice}" if base else notice
+    return request.override(system_message=SystemMessage(content=text))
+
+
 class ToolCallIdMiddleware(AgentMiddleware):
     """模型出口就把空 id 的 tool_call 补成真 id。
 
@@ -284,12 +330,32 @@ class ToolCallIdMiddleware(AgentMiddleware):
     中间那一轮的空 id 配对虽然实测能过 provider，但等于把坏数据留在历史里。
     """
 
+    def __init__(self, *, max_invalid_retries: int = MAX_INVALID_TOOL_RETRIES) -> None:
+        self._max_invalid_retries = max(0, int(max_invalid_retries))
+
     async def awrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse | ExtendedModelResponse:
-        return _normalize_response(await handler(request))
+        response = await handler(request)
+        invalid = _invalid_calls(response)
+        retries = 0
+        while invalid and retries < self._max_invalid_retries:
+            retries += 1
+            logger.warning(
+                "工具调用参数无效，重试模型 %d/%d：%s",
+                retries,
+                self._max_invalid_retries,
+                "；".join(
+                    f"{call.get('name') or 'unknown'}: "
+                    f"{call.get('error') or 'JSON 不完整'}"
+                    for call in invalid
+                ),
+            )
+            response = await handler(_retry_request(request, invalid))
+            invalid = _invalid_calls(response)
+        return _normalize_response(response)
 
 
 class ToolErrorGuardMiddleware(AgentMiddleware):

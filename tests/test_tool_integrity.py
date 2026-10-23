@@ -42,7 +42,10 @@ from ai_coding_harness.agent.middleware import (
     ToolCallIdMiddleware,
     ToolErrorGuardMiddleware,
 )
-from ai_coding_harness.agent.middleware.tool_integrity import repair_messages
+from ai_coding_harness.agent.middleware.tool_integrity import (
+    MAX_INVALID_TOOL_RETRIES,
+    repair_messages,
+)
 from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM
 from ai_coding_harness.agent.subagents import build_subagents
 from ai_coding_harness.safety.policy import policy_for
@@ -396,6 +399,57 @@ class TestToolCallId:
         assert message.tool_calls == []
         assert "[工具调用未执行]" in message.content
         assert "JSONDecodeError" in message.content
+
+    async def test_invalid_call_retries_until_the_model_recovers(self):
+        invalid = AIMessage(
+            content=[
+                {
+                    "type": "invalid_tool_call",
+                    "name": "save_repo_memory",
+                    "args": '{"payload":',
+                    "error": "Failed to parse tool call arguments as JSON",
+                }
+            ]
+        )
+        valid = AIMessage(content="已重新生成合法调用")
+        responses = iter([ModelResponse(result=[invalid]), ModelResponse(result=[valid])])
+        systems: list[str] = []
+
+        async def handler(request: ModelRequest) -> ModelResponse:
+            systems.append(request.system_message.text if request.system_message else "")
+            return next(responses)
+
+        out = await ToolCallIdMiddleware().awrap_model_call(_model_request(), handler)
+
+        assert len(systems) == 2
+        assert "工具调用修复" in systems[1]
+        assert "save_repo_memory" in systems[1]
+        assert out.result[0].content == "已重新生成合法调用"
+
+    async def test_invalid_retry_is_bounded_to_three_then_downcasts(self):
+        invalid = AIMessage(
+            content=[
+                {
+                    "type": "invalid_tool_call",
+                    "name": "save_repo_memory",
+                    "args": '{"payload":',
+                    "error": "JSON 不完整",
+                }
+            ]
+        )
+        calls = 0
+
+        async def handler(_request: ModelRequest) -> ModelResponse:
+            nonlocal calls
+            calls += 1
+            return ModelResponse(result=[invalid.model_copy(deep=True)])
+
+        out = await ToolCallIdMiddleware().awrap_model_call(_model_request(), handler)
+
+        assert calls == 1 + MAX_INVALID_TOOL_RETRIES
+        message = out.result[0]
+        assert message.invalid_tool_calls == []
+        assert "[工具调用未执行]" in str(message.content)
 
     async def test_real_ids_are_returned_as_is(self):
         """没命中就别造新对象：状态无谓更新会连带下游一堆重算。"""

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 # deepagents 内置的待办工具
@@ -89,6 +90,44 @@ def metadata_of(event: dict) -> dict:
     if isinstance(data, tuple) and len(data) > 1 and isinstance(data[1], dict):
         return data[1]
     return {}
+
+
+def text_of_content(content: Any) -> str:
+    """取普通正文，忽略 reasoning / tool call 等非正文块。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
+def last_ai_text(messages: Sequence[Any]) -> str:
+    """取最后一条带正文的 AI 消息；没有就返回空串。"""
+    for message in reversed(messages):
+        message_type = (
+            message.get("type")
+            if isinstance(message, Mapping)
+            else getattr(message, "type", "")
+        )
+        if message_type != "ai":
+            continue
+        content = (
+            message.get("content")
+            if isinstance(message, Mapping)
+            else getattr(message, "content", None)
+        )
+        text = text_of_content(content)
+        if text.strip():
+            return text
+    return ""
 
 
 def is_internal_call(event: dict) -> bool:
