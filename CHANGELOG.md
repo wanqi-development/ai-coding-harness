@@ -23,6 +23,29 @@
 
 ## 修改记录
 
+### 2026-10-23
+
+#### 修复 invalid tool call 污染 checkpoint 后所有 provider 400
+
+- **动机**：2026-10-23 11:47:13 的 QA 轮次报
+  `message at position 408 with role 'assistant' contains an invalid part type:
+  invalid_tool_call`；主模型 422、兜底模型同样 400。根因是历史修复只补 ID 与配对，
+  却把 `AIMessage.invalid_tool_calls` 原样留在 checkpoint，LangChain 再把它序列化成
+  OpenAI-compatible 网关不接受的内容块。
+- **改动**：
+  - `agent/middleware/tool_integrity.py`：invalid call 降级成普通文本说明
+    `[工具调用未执行] ...`，并清空 `invalid_tool_calls`。
+  - 模型出口与 `HistoryRepairMiddleware` 历史整表修复共用同一重建逻辑。
+  - 不再为 invalid call 伪造 `ToolMessage`；旧版本已经生成过的伪响应会被删除。
+  - 同一条 AI 消息里的正常 `tool_calls` 与对应响应保持不变。
+  - README、AGENTS 同步记录 provider 兼容边界。
+- **关键决策**：保留“哪个工具、为什么没执行”的可读信息，但不保留 provider 无法序列化
+  的 `invalid_tool_call` part；原始诊断文本进入普通 assistant content。
+- **验证**：`tests/test_tool_integrity.py` **31 passed**；全量 `pytest`
+  **1288 passed, 2 warnings**；ruff 与 `git diff --check` 干净。
+- **遗留**：运行中的后端必须重启后才会加载新中间件；现有坏 checkpoint 会在下一次
+  `HistoryRepairMiddleware.abefore_agent` 时自动整表修复。
+
 ### 2026-10-22
 
 #### 工具裁剪改为持久化事件投影：大内容才裁、原始 checkpoint 不动

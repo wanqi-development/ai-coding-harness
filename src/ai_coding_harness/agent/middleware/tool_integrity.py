@@ -19,8 +19,8 @@ provider 对历史的要求是「带 tool_calls 的 assistant 消息后面必须
    一个字节都不写。
 
 三个钩子各堵一头，缺一不可：``ToolCallIdMiddleware`` 在模型出口就把空 id 换成真 id，
-``ToolErrorGuardMiddleware`` 把工具异常变成 tool 响应，``HistoryRepairMiddleware`` 把
-已经坏掉的历史整表修好。
+并把无法序列化的 invalid call 降级成普通文本；``ToolErrorGuardMiddleware`` 把工具异常
+变成 tool 响应；``HistoryRepairMiddleware`` 把已经坏掉的历史整表修好。
 
 **为什么是整表重写**：孤儿可能落在历史**中间**（后面还有人类消息），而往图输入里追加消息
 只能加在末尾，够不着；能改中间位置的只有 ``RemoveMessage(REMOVE_ALL_MESSAGES)`` + 全量
@@ -94,21 +94,36 @@ def _calls_of(message: AIMessage) -> list[dict[str, Any]]:
 
 
 def _rebuild(message: AIMessage, calls: list[dict[str, Any]]) -> AIMessage:
-    """按改过的调用重建这条消息，两个字段各归各位。"""
+    """按改过的调用重建消息；invalid call 降级为正文，不再进入 provider payload。"""
+    invalid = [call for call in calls if call.get("type") == INVALID]
+    content = message.content
+    if invalid:
+        note = "\n".join(_invalid_note(call) for call in invalid)
+        if isinstance(content, str):
+            content = f"{content}\n\n{note}".strip()
+        elif isinstance(content, list):
+            content = [*content, {"type": "text", "text": f"\n\n{note}"}]
+        else:
+            content = f"{content}\n\n{note}"
     return message.model_copy(
         update={
             "tool_calls": [call for call in calls if call.get("type") != INVALID],
-            "invalid_tool_calls": [
-                call for call in calls if call.get("type") == INVALID
-            ],
+            "invalid_tool_calls": [],
+            "content": content,
         }
     )
 
 
+def _invalid_note(call: dict[str, Any]) -> str:
+    """把坏调用变成模型和用户都能看懂、provider 也能接受的一行文本。"""
+    name = call.get("name") or "unknown"
+    error = str(call.get("error") or "").strip()
+    suffix = f"：{error}" if error else ""
+    return f"[工具调用未执行] {name} 参数不完整或格式错误{suffix}"
+
+
 def _unexecuted_note(call: dict[str, Any]) -> str:
     name = call.get("name") or "unknown"
-    if call.get("type") == INVALID:
-        return f"工具 {name} 未执行：调用参数不完整或格式不对。"
     return f"工具 {name} 未执行：上一轮在它返回结果之前就中断了。"
 
 
@@ -129,11 +144,19 @@ def repair_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage] | None
     total = len(messages)
     patched: list[BaseMessage] = []
     changed = False
+    discard_tool_ids: set[str] = set()
     index = 0
 
     while index < total:
         message = messages[index]
         if not isinstance(message, AIMessage):
+            if (
+                isinstance(message, ToolMessage)
+                and message.tool_call_id in discard_tool_ids
+            ):
+                changed = True
+                index += 1
+                continue
             patched.append(message)
             index += 1
             continue
@@ -148,28 +171,48 @@ def repair_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage] | None
         for call in blank:
             call["id"] = _new_call_id()
             dirty = True
+        invalid_ids = {
+            call["id"] for call in calls if call.get("type") == INVALID
+        }
+        if invalid_ids:
+            dirty = True
+            discard_tool_ids.update(invalid_ids)
 
         # 紧跟其后的那一串响应（provider 也要求这一串紧挨着 AI 消息）
         stop = index + 1
         while stop < total and isinstance(messages[stop], ToolMessage):
             stop += 1
 
-        queue = list(blank)
+        queue = [call for call in blank if call.get("type") != INVALID]
         responses: list[BaseMessage] = []
         for response in messages[index + 1 : stop]:
+            if (
+                isinstance(response, ToolMessage)
+                and response.tool_call_id in invalid_ids
+            ):
+                dirty = True
+                continue
             if not response.tool_call_id and queue:
                 response = response.model_copy(
                     update={"tool_call_id": queue.pop(0)["id"]}
                 )
                 dirty = True
+            elif not response.tool_call_id and invalid_ids:
+                dirty = True
+                continue
             responses.append(response)
 
         answered = {
             response.tool_call_id
             for response in (*responses, *messages[index + 1 :])
             if isinstance(response, ToolMessage) and response.tool_call_id
+            and response.tool_call_id not in discard_tool_ids
         }
-        pending = [call for call in calls if call["id"] not in answered]
+        pending = [
+            call
+            for call in calls
+            if call.get("type") != INVALID and call["id"] not in answered
+        ]
 
         patched.append(_rebuild(message, calls) if dirty else message)
         for call in pending:
@@ -189,11 +232,14 @@ def repair_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage] | None
 
 
 def _normalized_ids(message: Any) -> Any:
-    """模型刚吐出来的响应：把空 id 换成真 id。非 AI 消息原样返回。"""
+    """模型刚吐出来的响应：补空 id，并把 invalid call 降级为普通正文。"""
     if not isinstance(message, AIMessage):
         return message
     calls = _calls_of(message)
-    if not calls or all(call.get("id") for call in calls):
+    if not calls:
+        return message
+    has_invalid = any(call.get("type") == INVALID for call in calls)
+    if not has_invalid and all(call.get("id") for call in calls):
         return message
     for call in calls:
         if not call.get("id"):

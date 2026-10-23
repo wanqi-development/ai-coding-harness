@@ -57,6 +57,10 @@
 
 - **提示词是行为契约**：改 `src/ai_coding_harness/agent/prompts.py` 的措辞等于改行为 ——
   必须跑 `tests/test_prompts.py` 与 `scripts/check_prompts.py`。
+- **`invalid_tool_calls` 不能进入 provider 历史**：LangChain 会把它序列化成
+  `invalid_tool_call` content part，OpenAI-compatible 网关直接 400。模型出口与历史修复
+  都必须把它降级成普通正文、清空字段，并且不要为没有 `tool_calls` 的错误调用伪造
+  `ToolMessage`。见 `agent/middleware/tool_integrity.py` 与 `tests/test_tool_integrity.py`。
 - **沙箱资产建会话时整棵推入**：`sandbox/policies`、`sandbox/skills`、`sandbox/maven`、
   `sandbox/deploy/sandbox/*` 改完要**新建会话**才保证生效。脚本类的资产有编码要求：
   `start.bat` 是 **GBK**，改动必须保住原编码，不能拿 UTF-8 直接覆盖（否则中文乱码）。
