@@ -35,14 +35,17 @@
 - **改动**：
   - `agent/middleware/tool_integrity.py`：invalid call 降级成普通文本说明
     `[工具调用未执行] ...`，并清空 `invalid_tool_calls`。
+  - 同时识别并清除已经固化进 `AIMessage.content` 的
+    `{"type": "invalid_tool_call"}` block。真实坏 checkpoint 的
+    `invalid_tool_calls` 字段为空，坏数据只在 content block 里，上一版只查字段仍会漏。
   - 模型出口与 `HistoryRepairMiddleware` 历史整表修复共用同一重建逻辑。
   - 不再为 invalid call 伪造 `ToolMessage`；旧版本已经生成过的伪响应会被删除。
   - 同一条 AI 消息里的正常 `tool_calls` 与对应响应保持不变。
   - README、AGENTS 同步记录 provider 兼容边界。
 - **关键决策**：保留“哪个工具、为什么没执行”的可读信息，但不保留 provider 无法序列化
   的 `invalid_tool_call` part；原始诊断文本进入普通 assistant content。
-- **验证**：`tests/test_tool_integrity.py` **31 passed**；全量 `pytest`
-  **1288 passed, 2 warnings**；ruff 与 `git diff --check` 干净。
+- **验证**：`tests/test_tool_integrity.py` **32 passed**；全量 `pytest`
+  **1289 passed, 2 warnings**；ruff 与 `git diff --check` 干净。
 - **遗留**：运行中的后端必须重启后才会加载新中间件；现有坏 checkpoint 会在下一次
   `HistoryRepairMiddleware.abefore_agent` 时自动整表修复。
 

@@ -191,6 +191,41 @@ class TestUnexecutedWording:
         assert len(responses(out)) == 1
         assert responses(out)[0].tool_call_id == "call_a"
 
+    def test_invalid_content_block_is_downcast_without_invalid_field(self):
+        """真实坏 checkpoint 形状：invalid 在 content block 里，字段本身是空列表。"""
+        history = [
+            AIMessage(
+                content=[
+                    {
+                        "type": "invalid_tool_call",
+                        "id": "call_bad",
+                        "name": "save_repo_memory",
+                        "args": "{坏的 JSON",
+                        "error": "Failed to parse tool call arguments as JSON",
+                    }
+                ],
+                invalid_tool_calls=[],
+            ),
+            HumanMessage("继续"),
+        ]
+
+        out = repaired_or_fail(history)
+
+        rebuilt = out[0]
+        assert isinstance(rebuilt, AIMessage)
+        assert rebuilt.invalid_tool_calls == []
+        assert isinstance(rebuilt.content, list)
+        assert all(
+            not (
+                isinstance(block, dict)
+                and block.get("type") == "invalid_tool_call"
+            )
+            for block in rebuilt.content
+        )
+        assert "[工具调用未执行]" in str(rebuilt.content)
+        assert "save_repo_memory" in str(rebuilt.content)
+        assert not responses(out)
+
     def test_old_fake_response_for_an_invalid_call_is_removed(self):
         """旧修复逻辑生成过伪 ToolMessage；升级后要把这条孤儿一并清掉。"""
         history = [

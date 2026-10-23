@@ -90,6 +90,12 @@ def _calls_of(message: AIMessage) -> list[dict[str, Any]]:
     """
     calls = [{**call, "type": TOOL_CALL} for call in message.tool_calls]
     calls += [{**call, "type": INVALID} for call in message.invalid_tool_calls]
+    if isinstance(message.content, list):
+        calls += [
+            {**block, "type": INVALID}
+            for block in message.content
+            if isinstance(block, dict) and block.get("type") == INVALID
+        ]
     return calls
 
 
@@ -102,7 +108,15 @@ def _rebuild(message: AIMessage, calls: list[dict[str, Any]]) -> AIMessage:
         if isinstance(content, str):
             content = f"{content}\n\n{note}".strip()
         elif isinstance(content, list):
-            content = [*content, {"type": "text", "text": f"\n\n{note}"}]
+            content = [
+                block
+                for block in content
+                if not (
+                    isinstance(block, dict)
+                    and block.get("type") == INVALID
+                )
+            ]
+            content.append({"type": "text", "text": f"\n\n{note}"})
         else:
             content = f"{content}\n\n{note}"
     return message.model_copy(
