@@ -169,13 +169,6 @@ RUNTIME_SETTINGS: tuple[RuntimeSetting, ...] = (
         "float",
         "context_pretrim_notice_ratio",
     ),
-    RuntimeSetting(
-        "context_pretrim_forced_summary_after",
-        "强制摘要阈值（同一轮应急裁剪 N 次后，即使低于线也压；0=关闭）",
-        "上下文压缩配置",
-        "int",
-        "context_pretrim_forced_summary_after",
-    ),
     # -- 意图识别：低置信度时转 qa 追问（0 = 关闭）--
     RuntimeSetting(
         "intent_clarify_confidence",
@@ -461,25 +454,25 @@ class Settings(BaseSettings):
     # 2026-10-14 起可以在设置页改（常量仍留着当默认值与它的出处）。
     fallback_context_window: int = FALLBACK_CONTEXT_WINDOW
 
-    # 工具裁剪（2026-10-17 用户口径：**不要常规剪裁**）：只在**压缩线**做一次应急裁剪，
-    # 保留「当前这一步」和模型工作笔记 KEEP 点名的工具返回，其余换成带身份占位符；
-    # 剪完低于压缩线就不摘要，仍高于才压。只改这一次请求（见 middleware/context_trim.py）。
+    # 工具裁剪（2026-10-22）：只在**压缩线**生成持久化投影事件。事件只存 tool_call_id，
+    # 原始消息仍在 checkpoint；每次模型调用动态应用。没有新增可裁项时直接摘要。
     context_trim_enabled: bool = os.getenv("CONTEXT_TRIM_TOOL_RESULTS", "true").strip().lower() in (
         "1",
         "true",
         "yes",
     )
-    # 应急裁剪时连工具**入参**一起清（edit_file 的 old/new、write_file 的整份文件）：
-    # 2026-10-20 起**默认开** —— 真机上 54 次 edit 的正文一直留在历史里，每次调用都重发；
-    # 被裁掉的都是「旧步骤」，当前步骤与 KEEP 点名的结果不在清理范围。
+    # 历史工具入参的选择性压缩：只压超大字符串字段、保留路径与调用参数结构。
+    # 2026-10-22 起默认关：旧实现把整个 args 清成 {}，真机上出现了 `read_file 参数={}`。
     context_trim_clear_inputs: bool = (
-        os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "true").strip().lower() in ("1", "true", "yes")
+        os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "false").strip().lower() in ("1", "true", "yes")
     )
-    # 同一轮累计应急裁剪几次后**强制摘要**（即使已经低于压缩线）。应急裁剪只改本次请求、
-    # 不改 checkpoint，长任务里会反复「涨到 120k → 剪到 74k → 再涨回去」；真机一轮出现过
-    # 84 次原地裁剪、一次摘要都没有。摘要成功后计数清零，重新累计。0 = 关闭。
-    context_pretrim_forced_summary_after: int = int(
-        os.getenv("CONTEXT_PRETRIM_FORCED_SUMMARY_AFTER", "3")
+    # 工具结果低于这个字符数不裁：普通命令输出／短状态值留着，避免占位符比原文还长。
+    context_pretrim_min_result_chars: int = int(
+        os.getenv("CONTEXT_PRETRIM_MIN_RESULT_CHARS", "2000")
+    )
+    # 历史工具入参中的单个字符串低于这个字符数不压；只对大文件正文 / patch / 长命令生效。
+    context_pretrim_min_arg_chars: int = int(
+        os.getenv("CONTEXT_PRETRIM_MIN_ARG_CHARS", "2000")
     )
 
     # 压缩（摘要）：什么时候压 / 压完留多少 / 摘要那次调用最多吃多少。三件都在这组里，

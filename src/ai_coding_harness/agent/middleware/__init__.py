@@ -15,8 +15,8 @@
   一次完成，不再由中间件承担；
 - ``fallback``：主导模型彻底失败时切兜底，并留一条 ``MODEL_FALLBACK`` 的痕。
 - ``stream_usage``：流式响应也要 token 用量；网关不认 ``stream_options`` 时按地址自动降级。
-- ``context_trim``：压缩线处的**应急裁剪**辅助函数（保留当前步骤 + 模型工作笔记
-  ``KEEP:`` 点名的结果，**只改这一次请求**）；真正的挂载与判断在
+- ``context_trim``：压缩线处的**持久化裁剪投影**（保留当前步骤 + 模型工作笔记
+  ``KEEP:`` 点名的结果；事件只存工具调用 ID，原文仍在 checkpoint）；真正的挂载与判断在
   ``agent/summarization.py``。
 
 这里只做重新导出，装配点（``graph.py`` / ``subagents.py``）从这里拿类并实例化。
@@ -34,9 +34,17 @@ from ai_coding_harness.agent.middleware.context_inject import (
     now_stamp,
 )
 from ai_coding_harness.agent.middleware.context_trim import (
+    CONTEXT_TRIM_EVENT_VERSION,
     PRETRIM_KEEP_RECENT_TOOL_RESULTS,
+    PRETRIM_MIN_ARG_CHARS,
+    PRETRIM_MIN_RESULT_CHARS,
+    ContextTrimEvent,
+    apply_context_trim_event,
     keep_items_from_messages,
+    merge_context_trim_event,
+    plan_context_trim_event,
     pretrim_tool_results,
+    prune_context_trim_event,
 )
 from ai_coding_harness.agent.middleware.delegation_gate import DelegationGateMiddleware
 from ai_coding_harness.agent.middleware.fallback import (
@@ -72,12 +80,16 @@ from ai_coding_harness.agent.middleware.tool_integrity import (
 
 __all__ = [
     "ABORT_REASON",
+    "CONTEXT_TRIM_EVENT_VERSION",
     "FALLBACK_LOG_TAG",
     "LOOP_ABORT_MARKER",
     "MEMORY_BLOCK_TITLE",
     "PRETRIM_KEEP_RECENT_TOOL_RESULTS",
+    "PRETRIM_MIN_ARG_CHARS",
+    "PRETRIM_MIN_RESULT_CHARS",
     "STREAM_USAGE_LOG_TAG",
     "BoundaryMiddleware",
+    "ContextTrimEvent",
     "DelegationGateMiddleware",
     "FallbackMiddleware",
     "HistoryRepairMiddleware",
@@ -92,8 +104,12 @@ __all__ = [
     "ToolErrorGuardMiddleware",
     "TurnState",
     "TurnStop",
+    "apply_context_trim_event",
     "build_memory_middleware",
     "keep_items_from_messages",
+    "merge_context_trim_event",
     "now_stamp",
+    "plan_context_trim_event",
     "pretrim_tool_results",
+    "prune_context_trim_event",
 ]

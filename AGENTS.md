@@ -164,15 +164,18 @@
   **跑完隐藏思考、只留正文并 Markdown 化**；不落库、刷新即消失。别再单独维护
   `message.reasoning` 或把思考固定渲染在正文上方（2026-10-19 用户口径）。
 - **不要常规剪裁**（2026-10-17 用户口径）：平时**不**按 40k 阈值剪；只有到达压缩线时，
-  压缩中间件才做一次**应急裁剪**（`pretrim_tool_results`）。2026-10-19 起按角色分两档：
+  压缩中间件才生成一次**裁剪事件**（`plan_context_trim_event`）。2026-10-19 起按角色分两档：
   主控 `plan` 与子智能体 `planner` / `coder` / `reviewer` 走**爆发**（窗口 40%），
   `qa` 与主控 `orchestrate`（coding / rework）走**稳态**（窗口 70%）。
   **2026-10-20 起再叠一条绝对上限**：爆发 120k、稳态 200k，与比例线是 OR（先到先触发）——
   1M 窗口的 40% 是 40 万，真机一轮 131 次调用能涨到 194k 都不压。到压缩线的 90% 先注入
   `PRETRIM_NOTICE`，让模型写 `<working-note>` + `KEEP:` 清单；下一轮裁剪保留
   **当前步骤 + KEEP 点名的工具返回**（总额约 20k tokens，最近优先），未点名的一律换成
-  带身份占位符。剪完**落到触发线的 80% 以下才免压**；只在 80%~100% 之间仍会摘要
-  （裁剪只改请求副本，勉强压到线边会让原历史在下次调用再剪一遍）。**不要**改成「最后一条 `HumanMessage`
+  带身份占位符。2026-10-22 起裁剪是 **`_context_trim_event` 持久化投影**：checkpoint
+  的 `messages` 保留原文，事件只存 `tool_call_id`；每次请求先应用摘要事件、再应用裁剪事件。
+  **工具结果 / 入参小于 2000 字符不裁**，大入参只压字符串字段并保留 `file_path/path/
+  offset/limit/timeout`。剪完**落到触发线的 70% 以下才免压**；没有新增可裁项或仍超线时
+  直接摘要，不再使用“三次应急裁剪”计数器。**不要**改成「最后一条 `HumanMessage`
   之后全部保留」—— 子智能体整轮可能有一百多条工具返回，等于没有裁剪。它跟随
   `CONTEXT_TRIM_TOOL_RESULTS` 总开关；`CONTEXT_TRIM_TRIGGER_TOKENS` / `CONTEXT_TRIM_KEEP`
   / `CONTEXT_TRIM_ROLES` 已作废，别再加回独立剪裁中间件。`CONTEXT_SUMMARY_TRIGGER_TOKENS`
@@ -186,7 +189,7 @@
   `委派闸门已挂载`：没有这行就是进程没重载。
 - **成本纪律**（2026-10-20）：读码先 `grep` 定位、再用 `read_file` 的 `offset/limit`
   读片段，同一文件本轮不重读；coder 按模块批量验证，别每改一行跑一次全量；
-  `CONTEXT_TRIM_CLEAR_INPUTS` 默认开（裁剪时清旧 `edit_file` / `write_file` 入参）；
+  `CONTEXT_TRIM_CLEAR_INPUTS` 默认关（开启也只做超大字段选择性压缩，不把 `args` 清成 `{}`）；
   rework 的任务描述只给 PR / 问题编号，审查原文由 coder 用 `list_pr_comments` 自取
   （coder **只读**评论，`comment_pr` 仍归主控）。
 - **coder 的 rework 按模块编排**（`prompts._CODER_ROLE` B 流程）：先核验确认问题，再按

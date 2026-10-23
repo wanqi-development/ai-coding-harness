@@ -25,6 +25,29 @@
 
 ### 2026-10-22
 
+#### 工具裁剪改为持久化事件投影：大内容才裁、原始 checkpoint 不动
+
+- **动机**：旧应急裁剪只修改本次 `ModelRequest`，下一次仍从完整 checkpoint 恢复并重复
+  裁剪同一批历史；真机日志里同一角色几十秒内反复走 `CONTEXT_PRETRIM`。同时，旧实现会把
+  很小的结果也换成占位符、把历史入参整体清成 `{}`，已出现 `read_file 参数={}` 这类误导。
+- **改动**：
+  - 新增 `_context_trim_event` 私有 state：只保存 `trimmed_result_ids` /
+    `compacted_arg_ids`，不复制原文；每次模型调用按“摘要事件 → 裁剪事件”动态投影。
+  - 工具结果默认超过 **2000 字符**才裁；工具入参选择性压缩也默认关闭，开启后只压超大
+    字符串字段，保留 `file_path/path/offset/limit/timeout` 等结构。
+  - 当前步骤、`KEEP:` 点名项与 `KEEP_TOOLS` 不进入事件。
+  - 没有新增可裁项或仍高于触发线 70% 时直接摘要，删除“三次应急裁剪后强制摘要”计数器。
+  - 摘要与 offload 使用裁剪事件之前的原始消息；摘要成功后清理 cutoff 之前的裁剪 ID。
+  - 关闭上游 `truncate_args_settings`，避免它把历史入参截成前 20 字符。
+  - 设计说明写入 `docs/context-trim-event.md`，并同步 README、AGENTS、`.env.example`。
+- **关键决策**：不把占位符写回 `state.messages`，而是持久化稳定 ID 并在请求时投影；
+  这样后续调用不会重复裁剪原文，摘要仍能拿到可 offload 的完整内容。
+- **验证**：全量 `pytest` **1286 passed, 2 warnings**；定向上下文测试 **107 passed**；
+  `scripts/check_prompts.py` 6 份提示词、0 条冲突；改动文件 `ruff check` 干净；
+  `git diff --check` 通过。
+- **遗留**：2000 字符阈值先用于真机观察，后续应按工具结果 / 参数长度分布调整；原始
+  checkpoint 的物理体积仍由摘要与 offload 控制。
+
 #### 应急裁剪的安全区收紧到压缩线 70%
 
 - **动机**：应急裁剪后的历史只改本次请求副本，checkpoint 里的原文仍在。如果剪完只降到

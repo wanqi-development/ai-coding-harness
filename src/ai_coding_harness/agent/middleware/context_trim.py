@@ -1,4 +1,4 @@
-"""压缩前的应急工具裁剪：只保留「当前这一步」，其余换成带身份占位符。
+"""上下文裁剪事件：checkpoint 保留原文，模型请求按稳定 ID 做动态投影。
 
 2026-10-17 用户口径：**不要常规剪裁** —— 平时不按 40k 阈值剪，只有到达压缩线
 （``CONTEXT_SUMMARY_*``）时才做一次应急裁剪，交给压缩中间件判断「剪完能不能免掉
@@ -6,8 +6,9 @@
 不再按「最后一条 HumanMessage 之后全部保留」切。见
 ``agent/summarization.py::HarnessSummarizationMiddleware``。
 
-这一步只改**这一次请求**：不删消息、不改 ``tool_call_id``、不动 checkpoint / 业务库；
-消息条数与工具调用配对不变，回退只要关掉 ``CONTEXT_TRIM_TOOL_RESULTS``。
+事件本身写进 checkpoint 的私有字段 ``_context_trim_event``，但只保存 ``tool_call_id``；
+``messages`` 永远是原文。每次请求按“摘要事件 → 裁剪事件”重新拼出模型可见消息，因此不删
+消息、不改 ``tool_call_id``、不动业务原文。回退只要关掉 ``CONTEXT_TRIM_TOOL_RESULTS``。
 
 占位符**必须带身份**（哪个工具、哪个对象、原文多大），而且不能劝模型「重新读一次」——
 无名的占位符会让它防御性重读，实测把一轮分析拖到递归上限（见 ``trimmed_placeholder``）。
@@ -20,7 +21,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately
@@ -126,6 +127,7 @@ KEEP_TOOLS: tuple[str, ...] = (
     "updatePlanStatus",
     "planExists",
     "task",
+    "get_unexecuted_plan"
 )
 
 #: 应急裁剪时，除了「当前这一步」之外还保留几条最近的工具返回。
@@ -138,6 +140,41 @@ PRETRIM_KEEP_ITEMS = 8
 #: 被 ``KEEP`` 点名的工具返回最多占多少 token；超出的按“最近优先”保留。
 #: 这不是摘要的 keep 窗口 —— 只是应急裁剪时允许额外留下的原文预算。
 PRETRIM_KEEP_TOKENS = 20_000
+
+#: 工具结果小于这个字符数时不裁剪：普通命令输出和短状态值的节省抵不过占位符开销。
+PRETRIM_MIN_RESULT_CHARS = 2_000
+
+#: 工具入参中的单个字符串小于这个字符数时不压缩；路径、offset、timeout 等短字段永远保留。
+PRETRIM_MIN_ARG_CHARS = 2_000
+
+#: 压缩历史入参时保留的开头长度。它只用于识别调用，不承担恢复原始内容。
+_ARG_PREVIEW_CHARS = 120
+
+#: 不论阈值多小都保留的参数键：它们定义「调用的是哪个对象」，通常也很短。
+_ARG_PRESERVE_KEYS = frozenset(
+    {
+        "file_path",
+        "path",
+        "pattern",
+        "glob",
+        "query",
+        "url",
+        "offset",
+        "limit",
+        "timeout",
+    }
+)
+
+#: 裁剪事件版本。以后改变字段语义时递增，旧版本按“不应用”处理。
+CONTEXT_TRIM_EVENT_VERSION = 1
+
+
+class ContextTrimEvent(TypedDict):
+    """checkpoint 里的裁剪投影；只存稳定 ID，不复制原文或占位符。"""
+
+    version: int
+    trimmed_result_ids: list[str]
+    compacted_arg_ids: list[str]
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -248,87 +285,213 @@ def _trim_facts(messages: Sequence[BaseMessage]) -> dict[str, tuple[Any, int]]:
     return facts
 
 
-def _tool_call_owners(messages: Sequence[BaseMessage]) -> dict[str, int]:
-    """``tool_call_id`` → 发起它的那条 AI 消息的下标（清入参时用）。"""
-    owners: dict[str, int] = {}
-    for index, message in enumerate(messages):
-        if isinstance(message, AIMessage):
-            for call in message.tool_calls or []:
-                call_id = call.get("id")
-                if call_id:
-                    owners[call_id] = index
-    return owners
+def _compact_arg_value(value: str) -> str:
+    """把一个超大历史入参压成可识别的一行，不保留正文主体。"""
+    preview = " ".join(value[:_ARG_PREVIEW_CHARS].split())
+    return f"{preview}〔历史入参已压缩：原 {len(value):,} 字〕"
 
 
-def _clear_tool_call_args(message: BaseMessage, call_ids: set[str]) -> BaseMessage:
-    """把一条 AI 消息里指定 tool call 的 args 清空（与上游 ``clear_tool_inputs`` 同语义）。"""
+def _compact_tool_call_args(
+    message: BaseMessage,
+    call_ids: set[str],
+    *,
+    min_arg_chars: int,
+) -> BaseMessage:
+    """只压缩指定 tool call 中的超大字符串字段，保留参数结构与关键字段。"""
     if not isinstance(message, AIMessage):
         return message
     updated: list[Any] = []
     changed = False
     for call in message.tool_calls or []:
         if call.get("id") in call_ids:
-            updated.append({**call, "args": {}})
-            changed = True
+            args = call.get("args")
+            if isinstance(args, Mapping):
+                compacted = {
+                    key: (
+                        _compact_arg_value(value)
+                        if isinstance(value, str) and len(value) > min_arg_chars
+                        and key not in _ARG_PRESERVE_KEYS
+                        else value
+                    )
+                    for key, value in args.items()
+                }
+                if compacted != args:
+                    updated.append({**call, "args": compacted})
+                    changed = True
+                else:
+                    updated.append(call)
+            else:
+                updated.append(call)
         else:
             updated.append(call)
     if not changed:
         return message
     metadata = dict(message.response_metadata)
     context_entry = dict(metadata.get("context_editing", {}))
-    cleared_inputs = set(context_entry.get("cleared_tool_inputs", []))
-    cleared_inputs.update(call_ids)
-    context_entry["cleared_tool_inputs"] = sorted(cleared_inputs)
+    compacted_inputs = set(context_entry.get("compacted_tool_inputs", []))
+    compacted_inputs.update(call_ids)
+    context_entry["compacted_tool_inputs"] = sorted(compacted_inputs)
     metadata["context_editing"] = context_entry
     return message.model_copy(
         update={"tool_calls": updated, "response_metadata": metadata}
     )
 
 
-def pretrim_tool_results(
-    messages: Sequence[BaseMessage],
+def _event_sets(
+    event: Mapping[str, Any] | ContextTrimEvent | None,
+) -> tuple[set[str], set[str]]:
+    """读事件里的两个 ID 集合；未知版本按空事件处理。"""
+    if not isinstance(event, Mapping):
+        return set(), set()
+    if event.get("version") != CONTEXT_TRIM_EVENT_VERSION:
+        return set(), set()
+    results = event.get("trimmed_result_ids", [])
+    args = event.get("compacted_arg_ids", [])
+    return (
+        {str(item) for item in results if item},
+        {str(item) for item in args if item},
+    )
+
+
+def merge_context_trim_event(
+    event: Mapping[str, Any] | ContextTrimEvent | None,
     *,
-    keep_recent: int = PRETRIM_KEEP_RECENT_TOOL_RESULTS,
-    clear_tool_inputs: bool = False,
-    keep_items: Sequence[str] = (),
-    keep_budget_tokens: int = PRETRIM_KEEP_TOKENS,
-) -> tuple[list[BaseMessage], int]:
-    """压缩前的**应急裁剪**：清掉「当前这一步 + KEEP 清单」以外的工具返回。
+    result_ids: Sequence[str] = (),
+    arg_ids: Sequence[str] = (),
+) -> ContextTrimEvent | None:
+    """把新 ID 并入已有事件；没有任何内容时返回 ``None``。"""
+    results, args = _event_sets(event)
+    results.update(item for item in result_ids if item)
+    args.update(item for item in arg_ids if item)
+    if not results and not args:
+        return None
+    return {
+        "version": CONTEXT_TRIM_EVENT_VERSION,
+        "trimmed_result_ids": sorted(results),
+        "compacted_arg_ids": sorted(args),
+    }
 
-    只在压缩线处调用，不是每次模型调用都跑。保留消息列表**末尾连续的那一段 ToolMessage**
-    —— 那通常是模型这一轮刚拿到的工具结果，剪掉它等于让模型当场失忆。再往前的一律换成
-    带身份占位符，除非它被模型工作笔记里的 ``KEEP:`` 点名。
 
-    ``keep_recent`` 是「当前步骤之外再保留几条」的逃生门，默认 0。
-    ``keep_items`` 是模型工作笔记里的 ``KEEP:`` 清单（tool_call_id 或 ``工具名:目标``）；
-    被点名的 ToolMessage 保留原文，但总额受 ``keep_budget_tokens`` 限制（最近优先）。
-
-    返回新列表与清除条数；**不删消息、不改 ``tool_call_id``、不动状态**。
-    """
+def apply_context_trim_event(
+    messages: Sequence[BaseMessage],
+    event: Mapping[str, Any] | ContextTrimEvent | None,
+) -> list[BaseMessage]:
+    """把裁剪事件确定性地投影成模型可见消息，不修改原始消息。"""
     result = list(messages)
-    if not result:
-        return result, 0
-
-    # 当前这一步 = 末尾连续的 ToolMessage（并行工具调用会有多条）。
-    protected: set[int] = set()
-    index = len(result) - 1
-    while index >= 0 and isinstance(result[index], ToolMessage):
-        protected.add(index)
-        index -= 1
-
-    if keep_recent > 0:
-        kept = 0
-        for index in range(len(result) - 1, -1, -1):
-            if kept >= keep_recent:
-                break
-            if isinstance(result[index], ToolMessage) and index not in protected:
-                protected.add(index)
-                kept += 1
+    trimmed_ids, compacted_ids = _event_sets(event)
+    if not result or (not trimmed_ids and not compacted_ids):
+        return result
 
     facts = _trim_facts(result)
     names_by_id = {
         call.get("id"): call.get("name")
         for message in result
+        if isinstance(message, AIMessage)
+        for call in (message.tool_calls or [])
+        if call.get("id")
+    }
+    for index, message in enumerate(result):
+        if (
+            isinstance(message, ToolMessage)
+            and message.tool_call_id
+            and message.tool_call_id in trimmed_ids
+        ):
+            tool_name = message.name or names_by_id.get(message.tool_call_id) or "工具"
+            args, chars = facts.get(message.tool_call_id, (None, 0))
+            result[index] = message.model_copy(
+                update={
+                    "artifact": None,
+                    "content": trimmed_placeholder(
+                        tool_name, _target_of(args), chars
+                    ),
+                    "response_metadata": {
+                        **message.response_metadata,
+                        "context_editing": {
+                            "cleared": True,
+                            "strategy": "pretrim_event",
+                        },
+                    },
+                }
+            )
+
+    for index, message in enumerate(result):
+        if isinstance(message, AIMessage):
+            result[index] = _compact_tool_call_args(
+                message,
+                compacted_ids,
+                # 选入事件的 ID 已经过配置阈值判断；投影时不再依赖当前进程的阈值，
+                # 否则同一 checkpoint 换一个配置后会得到不同上下文。
+                min_arg_chars=0,
+            )
+    return result
+
+
+def prune_context_trim_event(
+    event: Mapping[str, Any] | ContextTrimEvent | None,
+    messages: Sequence[BaseMessage],
+    cutoff_index: int,
+) -> ContextTrimEvent | None:
+    """摘要后移除 cutoff 之前已经看不见的 ID，控制事件体积。"""
+    results, args = _event_sets(event)
+    if not results and not args:
+        return None
+    hidden_ids: set[str] = set()
+    for message in messages[: max(0, cutoff_index)]:
+        if isinstance(message, ToolMessage) and message.tool_call_id:
+            hidden_ids.add(message.tool_call_id)
+        elif isinstance(message, AIMessage):
+            hidden_ids.update(
+                call["id"]
+                for call in (message.tool_calls or [])
+                if call.get("id")
+            )
+    results.difference_update(hidden_ids)
+    args.difference_update(hidden_ids)
+    if not results and not args:
+        return None
+    return {
+        "version": CONTEXT_TRIM_EVENT_VERSION,
+        "trimmed_result_ids": sorted(results),
+        "compacted_arg_ids": sorted(args),
+    }
+
+
+def plan_context_trim_event(
+    messages: Sequence[BaseMessage],
+    *,
+    existing: Mapping[str, Any] | ContextTrimEvent | None = None,
+    keep_recent: int = PRETRIM_KEEP_RECENT_TOOL_RESULTS,
+    compact_tool_inputs: bool = False,
+    keep_items: Sequence[str] = (),
+    keep_budget_tokens: int = PRETRIM_KEEP_TOKENS,
+    min_result_chars: int = PRETRIM_MIN_RESULT_CHARS,
+    min_arg_chars: int = PRETRIM_MIN_ARG_CHARS,
+) -> tuple[ContextTrimEvent | None, int, int]:
+    """按大小阈值选出新的结果/入参 ID，并与已有事件合并。"""
+    source = list(messages)
+    if not source:
+        return merge_context_trim_event(existing), 0, 0
+
+    # 当前这一步 = 末尾连续的 ToolMessage（并行工具调用会有多条）。
+    protected: set[int] = set()
+    index = len(source) - 1
+    while index >= 0 and isinstance(source[index], ToolMessage):
+        protected.add(index)
+        index -= 1
+
+    if keep_recent > 0:
+        kept = 0
+        for index in range(len(source) - 1, -1, -1):
+            if kept >= keep_recent:
+                break
+            if isinstance(source[index], ToolMessage) and index not in protected:
+                protected.add(index)
+                kept += 1
+
+    facts = _trim_facts(source)
+    names_by_id = {
+        call.get("id"): call.get("name")
+        for message in source
         if isinstance(message, AIMessage)
         for call in (message.tool_calls or [])
         if call.get("id")
@@ -364,10 +527,8 @@ def pretrim_tool_results(
             for name, value in wanted_targets
         )
 
-    # KEEP 点名的结果单独记账；预算按“最近优先”（同一份笔记里它是按重要性排的，
-    # 但这里只负责别让几份大文件把应急裁剪彻底撑爆）。
     matched: list[tuple[int, int]] = []
-    for index, message in enumerate(result):
+    for index, message in enumerate(source):
         if not isinstance(message, ToolMessage) or index in protected:
             continue
         tool_name = message.name or names_by_id.get(message.tool_call_id) or ""
@@ -380,44 +541,89 @@ def pretrim_tool_results(
         if used + tokens <= keep_budget_tokens:
             kept_by_note.add(index)
             used += tokens
-    owners = _tool_call_owners(result) if clear_tool_inputs else {}
-    cleared_ids_by_owner: dict[int, set[str]] = {}
-    cleared = 0
-    for index, message in enumerate(result):
+
+    protected_call_ids = {
+        source[index].tool_call_id
+        for index in protected
+        if isinstance(source[index], ToolMessage) and source[index].tool_call_id
+    } | {
+        source[index].tool_call_id
+        for index in kept_by_note
+        if source[index].tool_call_id
+    }
+    for message in source:
+        if (
+            isinstance(message, ToolMessage)
+            and message.name in KEEP_TOOLS
+            and message.tool_call_id
+        ):
+            protected_call_ids.add(message.tool_call_id)
+
+    old_results, old_args = _event_sets(existing)
+    new_result_ids: set[str] = set()
+    for index, message in enumerate(source):
         if (
             not isinstance(message, ToolMessage)
             or index in protected
             or index in kept_by_note
+            or not message.tool_call_id
+            or message.tool_call_id in protected_call_ids
+            or message.tool_call_id in old_results
+            or message.name in KEEP_TOOLS
         ):
             continue
-        tool_name = message.name or names_by_id.get(message.tool_call_id) or ""
-        if tool_name in KEEP_TOOLS:
+        if len(_message_text(message)) <= min_result_chars:
             continue
-        if message.response_metadata.get("context_editing", {}).get("cleared"):
-            continue
-        args, chars = facts.get(message.tool_call_id, (None, 0))
-        result[index] = message.model_copy(
-            update={
-                "artifact": None,
-                "content": trimmed_placeholder(
-                    tool_name or "工具", _target_of(args), chars
-                ),
-                "response_metadata": {
-                    **message.response_metadata,
-                    "context_editing": {
-                        "cleared": True,
-                        "strategy": "pretrim",
-                    },
-                },
-            }
-        )
-        cleared += 1
-        if clear_tool_inputs and message.tool_call_id:
-            owner = owners.get(message.tool_call_id)
-            if owner is not None:
-                cleared_ids_by_owner.setdefault(owner, set()).add(message.tool_call_id)
+        new_result_ids.add(message.tool_call_id)
 
-    for owner, call_ids in cleared_ids_by_owner.items():
-        result[owner] = _clear_tool_call_args(result[owner], call_ids)
+    new_arg_ids: set[str] = set()
+    if compact_tool_inputs:
+        for message in source:
+            if not isinstance(message, AIMessage):
+                continue
+            for call in message.tool_calls or []:
+                call_id = call.get("id")
+                args = call.get("args")
+                if (
+                    not call_id
+                    or call_id in protected_call_ids
+                    or call_id in old_args
+                    or call.get("name") in KEEP_TOOLS
+                    or not isinstance(args, Mapping)
+                ):
+                    continue
+                if any(
+                    isinstance(value, str) and len(value) > min_arg_chars
+                    for value in args.values()
+                ):
+                    new_arg_ids.add(call_id)
 
-    return result, cleared
+    merged = merge_context_trim_event(
+        existing,
+        result_ids=tuple(new_result_ids),
+        arg_ids=tuple(new_arg_ids),
+    )
+    return merged, len(new_result_ids), len(new_arg_ids)
+
+
+def pretrim_tool_results(
+    messages: Sequence[BaseMessage],
+    *,
+    keep_recent: int = PRETRIM_KEEP_RECENT_TOOL_RESULTS,
+    clear_tool_inputs: bool = False,
+    keep_items: Sequence[str] = (),
+    keep_budget_tokens: int = PRETRIM_KEEP_TOKENS,
+    min_result_chars: int = PRETRIM_MIN_RESULT_CHARS,
+    min_arg_chars: int = PRETRIM_MIN_ARG_CHARS,
+) -> tuple[list[BaseMessage], int]:
+    """兼容纯函数入口：计划一次新事件并返回投影后的消息与新裁结果数。"""
+    event, new_results, _new_args = plan_context_trim_event(
+        messages,
+        keep_recent=keep_recent,
+        compact_tool_inputs=clear_tool_inputs,
+        keep_items=keep_items,
+        keep_budget_tokens=keep_budget_tokens,
+        min_result_chars=min_result_chars,
+        min_arg_chars=min_arg_chars,
+    )
+    return apply_context_trim_event(messages, event), new_results
