@@ -79,12 +79,18 @@ def clarification_block(
         "- 只输出下面这一种结构，不要 Markdown、不要解释文字；问题和选项文案可以自由写：",
         CLARIFY_OPEN,
         (
-            '{"question":"用一句话问用户想做什么",'
+            '{"steps":[{"id":"intent","question":"先确认意图",'
             '"options":[{"intent":"qa","label":"...","description":"..."},'
-            '{"intent":"plan","label":"...","description":"..."}]}'
+            '{"intent":"plan","label":"...","description":"..."}]},'
+            '{"id":"scope","question":"再确认业务口径",'
+            '"options":[{"value":"a","label":"...","description":"..."},'
+            '{"value":"b","label":"...","description":"..."}]}]}'
         ),
         CLARIFY_CLOSE,
-        f"- options 必须 2~3 个，按你的判断从高到低；intent 只能是：{allowed}。",
+        "- steps 为 1~3 个。第一步负责选择意图，2~4 个选项必须带 intent；",
+        f"  intent 只能是：{allowed}，按可能性从高到低。",
+        "- 后续步骤只问真正影响执行且无法从仓库推断的业务口径；每步 2~4 个选项，",
+        "  用 value + label 表示选择，不要重复问意图。",
         "- label 面向用户、要具体；description 用一句话说明这个选项会做什么。",
     ]
     return "\n".join(lines)

@@ -13,6 +13,7 @@ import {
   postChat,
   resumeChat,
   type ChatEvent,
+  type ClarificationAnswer,
   type ClarificationInfo,
   type PlanInfo,
   type PlanStep,
@@ -37,6 +38,7 @@ import HandoffRun from './components/HandoffRun.vue'
 import { defaultPanelTab } from './lib/prefs'
 import { usePanelWidth } from './lib/splitter'
 import { splitLongText } from './lib/streamblocks'
+import { clarificationAnswerLabels, clarificationSteps } from './lib/clarification'
 import { applyRunTrace, createRunTree, type RunTree } from './lib/runs'
 import { shouldShowTodos } from './lib/todos'
 import { readView, watchView, writeView, type AppView, type SettingsPanel } from './lib/viewState'
@@ -537,6 +539,11 @@ function statusClass(status: string): string {
 
 /** 历史记录 → 块序列：有落库的 parts 就按它回放，没有（纯正文回合）退回 content。 */
 function partsOf(r: { content: string | null; summary: string | null; extra: any }): Part[] {
+  // 澄清轮的最终产物是结构化弹窗 + 一句问题。旧记录曾把原始 <CLARIFY> 和
+  // 伪待办塞进 parts；这里以 content 为准，不能让历史脏数据重新覆盖正文。
+  if (r.extra?.clarification) {
+    return [{ kind: 'text', content: r.content || r.extra.clarification.question || '' }]
+  }
   const saved = r.extra?.parts
   if (Array.isArray(saved) && saved.length) {
     return saved.flatMap((p: any): Part[] => {
@@ -1477,10 +1484,14 @@ function quickAct(text: string) {
   void send()
 }
 
-async function sendTurn(choice?: { info: ClarificationInfo; index: number }) {
-  const picked = choice ? choice.info.options[choice.index] : null
+async function sendTurn(choice?: { info: ClarificationInfo; answers: ClarificationAnswer[] }) {
+  const pickedLabels = choice
+    ? clarificationAnswerLabels(choice.info, choice.answers)
+    : []
   const text = choice ? '' : input.value.trim()
-  const displayText = choice ? `选择：${picked?.label ?? '澄清选项'}` : text
+  const displayText = choice
+    ? `选择：${pickedLabels.join('；') || '澄清选项'}`
+    : text
   if ((!choice && !text) || !currentId.value || loading.value) return
   // 工作区没好就不发（输入框此时也是禁用的，这里兜住其它触发路径）
   if (!workspaceReady.value) return
@@ -1509,7 +1520,12 @@ async function sendTurn(choice?: { info: ClarificationInfo; index: number }) {
       id,
       text,
       controller.signal,
-      choice ? { clarificationId: choice.info.id, choice: choice.index } : undefined,
+      choice
+        ? {
+            clarificationId: choice.info.id,
+            answers: choice.answers,
+          }
+        : undefined,
     )
   } catch (e: any) {
     if (streamAbort === controller) streamAbort = null
@@ -1547,12 +1563,14 @@ async function send() {
   await sendTurn()
 }
 
-function chooseClarification(index: number) {
+function submitClarification(answers: ClarificationAnswer[]) {
   const info = clarification.value
   if (!info || clarificationBusy.value) return
+  const expected = clarificationSteps(info).length
+  if (!expected || answers.length !== expected) return
   clarification.value = null
   clarificationBusy.value = true
-  void sendTurn({ info, index }).finally(() => {
+  void sendTurn({ info, answers }).finally(() => {
     clarificationBusy.value = false
   })
 }
@@ -2211,7 +2229,7 @@ onUnmounted(() => {
       v-if="clarification"
       :info="clarification"
       :busy="clarificationBusy"
-      @choose="chooseClarification"
+      @submit="submitClarification"
       @other="otherClarification"
       @close="clarification = null"
     />

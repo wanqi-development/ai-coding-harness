@@ -425,8 +425,11 @@ class V3Translator:
     免得同一份文本被过滤两遍、口径还不一致。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_todos: bool = True) -> None:
         self.parts = StreamParts()
+        #: qa 没有 write_todos 工具。模型偶尔仍会伪造这个 tool-call，若照常翻译，
+        #: 就会出现「查一下、答一下」的幽灵清单；不可用的工具事件必须在这里丢掉。
+        self._allow_todos = allow_todos
         # 主清单（顶层；子项在 tree() 里现挂）
         self._main: list[dict[str, str]] = []
         # (namespace, block 下标) → 这个块是不是 write_todos。下标按消息编号，所以必须
@@ -688,6 +691,8 @@ class V3Translator:
         return None
 
     def _on_block_start(self, namespace: tuple[str, ...], payload: dict) -> None:
+        if not self._allow_todos:
+            return
         block = payload.get("content")
         if not isinstance(block, dict):
             return
@@ -731,7 +736,11 @@ class V3Translator:
 
             return [{"type": "ai", "content": text}]
         index = payload.get("index")
-        if delta.get("type") != "block-delta" or (namespace, index) not in self._todo_blocks:
+        if (
+            not self._allow_todos
+            or delta.get("type") != "block-delta"
+            or (namespace, index) not in self._todo_blocks
+        ):
             return []
         args = (delta.get("fields") or {}).get("args")
         if not isinstance(args, str):
@@ -754,7 +763,10 @@ class V3Translator:
         return self._names.get(call_id) or "subagent"
 
     def _on_block_finish(self, namespace: tuple[str, ...], payload: dict) -> list[dict]:
-        if (namespace, payload.get("index")) not in self._todo_blocks:
+        if (
+            not self._allow_todos
+            or (namespace, payload.get("index")) not in self._todo_blocks
+        ):
             return []
         items = finished_items(payload.get("content"))
         if items is None:

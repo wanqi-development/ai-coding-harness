@@ -1,159 +1,333 @@
 # ai-coding-harness
 
-基于 [deepagents](https://github.com/langchain-ai/deepagents) + [OpenSandbox](https://open-sandbox.ai/) 的 coding 辅助 harness 智能体。
+基于 [deepagents](https://github.com/langchain-ai/deepagents) + [OpenSandbox](https://open-sandbox.ai/) 的本地优先、单租户 coding agent harness。
 
 ## 是什么
 
-单用户 HTTP 服务。每轮先按仓库 PR 状态收口候选，再判定**意图**（`qa` / `plan` / `coding` / `rework`），由意图映射到**形态**取对应装配；文件与命令操作全部在隔离的 OpenSandbox 沙箱内执行，结果经 SSE 流式返回（支持断线续传与中途终止）。
+每轮对话先读取仓库真实状态，再决定该走问答、方案、编码还是既有 PR 返工；代码与命令只允许在隔离沙箱中执行，事件通过 SSE 流式返回。仓库记忆、方案、PR 状态、历史记录和 token 账都持久化，刷新页面或重连后可以继续。
 
-## 架构
+当前重点能力：
 
-- **接口**：FastAPI，SSE 流式。一轮对话分两段：`POST /chat/{id}` 起一轮并就地订阅，`GET /chat/{id}/stream` 供刷新后接回（帧带自增 id 作游标）。暂无鉴权。
-- **LLM**：按**角色 → 设置页里的一行**选模型（映射只有一份：`agent/llm.py::_AGENT_KEY`，行清单见 `config.MODEL_AGENT_ROWS`）。**没有 `.env` 出厂默认**（2026-10-15 起）：一行没配，用到这个角色的那一轮就当场报错并指认是哪一行。解析顺序 **① 该行的配置 → ②「统一模型」那一行（只兜底没配的行）**。全部走 OpenAI 兼容协议（`langchain-openai`）。主模型重试耗尽时切设置页「兜底模型」那一行；连续失败到阈值开**熔断**，冷却期内不再撞主导。
-- **意图判定**（`server/intent.py`）：每轮只查一次全量 PR，不做跨轮接口缓存。轮首同步仓库记忆：比记忆水印新的 PR 批量摘要一次并落盘，已有 PR 只修正不一致的状态；随后按 open PR 收口候选（无 open PR：`qa / plan / coding`，有 open PR：`qa / rework`，查询失败：`qa`）。再走口令 → **JEV 或 大模型（严格二选一）** → 关键字口径和函数闸门。
-- **形态**（`agent/profiles.py`）：**唯一的装配轴**，一处定下挂哪些子智能体、给哪些主工具、用哪套角色提示词。三种形态：`qa`（只读问答 / 解释 / 排查）、`plan`（自己出方案并落库）、`orchestrate`（唯一挂 planner / coder / reviewer 的形态）。`coding` 与 `rework` 共用 `orchestrate`，差别由逐轮意图指令决定。
-- **中间件**（`agent/middleware/` 与 `agent/summarization.py`，装配点在 `agent/graph.py` 与 `agent/subagents.py`，逐角色各建实例）：
+- 状态优先意图：无 open PR 时使用 `qa / plan / coding`，有 open PR 时使用 `qa / rework`。
+- 三种主形态：`qa`、`plan`、`orchestrate`；coding/rework 共用 orchestrate，并挂 planner / coder / reviewer 三个子智能体。
+- PR 感知：每轮实时查询一次 PR，同时用于意图候选、状态闸门和仓库记忆同步。
+- 上下文工程：中英混合 token 估算、在线校准、持久化工具裁剪事件、到线摘要与完整历史 offload。
+- 流式可观测：正文、reasoning、待办、工具、方案、token、文件 diff、handoff 内层 run 树。
+- 本地工作台：聊天、代码、记忆、PR、日志、Token，以及整页设置。
 
-| 模块 | 作用 |
-|---|---|
-| `context_inject` | 每次模型调用前注入**本轮意图**与澄清块；能力差异由基础提示词的通用规则约束（历史轮次的工具可用性不作数） |
-| `redaction` | 凭据脱敏的两条出口：工具返回值、模型输出 |
-| `tool_integrity` | 工具调用配对自洽：空 id 归一、invalid call 最多重试 3 次后降级为正文、工具异常兜底、历史整表修复 |
-| `boundary` | 按智能体的活动范围：从可见工具里摘掉越界的，执行前再判一次 |
-| `read_guard` | 读文件红线：policies ≤80 行、project ≤200 行；`cat` 等整文件命令直接拦 |
-| `guard` | 本轮**空转刹车**：同一工具同一参数反复调用时，先劝、再停 |
-| `fallback` | 主导失败时切兜底，并留一条 `MODEL_FALLBACK` 的痕 |
-| `summarization` | 压缩（摘要）。按角色分档：`qa` / `coding` / `orchestrate` / `rework` 稳态（窗口 70%），主控 `plan` 与子智能体 `planner` / `coder` / `reviewer` 爆发（窗口 40%）。到线先写**持久化工具裁剪事件**：只记录工具调用 ID，运行时把大工具结果 / 大入参投影成占位符，原始 checkpoint 不变；没有新增可裁项或仍超线才摘要 |
+## 总体架构
 
-- **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
-- **文件后端**：混合 `CompositeBackend` —— default 走自定义 OpenSandbox 后端，`/memories/` 走 `StoreBackend`。
-- **Redis（可选）**：多 worker 时的**跨进程旁路状态** —— 一轮对话的帧缓冲（刷新/断线后落到哪个 worker 都能带 `after` 游标接回）、会话运行权（同一会话不许两个 worker 同时跑）、模型熔断状态。帧号由 `INCR` 发，缓冲有上限与 TTL。**不配 `REDIS_URL` 就全部留在进程内**（单 worker 的行为，默认）；配了但连不上会退回进程内并记 warning，`REDIS_REQUIRED=true` 则直接拒绝启动。单条命令失败后退回进程内是**「冷却一段时间再试一次」而不是永久降级**（默认 60s）—— 走隧道 / 在远端的 Redis 一次瞬时抖动，不该让这个进程此后彻底失去跨进程能力。注意：**沙箱句柄仍在各 worker 里**（同一会话落到别的 worker 会另建容器，工作区靠命名卷共享），所以真要横向扩容还得配 sticky 路由或「谁持锁谁干活」的约束。
-- **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机自己 `git clone --bare` 一份只读缓存（按 `owner/repo`，`REPO_VIEW_DIR` 默认 **`~/.ai-coding-harness/repo_cache`**，即用户个人目录，不写进项目目录），切分支只是换个 ref，读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
-- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流；token 请求优先、平台配置兜底。**两个平台的 OAuth 登录后端都已就绪**（`/auth/gitee/*` 与 `/auth/github/*`，换回的 token 随 `create_session` 的 `gitee_token` / `github_token` 带上）；**前端还没接登录入口**，所以眼下实际用的仍是 `.env` 里的 `GITEE_ACCESS_TOKEN` / `GITHUB_ACCESS_TOKEN`（见 CHANGELOG 遗留项）。
-- **安全**：危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
-- **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（裁剪事件新增多少大结果 / 大入参、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。`handoffTask` 内层正文、思考、工具和日志以 `harness-run` 事件内嵌展示，run_id / parent_run_id 同时写入事件与日志。
-- **思考展示**：模型思考以 `reasoning` 帧单独下发，主控与子智能体按角色分段显示；它只存在于前端与 RunHub 的临时帧缓冲，**不落业务库**。流式期间正文按纯文本显示，任务结束后一次性 Markdown 化。
+- **接口**：FastAPI + SSE。`POST /chat/{session_id}` 起一轮并订阅，`GET /chat/{session_id}/stream?after=<帧号>` 刷新后接回；运行与 HTTP 请求生命周期解耦，终止必须调用 cancel。
+- **模型路由**：按智能体角色选择设置页里的模型行。主智能体不缓存，每轮现建，因此模型配置下一轮生效。
+- **意图判定**：轮首先取一次 PR 快照和仓库记忆状态，再按候选集、口令、JEV 或大模型、关键字兜底依次判定。PR 状态不一致时由纯函数闸门拦截写操作。
+- **装配轴**：`agent/profiles.py` 决定主形态挂哪些工具、子智能体和提示词，避免多套分支漂移。
+- **执行环境**：每会话一个 OpenSandbox 容器，项目位于 `/ai_coding/project`；policies、skills、Maven 与初始化脚本建会话时从仓库推入。
+- **文件后端**：CompositeBackend 将普通文件、`/memories/`、`/conversation_history/`、`/large_tool_results/` 路由到沙箱或持久 StoreBackend。
+- **持久化**：PostgreSQL 保存会话、仓库、方案、记录、澄清、模型配置和运行配置；LangGraph checkpoint 保存会话状态。
+- **Redis（可选）**：多 worker 时保存运行帧缓冲、会话运行权和模型熔断状态。未配置时自动使用进程内实现。
 
 ## 意图与形态
 
-所有形态都带联网工具（`web_search_tool` / `fetch_url`）与 `handoffTask`（这一轮做不了时交接给合适的形态），下表只列各形态**特有**的平台工具。
+| 意图 | 形态 | 主要职责 |
+|---|---|---|
+| `qa` | `qa` | 只读问答、解释、排查、需求澄清，以及查询现有仓库/PR/文件/任务状态 |
+| `plan` | `plan` | 方案讨论、方案落库、步骤设计；不写任务代码 |
+| `coding` | `orchestrate` | 没有 open PR 时实施新任务；普通代码走 planner → coder → reviewer，纯文档由 coder 直做并创建 PR |
+| `rework` | `orchestrate` | 跟进已有 open PR：审查、回评、按用户要求或审查意见修改既有分支 |
 
-| 意图 | 说明 | 形态 | 该形态特有的工具 |
-|---|---|---|---|
-| `qa` | 只读问答、解释、排查、需求澄清；也回答仓库 / PR / 记忆现状 | `qa` | `get_pr_info`、`list_pr_comments`；可写 `/ai_coding/tmp` 取证台账，不改任务代码 |
-| `plan` | 技术方案 / 设计 | `plan` | `get_pr_info`、`storePlan`、`getPlan`、`updatePlan`、`updatePlanSteps`、`deletePlan`（方案增删改查全归这一态；**不写记忆** —— 这一轮还没动代码） |
-| `coding` | 写代码 | `orchestrate` | `task`（派子智能体）、`get_pr_info`、`list_pr_comments`、`comment_pr`、`close_pr`、`get_unexecuted_plan`（**只读**：主控先查有没有可执行的方案）、`save_repo_memory`。明确要动手时：查到方案直接派 coder；没有先派 planner，**落库后不等确认**，一路 coder → reviewer 跑完；只是描述需求时，方案出来先停下等确认 |
-| `rework` | PR 跟进：审查 open PR、回评、按意见或用户新要求继续改既有分支 | `orchestrate`（与 `coding` 共用装配） | 同上。只审查时派 reviewer；要改代码时派 coder，改完再派 reviewer 复查；不新建分支 / PR |
+约束：
 
-`qa` 与 `plan` 都拿不到记忆写工具；仓库记忆正文只在 `coding` / `rework` 收尾由主控写回。PR 的新增记录与状态由轮首 / 轮末平台同步维护。
+- 有 open PR 时，`coding` / `plan` 会被状态闸门拦截，写操作只能走 `rework`。
+- 没有 open PR 时不能进入 `rework`。
+- `review` 不再是独立主控形态；reviewer 是 coding/rework 的内部子智能体。
+- `qa` 和 `plan` 不写仓库记忆；仓库记忆正文只在 coding/rework 收尾写回。
+- **纯文档直做**：任务只新增 / 修改 `AGENTS.md`、README、`docs/` 或其他 `.md` / `.mdx` /
+  `.rst` / `.adoc`，且不涉及源码、测试、配置、依赖或构建文件时，coding 主控只维护任务清单并
+  直接派 coder；不查询或创建方案，不派 planner，也不派 reviewer。
+- coder 从 `docs/<主题>` 分支修改文档，校验链接、路径、命令与仓库事实后提交并创建 PR。
+  若文档必须依赖代码改动才能成立，则停止直做并回到普通 coding 流程。
 
-意图判定走**状态候选 + 四关瀑布**：候选集先按 open PR 收口，再走 **口令** → **JEV / SystemOne** → **大模型** → **关键字口径**。每一关的结论都如实标在日志的 `source=` 上（`keyword` / `jev` / `llm` / `fallback` / `state`）。
+所有主形态都能使用联网工具和 `handoffTask`。handoff 的目标形态由服务端重新判定，不允许当前模型自行指定。
 
-> 三个子智能体（`planner` / `coder` / `reviewer`）由 `coding` 与 `rework` 通过 `task` 派下去，各自取自己的模型（见 `agent/llm.py` 的角色路由表）。
+### 意图澄清弹窗
 
-## 行为约束
+- 低置信度或必要业务口径采用分步弹窗：一页一个问题，点击选项后自动进入下一页。
+- 第一步只负责确定 `qa / plan / coding / rework` 意图；后续步骤收集无法从仓库推断的业务口径。
+- 最后一页展示全部选择，确认后通过 `answers[{step_id,choice}]` 一次提交；全选完成后才消费待澄清状态。
+- qa 不挂 `write_todos`；模型伪造的待办调用会被事件翻译层丢弃。澄清记录不保存原始
+  `<CLARIFY>`、过程旁白或伪待办，历史回放只展示最终问题。
 
-- **先摸清再动手**：主控先用 `write_todos` 写出本轮清单，再自己处理或派子智能体（子智能体的清单要挂在这份上才显示得出来）。这份清单是界面上唯一的进度，条目按用户原话里的对象写。
-- **空转刹车**：同一工具、同一参数在本轮重复到 `LOOP_GUARD_REPEATS`（默认 3，`0` = 关掉）次时先收到一条不执行的警告，再重复一次即本轮收尾。
-- **终止**：`POST /sessions/{id}/cancel` 中断当前这一轮。运行刻意剥在请求生命周期之外 —— 断开流只断订阅，停不掉它，必须显式取消。
+## 中间件
+
+装配点在 `agent/graph.py`、`agent/subagents.py`，主要能力如下：
+
+| 模块 | 作用 |
+|---|---|
+| `BoundaryMiddleware` | 按角色隐藏越界工具，执行前再校验目录与命令 |
+| `MemoryMiddleware` | 按形态加载、裁剪并注入仓库记忆 |
+| `ReadGuardMiddleware` | policies ≤80 行、project ≤200 行；拦整文件读取命令 |
+| `DelegationGateMiddleware` | 主控调用 `task` 前必须有本步骤对应的 `write_todos` 更新 |
+| `LoopGuardMiddleware` | 同一工具同一参数重复调用时先劝、再中止 |
+| `ToolCallIdMiddleware` | 补空 tool-call id；invalid tool call 带错误原因最多重试 3 次，仍失败则降级成正文 |
+| `ToolErrorGuardMiddleware` | 工具异常转换成错误 ToolMessage，不掀翻整个 superstep |
+| `HistoryRepairMiddleware` | 修复空 id、孤儿工具调用、旧 invalid content block |
+| `IntentMiddleware` | 注入本轮形态、实际可用工具和澄清块；不允许模型沿用上一轮能力结论 |
+| `RedactionMiddleware` | 工具返回与模型输出脱敏 |
+| `HarnessSummarizationMiddleware` | 上下文裁剪事件、摘要、角色化触发线和历史 offload |
+| `FallbackMiddleware` | 主模型失败时切兜底模型，并配合熔断 |
+| `StreamUsageMiddleware` | 兼容不同网关的流式 token usage |
+
+## 上下文工程
+
+### 计数与触发
+
+- token 估算按中英文实际比例混合：中文约 1.6 字符/token，代码/英文约 3.8。
+- 每次真实模型调用后用供应商 usage 做在线 EMA 校准。
+- 稳态角色：`qa`、coding/rework 主控；窗口 70% 或绝对 200k，先到先触发。
+- 爆发角色：`plan` 与 `planner / coder / reviewer`；窗口 40% 或绝对 120k，先到先触发。
+
+### 裁剪事件
+
+裁剪不是常规中间件，也不会直接覆盖 checkpoint：
+
+1. 到压缩线后先生成 `_context_trim_event`；
+2. 事件只存稳定的 `tool_call_id`；
+3. 本次请求动态拼接“摘要投影 + 裁剪投影”；
+4. 原始 `messages` 保持不变；
+5. 没有新的可裁项或仍高于安全区时直接摘要。
+
+默认阈值：
+
+- 工具结果小于 2000 字符不裁；
+- 入参小于 2000 字符不压缩；
+- 历史入参压缩默认关闭；开启后只压超大字符串字段，保留路径、offset、limit、timeout；
+- 当前步骤、`KEEP` 点名项和 `KEEP_TOOLS` 永不进入裁剪事件。
+
+### 摘要与恢复
+
+- 摘要与 offload 始终读取裁剪前的原始消息。
+- 被逐出的历史写到 `/conversation_history/{thread_id}.md`。
+- 摘要消息里保留历史文件路径，模型需要时可以回读。
+- 思考只实时展示，不写业务库，也不进入持久化上下文。
+
+## PR、仓库记忆与文件变更
+
+- 每轮只查询一次全量 PR，不做跨轮接口缓存。
+- 新 PR 批量生成摘要后增量写入仓库记忆；已有 PR 只同步变化的状态。
+- PR 同步入口只有两个：轮首记忆拦截点、coding/rework 轮末。
+- `save_repo_memory(section, payload)` 只接受 `change / gaps / decisions / basic`，平台负责合并、去重、渲染和限长。
+- coding/rework 若创建了 PR，本轮文件清单保存到本地代码缓存；刷新或沙箱销毁后仍可查看文件列表和按需 diff。
+
+## Handoff 内嵌 Run 树
+
+`handoffTask` 的内层运行与外层上下文隔离，但不再完全隐形：
+
+- 内层模型正文、reasoning、工具、待办和生命周期通过 `harness-run` 事件回传；
+- 每个节点带 `run_id / parent_run_id / root_run_id`；
+- 前端在 handoff 工具卡内嵌展示，不与外层正文混排；
+- reasoning 只实时展示，持久化时剔除；
+- 刷新后从记录 `extra.parts` 重建；
+- 文件日志带 `[run=... parent=...]`，日志面板默认按 run 父子树缩进。
+
+内层 token 会合并进本轮总账，并在 `by_actor` 中保留 planner/coder/reviewer 等角色。
+
+## 前端
+
+启动页是 Vue 3 + Vite 聊天工作台：
+
+- 输入框随内容增高，长历史向上滚动分页；
+- 正文流式纯文本，结束后整体 Markdown 化；
+- reasoning 与正文按到达顺序交错，结束后隐藏 reasoning；
+- 待办树、方案、澄清弹窗、handoff 内嵌 run 树；
+- 右侧栏：代码、记忆、PR、日志、Token；
+- 代码面板支持目录、文件、分支切换和左右 diff；
+- 日志面板支持关键字、级别、HTTP 噪声开关和 run 树视图；
+- “本轮改动”只在本轮创建 PR 时出现。
+
+设置页是整页工作台，入口在左栏品牌行的齿轮：
+
+- 基本设置；
+- 外观；
+- 模型配置；
+- 提供商目录。
+
+基本设置与外观存本机 localStorage；模型配置和运行期参数存 PostgreSQL。
+
+## 代码平台
+
+支持 Gitee 与 GitHub，平台由仓库地址自动判定：
+
+- PR 创建、评论、关闭、状态查询走统一接口，内部按平台分流；
+- 不提供 OAuth 登录入口；
+- 新会话使用 `.env` 中配置的 `GITEE_ACCESS_TOKEN` / `GITHUB_ACCESS_TOKEN`；
+- token 通过 git askpass/环境变量注入，不写进 URL、不写进 `.git/config`。
 
 ## API
 
-```
-POST   /sessions                    {"repo_url": "...", "gitee_token": "可选", "github_token": "可选"}  # 建会话（同仓库已有活跃会话则复用）
-GET    /sessions                    ?limit=50                                   # 会话列表
-GET    /sessions/{id}                                                           # 会话详情（含 running，刷新后据此决定是否接回直播）
-DELETE /sessions/{id}                                                           # 销毁会话
-POST   /sessions/{id}/workspace                                                 # 准备 / 取代码工作区
-GET    /sessions/{id}/records?limit=20&before_id=<id>                           # 历史一页（最近 20 条；before_id 向前翻）
-GET    /sessions/{id}/clarification                                             # 当前待回答的意图澄清（刷新恢复弹窗）
-GET    /sessions/{id}/plan                                                      # 最新方案（没有则 null）
-POST   /sessions/{id}/cancel                                                    # 终止当前这一轮
-GET    /sessions/{id}/repo                                                      # 右侧栏「代码」：本机缓存状态 + 分支（不联网）
-POST   /sessions/{id}/repo/sync                                                 # 下载（首次 clone）或更新（之后 fetch）这份缓存
-GET    /sessions/{id}/repo/tree             ?ref=<分支>&path=<目录>             # 列一层目录
-GET    /sessions/{id}/repo/file             ?ref=<分支>&path=<文件>             # 读一个文件（太大 / 二进制只回标记）
-GET    /sessions/{id}/memory                                                    # 右侧栏「记忆」：仓库记忆全文（只读）
-GET    /sessions/{id}/pulls                                                     # 右侧栏「PR」：本仓库 PR 列表与状态
-GET    /sessions/{id}/logs                  ?limit=300&q=<关键字>&with_http=false # 右侧栏「日志」：本会话日志（默认滤掉 HTTP 噪声）
-GET    /sessions/{id}/logs/download                                             # 下载整份日志（按时间线合并成一份）
-GET    /sessions/{id}/usage                                                     # 右侧栏「Token」：本会话消耗（按执行主角聚合）
-GET    /model-config                                                            # 模型配置：每行「库里填了什么」+「现在真的用谁」（effective）
-PUT    /model-config   {"rows": {"qa": {"base_url":…, "model":…, "api_key":…}}, "intent_mode": "jev"}  # 保存（留空＝不改）
-POST   /model-config/probe  {"base_url":…, "api_key":…}                          # 测试连接：拉厂商 /models（顺带读窗口）
-DELETE /model-config/{agent}                                                    # 清空这一行（界面上叫「清空这一行」）
-GET    /model-config/providers                                                  # 提供商目录全量（含停用）：设置页「提供商」栏用它
-PUT    /model-config/providers/{provider}                                       # 写一行提供商（整行覆盖；键不可改）
-POST   /chat/{id}                   {"message": "..."}                          # 起一轮（SSE 流式）
-                                     # 澄清选项：再加 {"clarification_id":"...","choice":0}
-GET    /chat/{id}/stream            ?after=<帧号>                               # 续订阅（刷新后接回）
-GET    /auth/gitee/authorize                                                    # 跳转 Gitee 授权页（带自签 state）
-GET    /auth/gitee/callback             ?code=...&state=...                     # 授权回调，验 state 后拿 code 换 token
-GET    /auth/github/authorize                                                   # 跳转 GitHub 授权页（同上）
-GET    /auth/github/callback            ?code=...&state=...                     # 授权回调（GitHub 必须回 Accept: application/json）
+```text
+POST   /sessions
+       {"repo_url":"..."}
+GET    /sessions?limit=50
+GET    /sessions/{id}
+DELETE /sessions/{id}
+POST   /sessions/{id}/workspace
+POST   /sessions/{id}/cancel
+
+GET    /sessions/{id}/records?limit=20&before_id=<id>
+GET    /sessions/{id}/clarification
+GET    /sessions/{id}/plan
+
+GET    /sessions/{id}/repo
+POST   /sessions/{id}/repo/sync
+GET    /sessions/{id}/repo/tree?ref=<branch>&path=<dir>
+GET    /sessions/{id}/repo/file?ref=<branch>&path=<file>
+GET    /sessions/{id}/repo/diff?base=<ref>&head=<ref>&path=<file>
+
+GET    /sessions/{id}/memory
+GET    /sessions/{id}/pulls
+GET    /sessions/{id}/logs?limit=300&level=&q=&with_http=false
+GET    /sessions/{id}/logs/download
+GET    /sessions/{id}/usage
+
+GET    /app-settings
+PUT    /app-settings
+
+GET    /model-config
+PUT    /model-config
+DELETE /model-config/{agent}
+POST   /model-config/probe
+
+GET    /model-config/providers
+PUT    /model-config/providers/{provider}
+GET    /model-config/providers/{provider}/models
+PUT    /model-config/providers/{provider}/models
+POST   /model-config/providers/{provider}/models/refresh
+POST   /model-config/providers/reload
+
+POST   /chat/{id}
+       {"message":"..."}
+       {"message":"...", "clarification_id":"...", "choice":0}
+GET    /chat/{id}/stream?after=<frame>
+
 GET    /health
 ```
 
-> 意图由服务端**自动判定**，请求里没有 `task_type` 这类参数。
+意图由服务端自动判定，客户端不传 `task_type`。
 
-## 目录
+## 主要目录
 
-```
+```text
 src/ai_coding_harness/
-├── api/            # FastAPI app、路由（model_config 按 agents / providers / probe 分包）、SSE、schemas
-├── server/         # 意图判定 + 业务编排（turn/ 按职责拆 mixin）+ 运行宿主（RunHub）
-├── agent/          # graph、llm、profiles、prompts、subagents（一主三从）
-│   └── middleware/ # 上下文注入 / 脱敏 / 工具自洽 / 边界 / 空转刹车 / 兜底
-├── db/             # 业务库 ORM / 引擎；dao/ 按表分组（会话 / 方案 / 记录 / 模型 / 澄清）
-├── backends/       # OpenSandbox 后端 + 混合路由
-├── sandbox/        # 沙箱供给 + SDK 客户端 + 工作区卷
-├── tools/          # PR（Gitee / GitHub）/ 方案 / 记忆 / 交接 / web 搜索 / 工具注册
-├── session/        # 会话管理 + checkpointer / store
-├── safety/         # 命令与工具边界策略 + 凭据脱敏
-├── core/           # 跨层契约：SSE 事件、git 平台判定、模型类型
-├── infra/          # 宿主机基础设施：Redis、仓库只读缓存、熔断
-└── observability/  # 日志 + trace
+├── api/                 # FastAPI、SSE、schemas、routes；model_config 按职责分包
+├── server/              # 意图、业务编排、RunHub、PR 状态与记忆同步
+│   └── turn/            # runner / intent / clarify / records / usage / changes mixin
+├── agent/               # graph、llm、profiles、prompts、subagents、chat_model
+│   └── middleware/      # 边界、上下文、记忆、工具完整性、循环守卫等
+├── backends/            # OpenSandbox 后端与 CompositeBackend
+├── db/                  # ORM、engine、按表拆分的 dao
+├── infra/               # Redis、本地只读 repo_cache、熔断
+├── observability/       # 日志、run log、日志筛选、tracing
+├── sandbox/             # 沙箱供给、代理、卷
+├── safety/              # 工具/目录策略、命令安全、脱敏
+├── session/             # 会话管理与 checkpointer/store
+└── tools/               # PR、方案、记忆、handoff、web、工具注册
 
-frontend/           # Vue3 + Vite 聊天界面（DeepSeek 风格：正文流、待办树、方案面板、终止 / 续传）
-sandbox/            # 推入沙箱的资产：deploy / policies / skills
-alembic/            # 数据库迁移
-docs/               # 参考资料（业务流程图、代码平台 PR API、沙箱镜像、工作区目录、记忆模板）
-start.sh / start.bat  # 一键启动前后端
+frontend/src/
+├── components/
+│   ├── panels/          # 代码 / 记忆 / PR / 日志 / Token
+│   ├── settings/        # 整页设置工作台
+│   └── HandoffRun.vue
+├── lib/                 # API、Markdown、流块、run 树、偏好
+└── App.vue
+
+sandbox/                 # 建会话时推入沙箱的 policies / skills / deploy 资产
+docs/                    # 设计、目录权限、PR API、评测、backlog
+alembic/                 # 数据库迁移
+start.sh / start.bat     # 一键启动
 ```
 
-## Setup
+## 环境与启动
+
+推荐 Python 3.11+ 和 conda 环境 `aicoding`：
 
 ```bash
-cp .env.example .env      # 填入模型 / Gitee 或 GitHub / OpenSandbox / PostgreSQL 配置
+cp .env.example .env
 pip install -e ".[dev]"
-alembic upgrade head      # 建业务表（PostgreSQL）
+alembic upgrade head
 npm --prefix frontend install
 ```
 
-> **依赖名注意（踩过坑）**
-> `pip install -e ".[dev]"` 会按 `pyproject.toml` **重装依赖**，因此依赖要写**发行名**，不是代码里的导入名。
-> 例：智谱 SDK 发行名是 **`zai-sdk`**（代码里 `import zai`）。若误写成 `zai`，PyPI 上的 `zai` 是个**空占位包**，会覆盖真 SDK 的文件 → `import` 失败 → **后端启动即崩**。
-> 另外：导入可选/第三方 SDK 建议放在**函数内懒加载**（本项目 `tools/web_search.py` 即如此），避免单个包出问题拖垮整个应用启动。
-
-## 启动
+一键启动：
 
 ```bash
-./start.sh                # Git Bash / Linux：一键起后端 + 前端
-start.bat                 # Windows：双击即可
+./start.sh
+start.bat
 ```
 
-或分别启动：
+分别启动：
 
 ```bash
-python -m ai_coding_harness.main       # 后端 http://127.0.0.1:8000
-npm --prefix frontend run dev          # 前端 http://localhost:5173
+python -m ai_coding_harness.main
+npm --prefix frontend run dev
 ```
 
-`.env` 关键配置：
+后端：`http://127.0.0.1:8000`
 
-- **模型**：**不在 `.env` 里配了**（2026-10-15 起）—— 谁用哪个模型在设置页 →「模型配置」里按智能体填，存表 `model_endpoints`、**下一轮生效**。唯一还用 `.env` 的是 `GLM_API_KEY` / `GLM_BASE_URL`（web 搜索那条工具）；`DEEPSEEK_*` / `KIMI_*` / `GPT_*` / `QWEN_*` / `*_CONTEXT_WINDOW` / `FALLBACK_PROVIDER` / `INTENT_MODEL|BASE_URL|API_KEY` / `TYPESAFE_API_KEY|BASE_URL|MODEL_NAME` 均已作废（`.env.example` 里逐条标注）。压缩（摘要）按角色分两档：**稳态** `qa` / 主控 `orchestrate`（coding / rework）按窗口 **70%** 触发，**爆发** 主控 `plan` 与子智能体 `planner` / `coder` / `reviewer` 按窗口 **40%** 触发；压完保留最近 20k，摘要那次调用最多吃 40k（`CONTEXT_STEADY_TRIGGER_FRACTION` / `CONTEXT_BURST_TRIGGER_FRACTION`，窗口解析不出来时才用 `CONTEXT_SUMMARY_TRIGGER_TOKENS` 兜底）。**平时不再做 40k 常规剪裁**，到压缩线的提醒线（默认 90%）先提醒模型写工作笔记与 `KEEP:` 清单，到线后的应急裁剪保留当前步骤 + KEEP 点名的工具返回，剪完低于线就不摘要。压缩那份中间件的取值由我们自己构造，上游那份按类排掉（`agent/summarization.py`）。两条**只提醒不改行为**的线不变：`CONTEXT_WARN_RATIO`（默认 0.6，输入框上方画细进度条）/ `CONTEXT_ALERT_RATIO`（默认 0.8，给警示语）。
-- **兜底与熔断**：兜底只有设置页「兜底模型」那一行（留空＝关掉）；`FALLBACK_CIRCUIT_THRESHOLD` / `FALLBACK_CIRCUIT_COOLDOWN_SECONDS` 仍从 `.env` 读。
-- **意图分类**：**严格二选一**（设置页 →「模型配置」→ 意图识别里选）—— JEV 那一行（供应商锁 `typesafe`，填 base_url + api_key）或「意图识别（大模型）」那一行。`INTENT_JEV_ENABLED` / `INTENT_LLM_ENABLED`（关掉某一侧）、`INTENT_TIMEOUT_SECONDS` / `INTENT_HISTORY_TURNS` / `TYPESAFE_TIMEOUT_SECONDS` 仍在 `.env`。
-- **运行约束**：`AGENT_RECURSION_LIMIT`、`LOOP_GUARD_REPEATS`（`0` = 关掉空转刹车）、`HANDOFF_RESULT_MAX`。
-- **业务**：`GLM_*`（智谱，web 搜索也用它）、`OPENSANDBOX_*` + `SANDBOX_*`（沙箱镜像 / 资产 / 工作区卷）、`GITEE_*` / `GITHUB_*`（两个平台的 PR 兜底 token、OAuth 登录凭据，GitHub 侧要先建 OAuth App 并把回调地址填成 `GITHUB_OAUTH_REDIRECT_URI`）、`POSTGRES_*`（业务库）。
-- **Redis（可选，多 worker 才需要）**：`REDIS_URL`（留空 = 进程内）、`REDIS_PREFIX`、`REDIS_REQUIRED`、`REDIS_TIMEOUT_SECONDS`（默认 5s；**Redis 走隧道 / 在远端时必须放大**）、`REDIS_DEGRADE_COOLDOWN_SECONDS`（一次失败后退回进程内多久再试一次，默认 60s；设 0 = 旧的「永久降级」），以及运行缓冲/运行权的 `RUN_BUFFER_TTL_SECONDS`、`RUN_BUFFER_MAX_FRAMES`、`RUN_LOCK_TTL_SECONDS`、`RUN_POLL_INTERVAL_SECONDS`。
+前端：`http://localhost:5173`
+
+## 关键配置
+
+### 代码平台
+
+```env
+GITEE_ACCESS_TOKEN=
+GITEE_USERNAME=
+GITHUB_ACCESS_TOKEN=
+GITHUB_USERNAME=
+```
+
+不再使用 OAuth client id/secret，也不接受创建会话时临时传入 token。
+
+### 模型
+
+模型不在 `.env` 中配置。进入设置页「模型配置」，按 `qa / plan / coding / coder / review / unified / fallback / jev / classifier` 等行配置。没有“全仓默认”：
+
+1. 先取该智能体自己的行；
+2. 没配时再取“统一模型”；
+3. 两边都没有则该角色本轮直接报错。
+
+### 运行期参数
+
+上下文告警线、默认分支、代码缓存路径等存 `app_settings`，通过设置页或 `/app-settings` 修改，立即生效。
+
+### 沙箱与持久化
+
+```env
+OPENSANDBOX_*
+SANDBOX_*
+POSTGRES_*
+REDIS_URL=
+```
+
+Redis 留空时使用进程内状态；生产多 worker 建议配置 Redis。
+
+## 验证
+
+```powershell
+$env:PYTHONPATH='src'
+conda run -n aicoding --no-capture-output python -m pytest -q
+
+D:\python-venv\ai_coding\Scripts\ruff.exe check <changed-files>
+python scripts/check_prompts.py
+npm.cmd --prefix frontend run build
+```
+
+## 更多文档
+
+- `CHANGELOG.md`：逐次改动、动机、验证与遗留。
+- `docs/config-page-design.md`：设置页与模型配置设计。
+- `docs/context-trim-event.md`：持久化裁剪事件。
+- `docs/workspace-directories.md`：工作区目录与权限。
+- `docs/code-platform-pr-api.md`：Gitee/GitHub PR API 差异。
+- `docs/repo-memory-template.md`：仓库记忆模板。
+- `docs/backlog.md`：已立项但尚未实施的事项。

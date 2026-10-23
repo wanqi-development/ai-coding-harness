@@ -54,16 +54,13 @@ async def create_session(
     的 ``reused`` 让前端直接落到既有会话上 —— 一个仓库同时只该有一份工作区，否则两个会话
     各占一个沙箱，各改各的代码。
 
-    平台由 ``repo_url`` 判定（gitee.com / github.com），令牌按平台取（``gitee_token`` /
-    ``github_token``），都没有就回落 .env 里该平台配置的那份。
+    平台由 ``repo_url`` 判定，令牌统一取该平台配置的 access token。
 
     代码工作区在后台建（~10s），接口立即返回，前端按 ``workspace_status`` 显示进度，
     打开会话时再 ``POST /sessions/{id}/workspace`` 等它就绪。
     """
     manager = request.app.state.manager
-    created = await manager.create_session(
-        req.repo_url, req.gitee_token, req.github_token
-    )
+    created = await manager.create_session(req.repo_url)
     request.app.state.sessions[created.session.public_id] = created.session
     if not created.reused:
         manager.start_provisioning(created.session)

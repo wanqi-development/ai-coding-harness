@@ -719,8 +719,8 @@ class Settings(BaseSettings):
     # 与平台**无关**：一个会话只装一个令牌，沙箱侧不必知道它来自 Gitee 还是 GitHub ——
     # 平台差异留在工具层（见 tools/git.py 的 build_git_client）。
     sandbox_git_token_env: str = "GIT_TOKEN"
-    # 注入沙箱的 git 认证用户名变量名（Gitee OAuth 用 oauth2、GitHub 用 x-access-token、
-    # PAT 场景用真实用户名；默认值由 codeplatform.Platform.default_git_username 给）
+    # 注入沙箱的 git 认证用户名变量名（默认 oauth2 / x-access-token，PAT 也可填真实用户名；
+    # 默认值由 codeplatform.Platform.default_git_username 给）
     sandbox_git_username_env: str = "GIT_USERNAME"
     # 沙箱创建后由应用经 `execute` 执行的初始化脚本（由 sandbox/deploy/sandbox/setup.sh
     # 推入，读沙箱内 `$GIT_TOKEN` 写 `.secrets`；必须不阻塞，勿含 `exec tail`）
@@ -740,17 +740,6 @@ class Settings(BaseSettings):
     github_username: str = ""
     github_base_url: str = "https://api.github.com"
     github_base_branch: str = ""
-
-    # Gitee OAuth（登录）
-    gitee_oauth_client_id: str = ""
-    gitee_oauth_client_secret: str = ""
-    gitee_oauth_redirect_uri: str = ""
-
-    # GitHub OAuth（登录）：与 Gitee 那三个同口径，见 api/routes/auth.py。
-    # redirect_uri 必须与 GitHub OAuth App 里登记的回调地址**逐字一致**。
-    github_oauth_client_id: str = ""
-    github_oauth_client_secret: str = ""
-    github_oauth_redirect_uri: str = ""
 
     # 右侧栏「代码」面板：**宿主机自己** clone 一份仓库做只读浏览（不经沙箱）。
     # 为什么要有：沙箱会没（TTL 到期、会话结束、首次创建失败），而「看看这个仓库的代码」
@@ -797,7 +786,7 @@ class Settings(BaseSettings):
         )
 
     def username_for(self, platform: Platform) -> str:
-        """该平台配置里的 git 用户名（PAT 场景用真实用户名，OAuth 场景留空走默认）。"""
+        """该平台配置里的 git 用户名；留空走平台默认值。"""
         return (
             self.github_username if platform is Platform.GITHUB else self.gitee_username
         )

@@ -105,6 +105,34 @@ async def test_post_streams_numbered_frames() -> None:
     assert [e["data"]["type"] for e in client.events] == ["ai", "done"]
 
 
+async def test_post_forwards_multi_step_answers() -> None:
+    svc = ScriptedService([{"type": "done"}])
+    app = _app(svc)
+    body = json.dumps(
+        {
+            "message": "",
+            "clarification_id": "clr-1",
+            "answers": [
+                {"step_id": "intent", "choice": 0},
+                {"step_id": "refund", "choice": 1},
+            ],
+        }
+    ).encode()
+    client = _Client("POST", "/chat/s-1", body=body)
+    await client.run(app)
+
+    assert svc.calls == [
+        {
+            "message": "",
+            "clarification_id": "clr-1",
+            "answers": [
+                {"step_id": "intent", "choice": 0},
+                {"step_id": "refund", "choice": 1},
+            ],
+        }
+    ]
+
+
 async def test_error_frames_also_carry_an_id() -> None:
     app = _app(ScriptedService([{"type": "error", "error": "炸了"}]))
     client = _Client("POST", "/chat/s-1", body=b'{"message":"hi"}')

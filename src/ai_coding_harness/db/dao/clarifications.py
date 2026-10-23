@@ -23,6 +23,7 @@ async def save_clarification(
     original_message: str,
     question: str,
     options: list[dict[str, Any]],
+    steps: list[dict[str, Any]] | None = None,
 ) -> Clarification:
     """写入本会话的待澄清状态；旧的一条直接替换（每个会话最多一条）。"""
     await db.execute(delete(Clarification).where(Clarification.session_id == session_id))
@@ -32,6 +33,7 @@ async def save_clarification(
         original_message=original_message,
         question=question,
         options=options,
+        steps=steps or [],
     )
     db.add(row)
     await db.flush()

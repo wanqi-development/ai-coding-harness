@@ -37,7 +37,7 @@ _ROLES: dict[str, dict[str, str]] = {
         "prompt": PLANNER_PROMPT,
     },
     "coder": {
-        "description": "按 planner 的方案实施代码、测试、更新记忆并创建 PR；以及按用户指定要修改的审查问题继续修复。",
+        "description": "按 planner 的方案实施代码、测试并创建 PR；按用户指定要修改的审查问题继续修复；纯文档任务可不经方案直接完成并创建 PR。",
         "prompt": CODER_PROMPT,
     },
     "reviewer": {

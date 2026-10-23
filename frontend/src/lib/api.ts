@@ -218,16 +218,31 @@ export interface RunTrace {
 
 /** 意图澄清弹窗里的一个候选；`intent` 由后端固定，label/description 是 qa 自由写的。 */
 export interface ClarificationOption {
-  intent: string
+  intent?: string
   label: string
   description?: string
+  value?: string
+}
+
+/** 多步澄清中的一页。第一步负责确定 intent，后续步骤补充业务口径。 */
+export interface ClarificationStep {
+  id: string
+  question: string
+  options: ClarificationOption[]
+}
+
+export interface ClarificationAnswer {
+  step_id: string
+  choice: number
 }
 
 /** SSE `clarification` 帧 / GET 待澄清接口的同一份载荷。 */
 export interface ClarificationInfo {
   id: string
-  question: string
-  options: ClarificationOption[]
+  /** 兼容旧后端的单题字段。 */
+  question?: string
+  options?: ClarificationOption[]
+  steps?: ClarificationStep[]
   allow_other?: boolean
 }
 
@@ -772,11 +787,16 @@ export async function postChat(
   id: string,
   message: string,
   signal?: AbortSignal,
-  options?: { clarificationId?: string; choice?: number | string },
+  options?: {
+    clarificationId?: string
+    choice?: number | string
+    answers?: ClarificationAnswer[]
+  },
 ): Promise<Response> {
   const body: Record<string, unknown> = { message }
   if (options?.clarificationId) body.clarification_id = options.clarificationId
   if (options?.choice !== undefined) body.choice = options.choice
+  if (options?.answers?.length) body.answers = options.answers
   const resp = await fetch(`/chat/${id}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

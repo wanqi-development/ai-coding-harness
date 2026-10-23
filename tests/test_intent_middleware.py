@@ -163,7 +163,9 @@ def test_clarification_block_ranks_candidates_and_forbids_execution():
     assert "不要直接执行" in text
     assert "不要调用 handoffTask" in text
     assert "<CLARIFY>" in text
-    assert '"options"' in text
+    assert '"steps"' in text
+    assert '"value":"a"' in text
+    assert "2~4 个选项" in text
     assert "qa / plan / coding / rework" in text
 
 

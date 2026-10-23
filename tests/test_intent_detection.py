@@ -109,6 +109,12 @@ class TestStrongKeywords:
         assert match_strong("先出个方案") == "plan"
         assert match_strong("开始实施") == "coding"
         assert match_strong("按这个方案做吧") == "coding"
+        assert match_strong("写技术文档") == "coding"
+        assert match_strong("更新 README 并提 PR") == "coding"
+        assert match_strong("写 AGENT.md") == "coding"
+        assert match_strong("写 AGENTS.md") == "coding"
+        assert match_strong("给我出一个写文档的方案") is None
+        assert match_strong("先讨论文档结构，不要写") is None
 
     def test_open_pr_review_and_fix_commands_are_rework(self) -> None:
         for message in (

@@ -12,6 +12,7 @@ from langchain_core.runnables import RunnableConfig
 from ai_coding_harness.agent.clarification import parse_clarification
 from ai_coding_harness.agent.middleware import TurnState, TurnStop
 from ai_coding_harness.agent.profiles import (
+    QA_FORM,
     profile_for,
 )
 from ai_coding_harness.core.stream import (
@@ -100,6 +101,7 @@ class TurnRunnerMixin:
         *,
         clarification_id: str | None = None,
         choice: int | str | None = None,
+        answers: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """处理用户消息。
 
@@ -121,9 +123,12 @@ class TurnRunnerMixin:
         )
         # 结构化选择：先消费 pending；普通消息则立刻让旧澄清失效（用户口径 2026-10-19）。
         chosen: tuple[str, str, str] | None = None
-        if clarification_id and choice is not None and str(choice) != "other":
+        if clarification_id and (answers or choice is not None) and str(choice) != "other":
             chosen = await self._consume_clarification(
-                session, clarification_id=clarification_id, choice=choice
+                session,
+                clarification_id=clarification_id,
+                choice=choice,
+                answers=answers,
             )
             if chosen is None:
                 if not message.strip():
@@ -390,7 +395,7 @@ class TurnRunnerMixin:
         # 能力交接的内层那一轮把它的用量交回来：它的事件流被摘掉（见 tools/handoff.py），
         # 不接这一根，Token 面板会漏掉整段。
         state.usage_sink = run_log.merge_usage
-        translator = V3Translator()
+        translator = V3Translator(allow_todos=profile_for(intent).form != QA_FORM)
         names = ToolNames()
         # task 的 tool_call_id → 派的是哪个子智能体。只为一件事：工具帧上带角色，前端
         # 才说得出「正在编码」而不是笼统的「正在处理子任务」。收尾那帧也得带 —— 不带的话
@@ -582,6 +587,7 @@ class TurnRunnerMixin:
                     original_message=message,
                     question=parsed.question,
                     options=[option.as_dict() for option in parsed.options],
+                    steps=[step.as_dict() for step in parsed.steps],
                 )
                 if clarification_frame is not None:
                     text = parsed.question
@@ -624,7 +630,9 @@ class TurnRunnerMixin:
         if clarification_frame is not None:
             extra["clarification"] = clarification_frame
         # parts 只在真的出现过待办或 handoff run 树时才写；纯正文的回合 content 已够回放。
-        if translator.parts.has_todos or persistent_run_events:
+        if clarification_frame is None and (
+            translator.parts.has_todos or persistent_run_events
+        ):
             parts = _redacted_parts(translator.parts.data, terms)
             if persistent_run_events:
                 parts.append({"kind": "handoff", "events": persistent_run_events})

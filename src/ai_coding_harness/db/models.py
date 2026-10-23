@@ -461,6 +461,12 @@ class Clarification(Base):
     options: Mapped[list] = mapped_column(
         JSONB, nullable=False, comment="候选：[{intent,label,description}]，顺序即展示顺序"
     )
+    steps: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default="[]",
+        comment="多步澄清：[{id,question,options}]；旧记录为空，读取时回退 question/options",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
     )

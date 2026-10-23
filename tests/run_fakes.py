@@ -21,8 +21,10 @@ class ScriptedService:
 
     def __init__(self, frames: list[dict[str, Any]]) -> None:
         self.frames = frames
+        self.calls: list[dict[str, Any]] = []
 
-    async def chat(self, session, message):
+    async def chat(self, session, message, **extra: Any):
+        self.calls.append({"message": message, **extra})
         for frame in self.frames:
             await asyncio.sleep(0)
             yield frame
@@ -34,8 +36,10 @@ class GatedService:
     def __init__(self, frames: list[dict[str, Any]]) -> None:
         self._frames = frames
         self._gate = asyncio.Event()
+        self.calls: list[dict[str, Any]] = []
 
-    async def chat(self, session, message):
+    async def chat(self, session, message, **extra: Any):
+        self.calls.append({"message": message, **extra})
         for frame in self._frames:
             await self._gate.wait()
             self._gate.clear()

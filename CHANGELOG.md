@@ -25,6 +25,51 @@
 
 ### 2026-10-23
 
+#### 澄清改为分步弹窗，并修复 qa 幽灵待办与原始 CLARIFY 回放
+
+- **动机**：低置信度澄清已经使用弹窗，但单步协议无法承载多个关键口径；同时 qa 没有
+  `write_todos`，模型伪造的 `write_todos` tool-call 仍被流翻译器收成幽灵待办，并连同原始
+  `<CLARIFY>` 和过程旁白写进 `extra.parts`，前端回放时出现怪异文字版。
+- **改动**：
+  - `<CLARIFY>` 协议扩展为 1~3 个 `steps`：第一步用 intent 选项确定轮次，后续步骤用
+    `value + label` 收集业务口径。
+  - `clarifications` 新增 `steps` JSONB；旧记录继续用 `question/options` 回退。
+  - 新请求一次提交 `answers[{step_id,choice}]`，后端校验每一步都有选择，再组装原用户消息
+    与全部选项并按第一步 intent 执行。
+  - `ClarificationDialog` 改成逐页选择、可返回上一步、最后统一确认；支持旧单题协议。
+  - `V3Translator(allow_todos=False)` 用于 qa，丢弃模型伪造的 `write_todos`。
+  - 澄清成功后不再保存原始过程正文/伪待办；前端回放旧记录时若存在 `extra.clarification`
+    则只展示最终 `content`。
+- **关键决策**：第一页固定负责意图，后续页面只补业务口径；选择过程在前端本地暂存，最终
+  一次提交后才消费 pending，避免产生半完成状态。
+- **验证**：定向测试 **124 passed**；全量 `pytest` **1293 passed, 2 warnings**；
+  `npm --prefix frontend run build` 通过；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check`、`git diff --check` 通过；Alembic head 为 `b2c3d4e5f6a7`，离线 SQL 生成通过。
+- **遗留**：本地 PostgreSQL 当前从 `192.168.220.1` 访问 `192.168.220.128:5432` 被
+  `pg_hba.conf` 拒绝，真实库尚未升级；修好网络 / `pg_hba` 后执行
+  `python -m alembic upgrade head`。中途刷新会回到第一步，尚未持久化未完成的分步选择。
+
+#### 纯文档任务跳过 planner 与 reviewer，由 coder 直做
+
+- **动机**（用户口径）：`AGENTS.md`、README、`docs/` 下的技术文档等纯文档任务不涉及代码行为，
+  不应为了走固定流程先出方案；coder 可以直接修改、校验并创建 PR。
+- **改动**：
+  - coding 主控新增最高优先级的纯文档分支：只写清单，直接派 coder；不查 / 不建方案，
+    不派 planner 和 reviewer。
+  - coder 新增流程 C：纯文档直做；不调用方案工具，从 `docs/<主题>` 分支修改文档、
+    校验链接 / 路径 / 命令 / 事实后提交并创建 PR。
+  - 明确纯文档白名单：`AGENTS.md`、README、`docs/` 与其他 `.md` / `.mdx` / `.rst` / `.adoc`；
+    不得改源码、测试、配置、依赖或构建文件。
+  - 文档与代码混合、或文档必须依赖代码改动才成立时，仍走普通 coding 流程。
+  - 意图层把“写 / 补 / 修改 / 更新文档”纳入 coding，避免在进入纯文档分支前被判成 qa / plan。
+  - `task` 工具中的 coder 描述同步说明纯文档能力。
+- **关键决策**：纯文档跳过 planner 和 reviewer 两步；coder 一旦发现必须改代码，立即停止并回报，
+  不静默扩大范围。
+- **验证**：提示词 / 意图路由 / profile / 工具注册定向测试 **84 passed**；
+  全量 `pytest` **1288 passed, 2 warnings**；`npm --prefix frontend run build` 通过；
+  `scripts/check_prompts.py` 冲突 0 条；`ruff check` 与 `git diff --check` 通过。
+- **遗留**：本次只改行为契约；尚未用真实会话跑一遍纯文档 PR 做端到端验证。
+
 #### 修复长交接后界面显示 0 字并封死澄清轮执行
 
 - **动机**：真实会话 `cb4c905c-b6af-4cbf-9435-ba1e49cbff19` 中，用户消息
@@ -44,6 +89,25 @@
   `scripts/check_prompts.py` 冲突 0 条；改动 Python 文件 `ruff check` 与
   `git diff --check` 通过。
 - **遗留**：需要真机验证长连接被代理截断时的自动接回；本次未改动旧记录的展示数据。
+
+#### 移除 OAuth 登录并按当前实现重写 README
+
+- **动机**（用户口径）：代码平台只使用配置项中的 Gitee/GitHub access token，不再提供
+  OAuth 授权登录；README 已长期落后于当前意图、中间件、前端、API 和运行方式。
+- **改动**：
+  - 删除 `api/routes/auth.py` 与 `tests/test_auth_routes.py`，从 FastAPI app 卸载 `/auth/*`。
+  - 删除 Gitee/GitHub OAuth client id/secret/redirect 配置与 `.env.example` 对应键。
+  - `CreateSessionRequest` 只保留 `repo_url`；创建会话不再接受请求级
+    `gitee_token/github_token`，统一取平台配置的 `GITEE_ACCESS_TOKEN` /
+    `GITHUB_ACCESS_TOKEN`。
+  - 清理 backlog、沙箱安全文档和代码注释中把 OAuth 当默认凭据来源的表述。
+  - 按当前实现重写 README：状态优先意图、三形态、一主三从、上下文裁剪事件、PR/记忆同步、
+    handoff run 树、整页设置、右侧栏、当前 API、目录结构、启动与验证。
+- **关键决策**：不做 OAuth 兼容入口；配置 token 是唯一凭据来源。已有会话继续使用数据库里
+  已保存的旧凭据，直到删除并重建会话。
+- **验证**：建会话 / 路由 / 平台 / 运行配置定向测试 **39 passed**；全量 `pytest`
+  **1285 passed, 2 warnings**；改动文件 `ruff check` 与 `git diff --check` 干净。
+- **遗留**：无。
 
 #### handoff 内层改为 run 树：正文、思考、工具与日志内嵌展示
 

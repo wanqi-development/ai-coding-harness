@@ -335,6 +335,17 @@ def test_todos_emitted_progressively_then_authoritative_on_finish() -> None:
     assert tr.parts.has_todos is True
 
 
+def test_disallowed_todos_are_ignored_even_if_the_model_hallucinates_them() -> None:
+    """qa 没有 write_todos；模型伪造该调用时不能生成前端/落库用的幽灵清单。"""
+    tr = V3Translator(allow_todos=False)
+
+    assert tr.feed(todo_start()) == []
+    assert tr.feed(todo_delta('{"todos":[{"content":"幽灵任务","status":"pending"}]}')) == []
+    assert tr.feed(todo_finish([{"content": "幽灵任务", "status": "completed"}])) == []
+    assert tr.parts.has_todos is False
+    assert tr.parts.data == []
+
+
 def test_todos_args_is_accumulated_not_appended() -> None:
     """``fields.args`` 每片都是**累加值**，当成增量累加会把前几项重复捞出来。"""
     tr = V3Translator()

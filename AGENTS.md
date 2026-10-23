@@ -208,6 +208,11 @@
 - **coder 的 rework 按模块编排**（`prompts._CODER_ROLE` B 流程）：先核验确认问题，再按
   模块 / 目录分组（**不按 P0/P1**），`write_todos` 一项对应一个模块；同模块改完先跑该
   模块测试，全部模块后再做一次全量。
+- **纯文档任务走 coder 直做**（`prompts._CODER_ROLE` C 流程）：`AGENTS.md`、README、`docs/`
+  与其他 `.md` / `.mdx` / `.rst` / `.adoc`，且不涉及源码、测试、配置、依赖、构建文件时，
+  主控只写清单后直接派 coder；**不查 / 不建方案，不派 planner，不派 reviewer**。
+  coder 从 `docs/<主题>` 分支改文档、校验链接 / 路径 / 命令 / 事实并创建 PR；若必须改代码，
+  立即停止上报，回到普通 coding 流程。
 - **读文件红线由中间件拦**（`ReadGuardMiddleware`，主控与三个子智能体都挂）：
   `read_file` 读 `/ai_coding/policies` 必须显式给 `limit` 且 ≤80 行、`/ai_coding/project`
   ≤200 行；`execute` 里的 `cat` / `less` / `more` / `nl` / `tac` 读这两处一律拦，
@@ -247,17 +252,21 @@
   收尾、关闭/删除方案时清空。路由 JSON 解析失败重试一次。
 - **低置信度转 qa 澄清**（`config.intent_clarify_confidence`，默认 **0.55**，0=关闭）：
   JEV/LLM 的 confidence 低于阈值时转 `qa` + `SOURCE_CLARIFY`，qa 用**提示词澄清模式**
-  （先只读了解上下文、列 2~3 个按可能性排序的候选、最后只问一个问题），**不把
+  （先只读了解上下文，按需要列 1~3 步可选项），**不把
   `write_todos` 还给 qa**。`active_task_override` 命中时优先继续干活，不追问。
   **澄清轮禁止 `handoffTask`**：工具层直接拒绝，避免把低置信度判断交给另一个形态长跑；
   这条不能只靠提示词。
   阈值来自 200 条实测：JEV <0.55 的 16 条只对 43.8%，≥0.55 的 147 条对 91.2%。
-- **澄清是结构化弹窗，不是自由文本追问**（2026-10-19）：qa 仍可自由措辞，但必须输出
-  `<CLARIFY>` + JSON（`question` + 2~3 个 `{intent,label,description}`，intent 还必须属于
-  本轮状态候选集）；后端解析后落表 `clarifications`（每会话最多一条）
-  并发 SSE `clarification` 帧。**任何新的用户消息先让旧 pending 失效**；前端点候选项走
-  `clarification_id + choice` 确定性映射、跳过意图模型，用**原始用户消息**执行；点“其他”
-  或关掉弹窗后自由输入，才重新走意图识别。别把它做成“让模型自己理解第一个/第二个”。
+- **澄清是分步结构化弹窗，不是自由文本追问**（2026-10-23 扩展）：qa 必须输出
+  `<CLARIFY>` + `steps` JSON。第一步用 `intent` 候选确定轮次；后续步骤用
+  `value + label` 收集业务口径。每步 2~4 个选项，最多 3 步。后端落表
+  `clarifications.steps`（旧 `question/options` 自动回退）；前端逐页选择、最终确认后
+  一次提交 `clarification_id + answers[{step_id,choice}]`，跳过意图模型并用原始用户消息
+  + 全部选择执行。**任何新的用户消息先让旧 pending 失效**；点“其他”或关掉弹窗后自由输入，
+  才重新走意图识别。
+- **qa 没有 `write_todos`，也不许伪造清单**：`V3Translator(allow_todos=False)` 必须丢弃
+  qa 模型产生的 `write_todos` tool-call；澄清成功后不要保存原始过程正文 / `<CLARIFY>` /
+  伪待办到 `extra.parts`，历史回放遇 `extra.clarification` 时以 `content` 为准。
 - **SSE 只有收到 `done` 才算完成**（`frontend/src/lib/api.ts`）：正常 EOF 也可能是代理
   截断；没有 `done` 就带游标重连。轮次收尾后前端按 `/records` 回填持久化助手记录，
   **数据库是最终事实来源**，直播半截内容不能覆盖已落库正文。

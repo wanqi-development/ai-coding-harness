@@ -52,7 +52,16 @@ class TestPlan:
 class TestCoding:
     def test_orchestrator_dispatches_instead_of_editing(self) -> None:
         assert "写代码/修复PR问题一律派 `coder`" in MAIN_AGENT_PROMPT
-        assert "审查一律派 `reviewer`" in MAIN_AGENT_PROMPT
+        assert "涉及代码的审查一律派 `reviewer`" in MAIN_AGENT_PROMPT
+
+    def test_pure_docs_skip_planner_and_reviewer(self) -> None:
+        coding = intent_directive("coding")
+
+        assert "纯文档直做（优先级最高）" in coding
+        assert "直接派 `coder`" in coding
+        assert "不要调用 `get_unexecuted_plan`" in coding
+        assert "`planner`，不要派 `reviewer`" in coding
+        assert "纯文档直做（强要求）" in MAIN_AGENT_PROMPT
 
     def test_every_code_change_ends_with_one_review(self) -> None:
         coding = intent_directive("coding")
@@ -98,6 +107,12 @@ class TestCoder:
     def test_pr_fix_flow_uses_existing_branch(self) -> None:
         assert "工作流程 B：修复 PR" in CODER_PROMPT
         assert "不新建分支、不新建 PR" in CODER_PROMPT
+
+    def test_pure_docs_have_a_direct_workflow(self) -> None:
+        assert "工作流程 C：纯文档直做" in CODER_PROMPT
+        assert "不调用 `get_unexecuted_plan`" in CODER_PROMPT
+        assert "不得修改源码、测试、配置、依赖或构建文件" in CODER_PROMPT
+        assert "`docs/<主题>` 分支" in CODER_PROMPT
 
 
 class TestIntentDirectives:
