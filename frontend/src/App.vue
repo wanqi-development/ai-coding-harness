@@ -1386,8 +1386,14 @@ function attachStream(msg: Message) {
  */
 async function runStream(id: string, resp: Response, msg: Message, signal?: AbortSignal) {
   const { onEvent, flush, append } = attachStream(msg)
+  const previousAssistantId =
+    [...messages.value]
+      .reverse()
+      .find((item) => item !== msg && item.role === 'assistant' && item.recordId)?.recordId ?? 0
+  let completed = false
+  let persisted: Message | null = null
   try {
-    await consumeStream(
+    completed = await consumeStream(
       id,
       resp,
       (ev) => {
@@ -1403,10 +1409,31 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
     if (stopping.value && currentId.value === id) append(`\n\n${TERMINATED}`)
     // 收尾必须刷一次，否则最后一批会卡在定时器里
     flush()
+    // 数据库是这一轮的最终事实来源：正常拿完 done 后回填持久化记录；没拿到 done
+    // 时也先查一次，能查到说明后端其实已经完成，只是最后几帧没送达。
+    try {
+      const page = await getRecords(id)
+      persisted =
+        [...page.items]
+          .reverse()
+          .filter((item) => item.type === 'assistant' && item.id > previousAssistantId)
+          .map(recordToMessage)
+          .find((item): item is Message => item !== null) ?? null
+    } catch {
+      persisted = null
+    }
+    if (persisted) {
+      const at = messages.value.indexOf(msg)
+      if (at >= 0) messages.value[at] = persisted
+    } else if (!completed && !stopping.value && currentId.value === id) {
+      append('\n\n[连接在完成帧前中断，本轮可能仍在后台运行。请刷新页面接回。]')
+    }
     // AI 那条的时间＝流结束时刻（失败/中断也补上，否则这条会一直没有时间）
-    msg.at = new Date().toISOString()
-    // 计时收尾：从开跑那一刻算起，冻结下来（之后刷新回放也照实显示这个数）
-    if (msg.startedAt) msg.elapsedMs = Date.now() - msg.startedAt
+    if (!persisted) {
+      msg.at = new Date().toISOString()
+      // 计时收尾：从开跑那一刻算起，冻结下来（之后刷新回放也照实显示这个数）
+      if (msg.startedAt) msg.elapsedMs = Date.now() - msg.startedAt
+    }
     if (currentId.value === id) {
       loading.value = false
       scrollToBottom()

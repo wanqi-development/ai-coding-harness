@@ -75,7 +75,7 @@ def clarification_block(
     allowed = " / ".join(choices)
     lines += [
         "- 先用只读工具了解必要上下文；可以按你的判断改写候选，不要机械照抄后端候选。",
-        "- 不要直接执行、不要改文件、不要创建方案。",
+        "- 不要直接执行、不要改文件、不要创建方案、不要调用 handoffTask。",
         "- 只输出下面这一种结构，不要 Markdown、不要解释文字；问题和选项文案可以自由写：",
         CLARIFY_OPEN,
         (

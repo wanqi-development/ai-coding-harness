@@ -58,7 +58,11 @@ from ai_coding_harness.core.stream import (
 )
 from ai_coding_harness.observability.run_log import AgentRunLog
 from ai_coding_harness.server.intent import SOURCE_LLM
-from ai_coding_harness.tools.context import get_configurable, get_redact_terms
+from ai_coding_harness.tools.context import (
+    get_clarification,
+    get_configurable,
+    get_redact_terms,
+)
 
 if TYPE_CHECKING:
     from ai_coding_harness.config import Settings
@@ -77,6 +81,10 @@ ALREADY = "本轮已经交接过一次了：同一个请求只能交出去一次
 NO_REJUDGE = "现在无法重判意图（分类模型不可用），交接会把请求送到错误的能力形态上，请直接讲给用户。"
 NOT_LLM = "重判没有走模型（分类器不可用，退回了关键字口径），不足以推翻原来的判断，请直接讲给用户。"
 SAME_FORM = "重判结果仍是当前形态：这件事本来就该你做，接着做，别交接。"
+CLARIFY_ONLY = (
+    "本轮是低置信度澄清轮：先问清用户意图，不要交接任务，也不要开始执行。"
+    "请按澄清格式给出问题和候选。"
+)
 EMPTY_RESULT = (
     "交接的形态这一轮跑完了但没有给出正文。别替它编内容 —— "
     "把已确认的情况讲给用户，并说明这一步没有拿到结果。"
@@ -170,6 +178,15 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
         state = get_configurable("turn_state")
         if not isinstance(state, TurnState):
             return NO_STATE
+        # 澄清轮的唯一目标是问清意图。交接会把一个低置信度判断带进另一个形态，
+        # 变成长时间执行；这条边界必须在工具层拦，不能只靠提示词。
+        if get_clarification() is not None:
+            logger.info(
+                "澄清轮拒绝交接：public_id=%s form=%s",
+                ctx.session.public_id,
+                ctx.form,
+            )
+            return CLARIFY_ONLY
         # 额度扣在**尝试**上而不是**成功**上：被拒之后还要再试的，多半是在原地甩锅
         # （重判结果不会在同一轮里翻盘），扣掉正好收住。
         ordinal = state.note_handoff()

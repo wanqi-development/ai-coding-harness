@@ -898,10 +898,11 @@ async function readStream(
   resp: Response,
   onEvent: (ev: ChatEvent) => void,
   cursor: { last: number },
-): Promise<void> {
+): Promise<boolean> {
   const reader = resp.body!.getReader()
   const decoder = new TextDecoder()
   let buf = ''
+  let sawDone = false
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -930,32 +931,45 @@ async function readStream(
           continue
         }
         if (eventName === 'error') onEvent({ type: 'error', error: obj.error ?? 'unknown' })
-        else onEvent(obj as ChatEvent)
+        else {
+          const ev = obj as ChatEvent
+          if (ev.type === 'done') sawDone = true
+          onEvent(ev)
+        }
       }
     }
   } finally {
     reader.releaseLock()
   }
+  return sawDone
 }
 
-/** 读一条流；传输中断就带着游标重连一次（本轮跑完了也能接，服务端会把尾巴补完）。 */
+/**
+ * 读一条流；只有收到 `done` 才算成功结束。
+ *
+ * 长任务可能被代理或连接层以**正常 EOF** 截断。此时 `reader.read()` 不会抛错，
+ * 但本轮并没有完成；必须带着游标再接一次。两次都拿不到 `done` 时返回 false，
+ * 由调用方用持久化记录兜底，不能把半截流当完成。
+ */
 export async function consumeStream(
   id: string,
   first: Response,
   onEvent: (ev: ChatEvent) => void,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<boolean> {
   const cursor = { last: 0 }
   let resp = first
   for (let attempt = 0; ; attempt++) {
     try {
-      await readStream(resp, onEvent, cursor)
-      return
+      if (await readStream(resp, onEvent, cursor)) return true
     } catch (e) {
       // 用户自己点的终止：本地主动断的，不是传输故障 —— 再重连一次就白跑一个请求
       if (signal?.aborted) throw e
       if (attempt >= 1) throw e
       resp = await resumeChat(id, cursor.last, signal)
+      continue
     }
+    if (attempt >= 1) return false
+    resp = await resumeChat(id, cursor.last, signal)
   }
 }

@@ -29,6 +29,7 @@ from ai_coding_harness.config import Settings
 from ai_coding_harness.server.intent import SOURCE_FALLBACK, SOURCE_LLM, IntentDecision
 from ai_coding_harness.tools.handoff import (
     ALREADY,
+    CLARIFY_ONLY,
     EMPTY_RESULT,
     NO_REJUDGE,
     NO_STATE,
@@ -182,6 +183,18 @@ class TestRefusals:
         out = await _call(build_handoff_tools(_context(inner))[0])
         assert out == NO_STATE
         assert inner.payloads == []
+
+    async def test_clarification_round_refuses_handoff(self, ambient):
+        """澄清轮只问意图，代码层禁止把低置信度判断交给别的形态执行。"""
+        state = TurnState(message="运费规则选择1", rejudge=_rejudge("coding"))
+        ambient(state, clarification={"confidence": 0.22, "candidates": [["qa", 0.22]]})
+        inner = _Inner([AIMessage("不该跑到这里")])
+
+        out = await _call(build_handoff_tools(_context(inner))[0])
+
+        assert out == CLARIFY_ONLY
+        assert inner.payloads == []
+        assert state._handoffs == 0
 
     async def test_second_attempt_in_the_same_round_refuses(self, ambient):
         """额度扣在尝试上：同一轮第二次交接直接拒 —— 被拒之后还再试的多半是原地甩锅。"""

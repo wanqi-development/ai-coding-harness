@@ -249,6 +249,8 @@
   JEV/LLM 的 confidence 低于阈值时转 `qa` + `SOURCE_CLARIFY`，qa 用**提示词澄清模式**
   （先只读了解上下文、列 2~3 个按可能性排序的候选、最后只问一个问题），**不把
   `write_todos` 还给 qa**。`active_task_override` 命中时优先继续干活，不追问。
+  **澄清轮禁止 `handoffTask`**：工具层直接拒绝，避免把低置信度判断交给另一个形态长跑；
+  这条不能只靠提示词。
   阈值来自 200 条实测：JEV <0.55 的 16 条只对 43.8%，≥0.55 的 147 条对 91.2%。
 - **澄清是结构化弹窗，不是自由文本追问**（2026-10-19）：qa 仍可自由措辞，但必须输出
   `<CLARIFY>` + JSON（`question` + 2~3 个 `{intent,label,description}`，intent 还必须属于
@@ -256,6 +258,9 @@
   并发 SSE `clarification` 帧。**任何新的用户消息先让旧 pending 失效**；前端点候选项走
   `clarification_id + choice` 确定性映射、跳过意图模型，用**原始用户消息**执行；点“其他”
   或关掉弹窗后自由输入，才重新走意图识别。别把它做成“让模型自己理解第一个/第二个”。
+- **SSE 只有收到 `done` 才算完成**（`frontend/src/lib/api.ts`）：正常 EOF 也可能是代理
+  截断；没有 `done` 就带游标重连。轮次收尾后前端按 `/records` 回填持久化助手记录，
+  **数据库是最终事实来源**，直播半截内容不能覆盖已落库正文。
 - **大模型分类输出是四行**：意图 / 置信度 / 候选 / 理由；`parse_reply` 仍兼容旧两行。
   改提示词或解析要同时跑 `tests/test_intent_detection.py`。
 - **意图评测先固定轴**：`eval_intent.py run --out` 保存逐样本路由轴，`policy` 用固定轴
