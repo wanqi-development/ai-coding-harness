@@ -33,9 +33,11 @@ import RepoPanel from './components/panels/RepoPanel.vue'
 import ChangesPanel from './components/panels/ChangesPanel.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
 import ClarificationDialog from './components/ClarificationDialog.vue'
+import HandoffRun from './components/HandoffRun.vue'
 import { defaultPanelTab } from './lib/prefs'
 import { usePanelWidth } from './lib/splitter'
 import { splitLongText } from './lib/streamblocks'
+import { applyRunTrace, createRunTree, type RunTree } from './lib/runs'
 import { shouldShowTodos } from './lib/todos'
 import { readView, watchView, writeView, type AppView, type SettingsPanel } from './lib/viewState'
 
@@ -53,6 +55,7 @@ type Part =
    * SSE 的 `plan` 事件，刷新后那条来自落库的 `type='plan'` 记录，两边形状一样。
    */
   | { kind: 'plan'; plan: PlanInfo }
+  | { kind: 'handoff'; tree: RunTree }
 
 interface Message {
   role: 'user' | 'assistant'
@@ -326,6 +329,26 @@ function pushPlan(parts: Part[], info: PlanInfo | null) {
   else parts.push({ kind: 'plan', plan: info })
 }
 
+function pushRun(parts: Part[], trace: import('./lib/api').RunTrace) {
+  let part = parts.find(
+    (p): p is Extract<Part, { kind: 'handoff' }> =>
+      p.kind === 'handoff' && p.tree.root_id === (trace.root_run_id || trace.run_id),
+  )
+  if (!part) {
+    if (trace.node_kind !== 'handoff' || trace.phase !== 'start') return
+    part = { kind: 'handoff', tree: createRunTree(trace) }
+    parts.push(part)
+    return
+  }
+  applyRunTrace(part.tree, trace)
+}
+
+function handoffParts(m: Message): RunTree[] {
+  return m.parts
+    .filter((p): p is Extract<Part, { kind: 'handoff' }> => p.kind === 'handoff')
+    .map((p) => p.tree)
+}
+
 /** 落库那条方案记录 → 方案块。字段来自后端 `plan_payload`（extra 里带 plan_id/status/steps）。 */
 function planFromRecord(r: {
   content: string | null
@@ -516,9 +539,14 @@ function statusClass(status: string): string {
 function partsOf(r: { content: string | null; summary: string | null; extra: any }): Part[] {
   const saved = r.extra?.parts
   if (Array.isArray(saved) && saved.length) {
-    return saved.map((p: any): Part => {
-      if (p?.kind === 'todos') return { kind: 'todos', items: todoItems(p.items) }
-      return { kind: 'text', content: String(p?.content ?? '') }
+    return saved.flatMap((p: any): Part[] => {
+      if (p?.kind === 'todos') return [{ kind: 'todos', items: todoItems(p.items) }]
+      if (p?.kind === 'handoff' && Array.isArray(p.events) && p.events.length) {
+        const tree = createRunTree(p.events[0])
+        for (const event of p.events.slice(1)) applyRunTrace(tree, event)
+        return [{ kind: 'handoff', tree }]
+      }
+      return [{ kind: 'text', content: String(p?.content ?? '') }]
     })
   }
   return [{ kind: 'text', content: r.content || r.summary || '' }]
@@ -1331,6 +1359,8 @@ function attachStream(msg: Message) {
     } else if (ev.type === 'plan') {
       // 后端每次推的都是全量快照：同一份方案只占一块，就地替换（`plan: null` = 方案被删）
       pushPlan(msg.parts, ev.plan ?? null)
+    } else if (ev.type === 'run' && ev.run) {
+      pushRun(msg.parts, ev.run)
     } else if (ev.type === 'usage') {
       // 本轮的账：后端落在正文之后发，所以它天然贴在回复末尾。不参与「正文/待办」的块序列
       // —— 它是这条消息的**属性**，不是一段内容（渲染在时间那一行上面）。
@@ -1725,6 +1755,12 @@ onUnmounted(() => {
               <template v-if="m.elapsedMs">用时 {{ elapsedLabel(m) }}</template>
               <template v-else>working<span class="working-dots">…</span> {{ elapsedLabel(m) }}</template>
             </p>
+            <HandoffRun
+              v-for="(run, ri) in handoffParts(m)"
+              :key="`${ri}:${run.root_id}`"
+              :node="run.root"
+              :tree="run"
+            />
             <!-- 运行中思考与正文按到达顺序交错：连续的正文块仍合成一个气泡（分组规则见
                  flowEntries），思考块浅色、始终展开；跑完隐藏思考、只留正文。
                  流式期间正文按纯文本显示（不解析 Markdown），任务结束后整组一次性渲染。 -->

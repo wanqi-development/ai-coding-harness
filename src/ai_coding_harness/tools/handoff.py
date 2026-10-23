@@ -18,10 +18,10 @@
    与原线程共用 checkpointer 的根槽位会覆盖外层自己的 checkpoint（``checkpoint_ns``
    在显式给了 ``thread_id`` 之后会被重置成 ``""``，两边就落到同一个槽）。
 
-内层那一串事件**对外层是隐形的**（见 ``_detached``）：不隔开的话，内层模型的正文会以
-空 namespace 混进外层事件流，被当成外层自己的回答下发、还写进业务库 —— 正是要避免的
-那类「一轮里冒出别人的话」。用户看到的是：一张 ``handoffTask`` 工具卡，然后外层模型
-据内层结果回话。
+内层原始 v3 事件**不能直接混进外层事件流**：不隔离的话，内层模型的正文会以空 namespace
+被当成外层自己的回答下发、还写进业务库。但内层事件也不是消失：这里消费它们，再通过
+``runtime.stream_writer`` 发成带 run_id / parent_run_id 的 ``harness-run`` trace。前端把
+trace 内嵌在 ``handoffTask`` 卡片里，与外层正文分开；文件日志带同样的 run 标记。
 
 内层的工具调用仍然受边界与循环守卫约束（那些中间件照挂），所以「交接出去绕开检查」
 不存在；守卫的重复计数还与外层共用（同一个 ``TurnState``），内层原地打转一样会被刹。
@@ -35,6 +35,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
@@ -42,7 +43,19 @@ from langchain_core.tools import BaseTool, tool
 
 from ai_coding_harness.agent.middleware import TurnState
 from ai_coding_harness.agent.profiles import profile_for
-from ai_coding_harness.core.stream import ToolNames, event_name, method_of
+from ai_coding_harness.core.stream import (
+    RUN_EVENT_KIND,
+    ToolNames,
+    V3Translator,
+    call_id_of,
+    delegation_id,
+    event_name,
+    metadata_of,
+    method_of,
+    namespace_of,
+    payload_of,
+    run_id_of,
+)
 from ai_coding_harness.observability.run_log import AgentRunLog
 from ai_coding_harness.server.intent import SOURCE_LLM
 from ai_coding_harness.tools.context import get_configurable, get_redact_terms
@@ -140,7 +153,11 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
     """构建能力交接工具（绑定当前会话与当前形态）。"""
 
     @tool
-    async def handoffTask(reason: str, notes: str = "") -> str:
+    async def handoffTask(
+        reason: str,
+        notes: str = "",
+        runtime: ToolRuntime = None,  # type: ignore[assignment]
+    ) -> str:
         """把这一轮请求交给更合适的能力形态去做（自己做不了时才用）。
 
         只有当这件事**确实**不在当前形态的能力范围内时才调它（比如手上没有写权限、
@@ -180,6 +197,56 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
         # 同一会话最多一个交接线程（``max_handoffs`` 默认 1），内层下一轮交接时还看得见
         # 上一轮做过什么 —— 这是想要的，别改成每轮一个新线程。
         thread = f"{ctx.manager.thread_id(ctx.session)}::handoff-{ordinal}"
+        handoff_run = f"handoff:{getattr(runtime, 'tool_call_id', None) or ordinal}"
+        runtime_config = getattr(runtime, "config", None) or {}
+        outer_run = str(runtime_config.get("run_id") or "turn")
+        writer = getattr(runtime, "stream_writer", None)
+
+        def emit(
+            node_kind: str,
+            phase: str,
+            *,
+            run_id: str = "",
+            parent_run_id: str = "",
+            agent: str = "",
+            name: str = "",
+            content: str = "",
+            status: str = "",
+            data: Any = None,
+        ) -> None:
+            if not callable(writer):
+                return
+            writer(
+                {
+                    "kind": RUN_EVENT_KIND,
+                    "node_kind": node_kind,
+                    "phase": phase,
+                    "run_id": run_id or handoff_run,
+                    "parent_run_id": parent_run_id or outer_run,
+                    "root_run_id": handoff_run,
+                    "agent": agent,
+                    "name": name,
+                    "content": content,
+                    "status": status,
+                    "data": data,
+                }
+            )
+
+        emit(
+            "handoff",
+            "start",
+            run_id=handoff_run,
+            parent_run_id=outer_run,
+            name="handoffTask",
+            status="running",
+            data={
+                "from": ctx.form,
+                "to": decision.intent,
+                "reason": reason,
+                "notes": notes,
+                "thread": thread,
+            },
+        )
         config = RunnableConfig(
             configurable={
                 "thread_id": thread,
@@ -210,8 +277,8 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
         #
         # 但「不混进外层流」不等于「什么日志都没有」：这里自己消费内层的 v3 事件流，
         # 用一份**带 ``handoff `` 前缀**的 AgentRunLog 记 LLM / 工具调用与耗时，并把
-        # 用量交回外层（``state.usage_sink``）。正文仍然不往下发 —— 用户看到的是
-        # handoff 工具卡 + 外层最后的回报。
+        # 用量交回外层（``state.usage_sink``）；内层正文 / 思考 / 工具过程改走
+        # ``runtime.stream_writer`` 的 run trace，内嵌在 handoff 卡片里。
         token = var_child_runnable_config.set({})
         started = time.monotonic()
         run_log = AgentRunLog(
@@ -222,13 +289,18 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
             prefix="handoff ",
         )
         logger.info(
-            "能力交接开始：public_id=%s %s→%s 线程=%s",
+            "[run=%s parent=%s] 能力交接开始：public_id=%s %s→%s 线程=%s",
+            handoff_run,
+            outer_run,
             ctx.session.public_id,
             ctx.form,
             decision.intent,
             thread,
         )
         result: Any = None
+        trace = V3Translator()
+        model_runs: dict[tuple[str, ...], str] = {}
+        trace_seq = 0
         try:
             streamer = getattr(inner, "astream_events", None)
             if streamer is None:
@@ -239,16 +311,110 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
                 names = ToolNames()
                 async for event in stream:
                     method = method_of(event)
+                    namespace = namespace_of(event)
                     if method == "messages":
+                        trace_seq += 1
+                        agent = str(metadata_of(event).get("lc_agent_name") or "")
+                        run_id = (
+                            run_id_of(event)
+                            or model_runs.get(namespace)
+                            or f"{handoff_run}:model:{trace_seq}"
+                        )
+                        parent = delegation_id(namespace) or handoff_run
+                        if event_name(event) == "message-start":
+                            model_runs[namespace] = run_id
+                            emit(
+                                "model",
+                                "start",
+                                run_id=run_id,
+                                parent_run_id=parent,
+                                agent=agent,
+                                status="running",
+                            )
+                        run_log.set_run_context(run_id, parent)
                         run_log.on_message(event)
+                        for part in trace.feed(event):
+                            kind = part.get("type")
+                            if kind == "todos":
+                                emit(
+                                    "todos",
+                                    "delta",
+                                    run_id=run_id,
+                                    parent_run_id=parent,
+                                    agent=agent,
+                                    data={"items": part.get("items") or []},
+                                )
+                            elif kind in {"ai", "reasoning"}:
+                                emit(
+                                    "model",
+                                    "delta",
+                                    run_id=run_id,
+                                    parent_run_id=parent,
+                                    agent=str(part.get("agent") or agent),
+                                    content=str(part.get("content") or ""),
+                                    data={"part": kind},
+                                )
+                        if event_name(event) == "message-finish":
+                            emit(
+                                "model",
+                                "finish",
+                                run_id=run_id,
+                                parent_run_id=parent,
+                                agent=agent,
+                                status="done",
+                            )
                     elif method == "tools":
                         kind = event_name(event)
+                        call_id = call_id_of(event) or f"{handoff_run}:tool:{trace_seq}"
+                        parent = model_runs.get(namespace) or delegation_id(namespace) or handoff_run
                         if kind == "tool-started":
-                            run_log.on_tool_start(event, names.remember(event))
+                            called = names.remember(event)
+                            run_log.set_run_context(call_id, parent)
+                            run_log.on_tool_start(event, called)
+                            emit(
+                                "tool",
+                                "start",
+                                run_id=call_id,
+                                parent_run_id=parent,
+                                name=called or "",
+                                status="running",
+                                data={"input": (payload_of(event) or {}).get("input")},
+                            )
                         elif kind == "tool-finished":
-                            run_log.on_tool_end(event, names.resolve(event))
+                            called = names.resolve(event)
+                            run_log.set_run_context(call_id, parent)
+                            run_log.on_tool_end(event, called)
+                            emit(
+                                "tool",
+                                "finish",
+                                run_id=call_id,
+                                parent_run_id=parent,
+                                name=called or "",
+                                status="done",
+                                content=str((payload_of(event) or {}).get("output", "")),
+                            )
                 snapshot = await inner.aget_state(config)
                 result = snapshot.values
+        except Exception as exc:
+            emit(
+                "handoff",
+                "finish",
+                run_id=handoff_run,
+                parent_run_id=outer_run,
+                name="handoffTask",
+                status="error",
+                content=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        else:
+            emit(
+                "handoff",
+                "finish",
+                run_id=handoff_run,
+                parent_run_id=outer_run,
+                name="handoffTask",
+                status="done",
+            )
         finally:
             var_child_runnable_config.reset(token)
             usage = run_log.usage_snapshot()
@@ -256,7 +422,9 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
                 state.usage_sink(usage)
         body = final_text(result)
         logger.info(
-            "能力交接：public_id=%s %s→%s 线程=%s 用时=%.1fs 回正文 %d 字",
+            "[run=%s parent=%s] 能力交接：public_id=%s %s→%s 线程=%s 用时=%.1fs 回正文 %d 字",
+            handoff_run,
+            outer_run,
             ctx.session.public_id, ctx.form, decision.intent, thread,
             time.monotonic() - started, len(body),
         )

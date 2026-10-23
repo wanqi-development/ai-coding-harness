@@ -229,6 +229,10 @@ class AgentRunLog:
         #: 日志行前缀。默认空；能力交接的内层那一轮用 ``"handoff "`` —— 它跑在
         #: 同名 logger 上，不加前缀就与外层完全混在一起，事后分不清是谁的调用。
         self._prefix = prefix
+        #: 当前日志行属于哪个 run / 哪个父 run；只有 handoff 内层会设置。
+        #: 写进正文而不是改全局日志格式，旧日志与现有格式串都不受影响。
+        self._active_run_id = ""
+        self._active_parent_run_id = ""
         # namespace → 子智能体名（由 messages 事件的 lc_agent_name 登记，工具事件靠它反查）
         self._ns_agents: dict[tuple[str, ...], str] = {}
         # task 工具调用 id → 子智能体名（委派那两行日志的夹子）
@@ -291,8 +295,18 @@ class AgentRunLog:
             return self._named(event) or MAIN_AGENT
         return self._ns_agents.get(namespace_of(event)) or MAIN_AGENT
 
+    def set_run_context(self, run_id: str, parent_run_id: str = "") -> None:
+        """标下一条日志的 run 父子关系；空串表示根层，不写标记。"""
+        self._active_run_id = run_id
+        self._active_parent_run_id = parent_run_id
+
     def _log(self, actor: str, message: str, *args: Any) -> None:
-        logger.info(f"{self._prefix}{message}", *args, extra={"agent": actor})
+        trace = (
+            f"[run={self._active_run_id} parent={self._active_parent_run_id or '-'}] "
+            if self._active_run_id
+            else ""
+        )
+        logger.info(f"{self._prefix}{trace}{message}", *args, extra={"agent": actor})
 
     # -- 记账 --------------------------------------------------------------
     def _accumulate(self, actor: str, numbers: tuple[int, int] | None) -> None:

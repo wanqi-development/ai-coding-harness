@@ -187,6 +187,13 @@
   / `CONTEXT_TRIM_ROLES` 已作废，别再加回独立剪裁中间件。`CONTEXT_SUMMARY_TRIGGER_TOKENS`
   只在窗口解析不出来时兜底；有窗口时用「比例线 或 绝对上限」。每轮结束会打一条
   `本轮成本`（输入/输出/调用/峰值），超过 `TURN_COST_WARN_TOKENS`（默认 300 万）再记 WARNING。
+- **handoff 内层用 run 树展示，不混进外层正文**：`handoffTask` 通过
+  `ToolRuntime.stream_writer` 发 `harness-run` 自定义事件，字段至少含
+  `run_id / parent_run_id / root_run_id / node_kind / phase`。前端把内层正文、思考、
+  工具、待办和日志内嵌在 handoff 卡片里；刷新时从记录 `extra.parts` 的
+  `{kind:"handoff", events:[...]}` 重建同一棵树。文件日志用
+  `[run=... parent=...]` 标记，`LogPanel` 按父子关系缩进。不要再把内层原始 v3 事件
+  直接混进外层 namespace。
 - **主控每次 `task` 前都要有一段新的 `write_todos`**（2026-10-20 用户口径，
   `DelegationGateMiddleware`）：第一次派发看最近一条 `HumanMessage` 之后；之后每次派发看
   上一次 `task` 结果之后。同一条 AI 消息里并行的 `write_todos` + `task` 不算，同一批并行

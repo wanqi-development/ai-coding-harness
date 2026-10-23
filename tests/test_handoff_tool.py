@@ -16,8 +16,10 @@ import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
+from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage
 from langchain_core.runnables.config import var_child_runnable_config
 
@@ -36,7 +38,16 @@ from ai_coding_harness.tools.handoff import (
     build_handoff_tools,
     final_text,
 )
-from tests.v3_events import message_finish, message_start, tool_finish, tool_start
+from tests.v3_events import (
+    message_finish,
+    message_start,
+    reasoning,
+    tool_finish,
+    tool_start,
+)
+from tests.v3_events import (
+    text as text_delta,
+)
 
 
 @dataclass
@@ -142,8 +153,23 @@ async def _call(
     *,
     reason: str = "手上没有建 PR 的工具",
     notes: str = "",
+    runtime: ToolRuntime | None = None,
 ) -> str:
-    return await tool.ainvoke({"reason": reason, "notes": notes})
+    payload: dict[str, Any] = {"reason": reason, "notes": notes}
+    if runtime is not None:
+        payload["runtime"] = runtime
+    return await tool.ainvoke(payload)
+
+
+def _runtime(events: list[dict[str, Any]]) -> ToolRuntime:
+    return ToolRuntime(
+        state={},
+        context=None,
+        config={"run_id": UUID("00000000-0000-0000-0000-000000000001")},
+        stream_writer=events.append,
+        tool_call_id="handoff-call",
+        store=None,
+    )
 
 
 class TestRefusals:
@@ -244,9 +270,52 @@ class TestDispatch:
 
         assert "已交给「coding」形态完成" in out
         lines = [record.getMessage() for record in caplog.records]
-        assert any(line.startswith("handoff LLM 调用完成") for line in lines), lines
-        assert any(line.startswith("handoff 工具调用 → read_file") for line in lines), lines
+        assert any("handoff [run=" in line and "LLM 调用完成" in line for line in lines), lines
+        assert any("handoff [run=c1" in line and "工具调用 → read_file" in line for line in lines), lines
         assert merged and merged[0]["totals"]["input"] == 120
+
+    async def test_inner_events_form_a_run_tree_for_the_ui(self, ambient):
+        """内层正文 / 思考 / 工具通过 stream_writer 回传，run_id 保持父子关系。"""
+        inner = _StreamingInner(
+            [AIMessage("改完了")],
+            [
+                message_start(agent="coder"),
+                text_delta("内层正文", agent="coder"),
+                reasoning("内层思考", agent="coder"),
+                message_finish(agent="coder"),
+                tool_start("read_file", call_id="c1", input={"file_path": "/a.py"}),
+                tool_finish(call_id="c1", output="class A: pass"),
+            ],
+        )
+        traces: list[dict[str, Any]] = []
+        state = TurnState(message="直接改", rejudge=_rejudge("coding"))
+        ambient(state)
+
+        await _call(build_handoff_tools(_context(inner))[0], runtime=_runtime(traces))
+
+        assert traces[0]["node_kind"] == "handoff"
+        assert traces[0]["phase"] == "start"
+        assert traces[0]["run_id"] == "handoff:handoff-call"
+        assert traces[0]["parent_run_id"] == "00000000-0000-0000-0000-000000000001"
+        assert any(
+            trace["node_kind"] == "model"
+            and trace["phase"] == "delta"
+            and trace["content"] == "内层正文"
+            and trace["parent_run_id"] == "handoff:handoff-call"
+            for trace in traces
+        )
+        assert any(
+            trace["node_kind"] == "model"
+            and (trace.get("data") or {}).get("part") == "reasoning"
+            and trace["content"] == "内层思考"
+            for trace in traces
+        )
+        assert any(
+            trace["node_kind"] == "tool"
+            and trace["name"] == "read_file"
+            and trace["run_id"] == "c1"
+            for trace in traces
+        )
 
     async def test_inner_run_gets_a_derived_thread(self, ambient):
         """内层不能蹭外层线程：``checkpoint_ns`` 会被重置成 ``""``，两边落到同一个根槽。"""

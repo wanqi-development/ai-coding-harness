@@ -182,6 +182,9 @@ export interface LogLineItem {
   /** 打这行的 logger 名（认不出就是空串） */
   logger: string
   text: string
+  /** handoff 内层日志的 run 父子关系；根层日志为空串 */
+  run_id?: string
+  parent_run_id?: string
 }
 
 export interface LogPage {
@@ -196,6 +199,21 @@ export interface TodoItem {
   status: string
   /** 子任务（子智能体自己那份清单），只有主项才有 */
   children?: TodoItem[]
+}
+
+/** handoff 内层通过 stream_writer 发上来的一个 run 事件。 */
+export interface RunTrace {
+  kind: string
+  node_kind: string
+  phase: 'start' | 'delta' | 'finish'
+  run_id: string
+  parent_run_id: string
+  root_run_id: string
+  agent?: string
+  name?: string
+  content?: string
+  status?: string
+  data?: any
 }
 
 /** 意图澄清弹窗里的一个候选；`intent` 由后端固定，label/description 是 qa 自由写的。 */
@@ -223,6 +241,7 @@ export interface ChatEvent {
     | 'usage'
     | 'changes'
     | 'clarification'
+    | 'run'
     | 'done'
     | 'error'
   content?: string
@@ -249,6 +268,8 @@ export interface ChatEvent {
    * 与 `usage` 一样贴在回复末尾：一条消息的**属性**，不是一段内容。
    */
   changes?: ChangesInfo
+  /** `run` 帧：handoff 内层事件，用 run_id / parent_run_id 挂在 run 树上。 */
+  run?: RunTrace
 }
 
 export async function listSessions(): Promise<SessionItem[]> {

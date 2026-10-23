@@ -25,6 +25,30 @@
 
 ### 2026-10-23
 
+#### handoff 内层改为 run 树：正文、思考、工具与日志内嵌展示
+
+- **动机**：`handoffTask` 为了避免内层正文混进外层回答，把内层 v3 事件完全摘掉了。
+  结果用户只能看到一张工具卡和最终回报，内层正文、工具执行与日志全靠 `handoff ` 文本
+  前缀辨认，无法从父子关系看清一次交接里发生了什么。
+- **改动**：
+  - `tools/handoff.py` 注入 `ToolRuntime`，用 `stream_writer` 发
+    `harness-run` 自定义事件；run_id / parent_run_id / root_run_id 显式记录。
+  - 内层 model、reasoning、tool、todos、handoff 生命周期都翻译成 run trace；内层原始
+    事件仍不混入外层 namespace。
+  - `core/stream.py` 增加 run id 提取与正文提取；外层正文 / 思考 / 工具帧也带可用
+    run id，旧事件没有 id 时不增加空字段。
+  - `runner.py` 转发 `custom` run 事件，脱敏截断后随本轮记录保存为
+    `{kind:"handoff", events:[...]}`，刷新后重建同一棵树。
+  - 新增 `HandoffRun.vue`：在工具卡内嵌显示内层正文、浅色思考、工具、待办和折叠日志。
+  - `AgentRunLog` 的 handoff 行增加 `[run=... parent=...]`；`log_tail` 解析为结构化字段，
+    `LogPanel` 默认按 run 父子树缩进展示，旧日志保持根节点。
+- **关键决策**：不复用内层原始 namespace，而是保留隔离后重发 trace；外层最终总结逻辑
+  不变。日志展示分为聊天内嵌的 run 事件树与日志面板的完整文件树，两者共享同一组 id。
+- **验证**：handoff / stream / runner / logs 定向测试 **184 passed**；全量 `pytest`
+  **1299 passed, 2 warnings**；`npm --prefix frontend run build`、ruff 和
+  `git diff --check` 均通过。
+- **遗留**：单段 run 文本 8000 字、列表 200 项的上限先用于控制记录体积，真机后再调。
+
 #### 修复 invalid tool call 污染 checkpoint 后所有 provider 400
 
 - **动机**：2026-10-23 11:47:13 的 QA 轮次报

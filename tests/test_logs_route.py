@@ -184,6 +184,26 @@ def test_a_missing_file_is_an_empty_slice(tmp_path: Path) -> None:
     assert read_session_logs([tmp_path / "nope.log"], SESSION).total == 0
 
 
+def test_handoff_run_metadata_is_parsed_for_the_tree(tmp_path: Path) -> None:
+    path = tmp_path / "agent.log"
+    path.write_text(
+        _line(
+            "2026-10-23 12:00:00",
+            "INFO",
+            "handoff [run=call_child parent=call_handoff] LLM 调用完成",
+            session=SESSION,
+            logger="ai_coding_harness.observability.run_log",
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    item = read_session_logs([path], SESSION).lines[0]
+
+    assert item.run_id == "call_child"
+    assert item.parent_run_id == "call_handoff"
+
+
 def test_http_request_noise_is_hidden_by_default(tmp_path: Path) -> None:
     """HTTP 请求行默认不显示：一个请求三行、前端每 1.5 秒轮询一次，实测占某会话 76%。
 

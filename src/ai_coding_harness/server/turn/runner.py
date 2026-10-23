@@ -16,6 +16,7 @@ from ai_coding_harness.agent.profiles import (
 )
 from ai_coding_harness.core.stream import (
     CREATE_PR_TOOL,
+    RUN_EVENT_KIND,
     TASK_TOOL,
     ToolNames,
     V3Translator,
@@ -23,7 +24,9 @@ from ai_coding_harness.core.stream import (
     event_name,
     last_ai_text,
     method_of,
+    parent_run_id_of,
     payload_of,
+    run_id_of,
     subagent_name,
 )
 from ai_coding_harness.observability.logging import MAIN_AGENT
@@ -59,6 +62,32 @@ from .common import (
     _redacted_todos,
     credential_refusal,
 )
+
+_RUN_TEXT_LIMIT = 8_000
+
+
+def _redact_run_payload(value: Any, terms: tuple[str, ...]) -> Any:
+    """脱敏并限制 run trace 的单段文本，避免内层输出把记录撑爆。"""
+    if isinstance(value, str):
+        text = redact(value, terms)
+        return text[:_RUN_TEXT_LIMIT] + ("…（已截断）" if len(text) > _RUN_TEXT_LIMIT else "")
+    if isinstance(value, list):
+        return [_redact_run_payload(item, terms) for item in value[:200]]
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_run_payload(item, terms)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _add_run_ids(frame: dict[str, Any], run_id: Any, parent_run_id: Any) -> dict[str, Any]:
+    """只在真有 run id 时加字段，旧事件形状与旧断言不受影响。"""
+    if run_id:
+        frame["run_id"] = str(run_id)
+    if parent_run_id:
+        frame["parent_run_id"] = str(parent_run_id)
+    return frame
 
 
 class TurnRunnerMixin:
@@ -351,6 +380,7 @@ class TurnRunnerMixin:
         llm_calls = 0
         tool_calls = 0
         last_plan: dict[str, Any] | None = None
+        persistent_run_events: list[dict[str, Any]] = []
         run_log = AgentRunLog(
             arg_limit=self._settings.log_tool_arg_max,
             result_limit=self._settings.log_tool_result_max,
@@ -397,17 +427,20 @@ class TurnRunnerMixin:
                             if answer:
                                 text += answer
                                 if clarification is None:
-                                    yield {"type": "ai", "content": answer}
+                                    yield _add_run_ids({
+                                        "type": "ai",
+                                        "content": answer,
+                                    }, part.get("run_id"), part.get("parent_run_id"))
                         elif part["type"] == "reasoning":
                             # 思考只走 SSE：**不进 text / parts / 记录**。重连时能靠
                             # RunHub 的临时帧缓冲重放，库里不会留。
                             thought = redact(part["content"], terms)
                             if thought:
-                                yield {
+                                yield _add_run_ids({
                                     "type": "reasoning",
                                     "content": thought,
                                     "agent": part.get("agent") or "main",
-                                }
+                                }, part.get("run_id"), part.get("parent_run_id"))
                         else:
                             yield {
                                 "type": "todos",
@@ -420,7 +453,11 @@ class TurnRunnerMixin:
                         # 委派要赶在子智能体的 write_todos 之前记下（树靠它认父项）
                         translator.note_delegation(event)
                         called = names.remember(event)
-                        frame = {"type": "tool", "name": called, "content": ""}
+                        frame = _add_run_ids({
+                            "type": "tool",
+                            "name": called,
+                            "content": "",
+                        }, run_id_of(event) or call_id_of(event), parent_run_id_of(event))
                         if called == CREATE_PR_TOOL:
                             pr_refs = _pr_refs((payload_of(event) or {}).get("input")) or pr_refs
                         if called == TASK_TOOL:
@@ -434,7 +471,7 @@ class TurnRunnerMixin:
                     elif name == "tool-finished":
                         called = names.resolve(event)
                         run_log.on_tool_end(event, called)
-                        frame = {
+                        frame = _add_run_ids({
                             "type": "tool",
                             "name": called,
                             # 中间件已把进状态的返回值脱敏，这里再兜一道：工具事件的
@@ -442,7 +479,7 @@ class TurnRunnerMixin:
                             "content": redact(
                                 str((payload_of(event) or {}).get("output", "")), terms
                             )[:500],
-                        }
+                        }, run_id_of(event) or call_id_of(event), parent_run_id_of(event))
                         role = delegated.pop(call_id_of(event), "")
                         if role:
                             frame["agent"] = role
@@ -461,6 +498,19 @@ class TurnRunnerMixin:
                                     # 首次生成时落一条记录，之后同 plan_id 不再追加（见该函数）
                                     await self._record_plan_once(session, latest)
                                 yield {"type": "plan", "plan": latest}
+                elif method == "custom":
+                    payload = payload_of(event)
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("kind") == RUN_EVENT_KIND
+                    ):
+                        safe_run = _redact_run_payload(payload, terms)
+                        if not (
+                            safe_run.get("node_kind") == "model"
+                            and (safe_run.get("data") or {}).get("part") == "reasoning"
+                        ):
+                            persistent_run_events.append(safe_run)
+                        yield {"type": "run", "run": safe_run}
         except asyncio.CancelledError:
             # 用户点了「终止」：RunHub 把这一轮的 task 取消了。补一条记录（不补的话库里
             # 就只剩一条用户消息空着，刷新后看不出这轮出过事），再原样抛出 —— 上层靠
@@ -573,9 +623,12 @@ class TurnRunnerMixin:
         }
         if clarification_frame is not None:
             extra["clarification"] = clarification_frame
-        # parts 只在真的出现过待办时才写：纯正文的回合，content 已经够前端回放了
-        if translator.parts.has_todos:
-            extra["parts"] = _redacted_parts(translator.parts.data, terms)
+        # parts 只在真的出现过待办或 handoff run 树时才写；纯正文的回合 content 已够回放。
+        if translator.parts.has_todos or persistent_run_events:
+            parts = _redacted_parts(translator.parts.data, terms)
+            if persistent_run_events:
+                parts.append({"kind": "handoff", "events": persistent_run_events})
+            extra["parts"] = parts
         # 「这一轮改了什么」：只有本轮**建过 PR** 才算数（用户口径：这就是「写完 + 提了 PR」的场景）。
         # 算不出来（本地没缓存过这个仓库 / 缺分支）就整块不出现 —— 宁可不显示，也不显示半份。
         changes = await self._changes_for_round(session, pr_refs) if pr_refs else None

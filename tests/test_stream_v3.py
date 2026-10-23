@@ -16,7 +16,9 @@ from ai_coding_harness.core.stream import (
     last_ai_text,
     metadata_of,
     namespace_of,
+    parent_run_id_of,
     payload_of,
+    run_id_of,
     text_of_content,
     todo_items,
 )
@@ -58,6 +60,18 @@ def test_metadata_and_namespace() -> None:
     assert metadata_of(tool_start("task")) == {}
     assert namespace_of(message_start()) == MAIN_NS
     assert namespace_of(message_start(ns=SUB_NS)) == SUB_NS
+
+
+def test_run_ids_can_build_a_parent_child_tree() -> None:
+    event = text_delta("正文")
+    event["run_id"] = "child"
+    event["parent_ids"] = ["root", "handoff"]
+
+    assert run_id_of(event) == "child"
+    assert parent_run_id_of(event) == "handoff"
+    part = V3Translator().feed(event)[0]
+    assert part["run_id"] == "child"
+    assert part["parent_run_id"] == "handoff"
 
 
 def test_event_name_follows_the_channel() -> None:

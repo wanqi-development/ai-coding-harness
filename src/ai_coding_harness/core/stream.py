@@ -33,6 +33,9 @@ CREATE_PR_TOOL = "create_pr"
 # （2026-09-21 实见，前 5293 字是 ``## SESSION INTENT`` 那一整段）。
 INTERNAL_CALL_KEY = "lc_internal_call"
 
+#: 自定义 run trace 的通道与 kind。handoff 内层用 ``stream_writer`` 发它。
+RUN_EVENT_KIND = "harness-run"
+
 # 子智能体的事件 namespace：``("tools:<task 的 tool_call_id>",)``
 _NS_PREFIX = "tools:"
 
@@ -90,6 +93,34 @@ def metadata_of(event: dict) -> dict:
     if isinstance(data, tuple) and len(data) > 1 and isinstance(data[1], dict):
         return data[1]
     return {}
+
+
+def run_id_of(event: dict) -> str:
+    """取事件自身的稳定 run id；不同的 v3 路径可能放在三处。"""
+    for value in (
+        event.get("run_id"),
+        metadata_of(event).get("run_id"),
+        (payload_of(event) or {}).get("run_id")
+        if isinstance(payload_of(event), dict)
+        else None,
+        event.get("event_id"),
+    ):
+        if value:
+            return str(value)
+    return ""
+
+
+def parent_run_id_of(event: dict) -> str:
+    """取事件声明的直接父 run；没有就返回空串。"""
+    metadata = metadata_of(event)
+    for value in (event.get("parent_run_id"), metadata.get("parent_run_id")):
+        if value:
+            return str(value)
+    for key in ("parent_ids", "parent_run_ids"):
+        parents = metadata.get(key) or event.get(key)
+        if isinstance(parents, (list, tuple)) and parents:
+            return str(parents[-1])
+    return ""
 
 
 def text_of_content(content: Any) -> str:
@@ -421,6 +452,11 @@ class V3Translator:
         """吃一条 v3 事件，吐出要下发的 SSE 事件（可能为空）。"""
         if method_of(event) != "messages":
             return []
+        trace: dict[str, str] = {}
+        if run_id := run_id_of(event):
+            trace["run_id"] = run_id
+        if parent_run_id := parent_run_id_of(event):
+            trace["parent_run_id"] = parent_run_id
         # 中间件内部的模型调用（摘要等）整条丢掉：它不是助手在对用户说话。丢在这里而
         # 不是 service 里，是因为「哪些事件算正文」是事件形状的知识，归这个模块；也顺带
         # 免了它那条 message-start 把主智能体的待办块登记清掉。
@@ -443,9 +479,15 @@ class V3Translator:
             self._on_block_start(namespace, payload)
             return []
         if name == "content-block-delta":
-            return self._on_block_delta(namespace, payload)
+            parts = self._on_block_delta(namespace, payload)
+            for part in parts:
+                part.update(trace)
+            return parts
         if name == "content-block-finish":
-            return self._on_block_finish(namespace, payload)
+            parts = self._on_block_finish(namespace, payload)
+            for part in parts:
+                part.update(trace)
+            return parts
         return []
 
     def note_delegation(self, event: dict) -> None:
