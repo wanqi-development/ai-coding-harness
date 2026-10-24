@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from sqlalchemy import (
     BigInteger,
@@ -19,6 +19,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -35,7 +36,7 @@ class AgentSession(Base):
     """会话表：一次用户会话，关联一个仓库、一个沙箱。"""
 
     __tablename__ = "sessions"
-    __table_args__ = {"comment": "会话表：一次用户会话"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "会话表：一次用户会话"}
 
     id: Mapped[int] = mapped_column(
         BigInteger, primary_key=True, autoincrement=True, comment="内部主键（自增）"
@@ -96,7 +97,7 @@ class AgentSession(Base):
         DateTime(timezone=True), nullable=True, comment="过期时间"
     )
 
-    repository: Mapped["Repository | None"] = relationship(
+    repository: Mapped[Repository | None] = relationship(
         back_populates="session", cascade="all, delete-orphan", uselist=False
     )
 
@@ -105,7 +106,9 @@ class Repository(Base):
     """仓库表：一个会话关联一个仓库（``UNIQUE(session_id)``）。"""
 
     __tablename__ = "repositories"
-    __table_args__ = {"comment": "会话关联的仓库表（1:1）"}
+    __table_args__: ClassVar[dict[str, str]] = {
+        "comment": "会话关联的仓库表（1:1）"
+    }
 
     id: Mapped[int] = mapped_column(
         BigInteger, primary_key=True, autoincrement=True, comment="主键"
@@ -178,6 +181,104 @@ class Plan(Base):
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, comment="执行完成时间"
     )
+    pull_requests: Mapped[list[PullRequest]] = relationship(
+        back_populates="plan", passive_deletes=True
+    )
+
+
+class PullRequest(Base):
+    """代码平台 PR 的稳定镜像，也是“是否由 Agent 创建”的权威归属表。"""
+
+    __tablename__ = "pull_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform",
+            "repo_owner",
+            "repo_name",
+            "number",
+            name="pull_requests_repo_number_uq",
+        ),
+        Index("pull_requests_repo_state_idx", "platform", "repo_owner", "repo_name", "state"),
+        Index("pull_requests_plan_idx", "plan_id"),
+        Index("pull_requests_session_idx", "session_id"),
+        {"comment": "PR 镜像：归属、状态、方案关联与工作区同步水位"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+    )
+    session_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="首次登记该 PR 的会话；会话删除后保留 PR 审计",
+    )
+    plan_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("plans.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="产出该 PR 的方案；一个方案允许对应多个替代 PR",
+    )
+    platform: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="代码平台：gitee / github"
+    )
+    repo_owner: Mapped[str] = mapped_column(Text, nullable=False, comment="仓库 owner")
+    repo_name: Mapped[str] = mapped_column(Text, nullable=False, comment="仓库名")
+    number: Mapped[int] = mapped_column(Integer, nullable=False, comment="平台 PR 编号")
+    title: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="PR 标题"
+    )
+    state: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="unknown", comment="open / merged / closed / unknown"
+    )
+    url: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="PR 网页链接"
+    )
+    author: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="PR 创建者登录名"
+    )
+    head_ref: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="源分支"
+    )
+    head_sha: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="远端最新 head SHA"
+    )
+    synced_head_sha: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="最后一次安全同步进沙箱的 head SHA"
+    )
+    base_ref: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="目标分支"
+    )
+    source: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="unknown",
+        comment="归属：agent / legacy_agent / external / unknown",
+    )
+    remote_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="平台记录创建时间"
+    )
+    remote_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="平台记录更新时间"
+    )
+    last_synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="最近一次从平台刷新该行的时间",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+    plan: Mapped[Plan | None] = relationship(back_populates="pull_requests")
 
 
 class SessionRecord(Base):
@@ -221,7 +322,9 @@ class SessionRecordDetail(Base):
     """会话记录详情：存「重」字段（完整内容 / 结构化附加），1:1 关联 ``session_records``。"""
 
     __tablename__ = "session_record_details"
-    __table_args__ = {"comment": "会话记录详情（垂直分表的重字段）"}
+    __table_args__: ClassVar[dict[str, str]] = {
+        "comment": "会话记录详情（垂直分表的重字段）"
+    }
 
     record_id: Mapped[int] = mapped_column(
         BigInteger,

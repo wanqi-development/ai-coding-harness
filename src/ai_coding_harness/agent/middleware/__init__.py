@@ -13,6 +13,7 @@
   命令直接拦；
 - ``memory``：仓库记忆 —— 每轮开始把它注入系统提示；PR 状态闸门在 server 层意图判定后
   一次完成，不再由中间件承担；
+- ``plan_recovery``：coding 主控 / planner / coder 进入和正常退出时回收 executing 方案；
 - ``fallback``：主导模型彻底失败时切兜底，并留一条 ``MODEL_FALLBACK`` 的痕。
 - ``stream_usage``：流式响应也要 token 用量；网关不认 ``stream_options`` 时按地址自动降级。
 - ``context_trim``：压缩线处的**持久化裁剪投影**（保留当前步骤 + 模型工作笔记
@@ -20,6 +21,7 @@
   ``agent/summarization.py``。
 
 这里只做重新导出，装配点（``graph.py`` / ``subagents.py``）从这里拿类并实例化。
+公共的 ``TurnState`` / ``TurnStop`` 定义在 ``agent.turn_state``，这里只保留兼容导出。
 中间件是 ``AgentMiddleware`` 子类，实例无状态，每次构建新实例即可 —— 例外是
 ``BoundaryMiddleware``、``FallbackMiddleware`` 与 ``MemoryMiddleware``：前者持有该智能体的
 策略、中者持有该角色的角色名与兜底模型、后者按轮暂存要注入的记忆块，所以这三类
@@ -52,17 +54,14 @@ from ai_coding_harness.agent.middleware.fallback import (
     FallbackMiddleware,
 )
 from ai_coding_harness.agent.middleware.guard import (
-    ABORT_REASON,
-    LOOP_ABORT_MARKER,
     LoopGuardMiddleware,
-    TurnState,
-    TurnStop,
 )
 from ai_coding_harness.agent.middleware.memory import (
     MEMORY_BLOCK_TITLE,
     MemoryMiddleware,
     build_memory_middleware,
 )
+from ai_coding_harness.agent.middleware.plan_recovery import PlanRecoveryMiddleware
 from ai_coding_harness.agent.middleware.read_guard import ReadGuardMiddleware
 from ai_coding_harness.agent.middleware.redaction import (
     ModelRedactionMiddleware,
@@ -76,6 +75,12 @@ from ai_coding_harness.agent.middleware.tool_integrity import (
     HistoryRepairMiddleware,
     ToolCallIdMiddleware,
     ToolErrorGuardMiddleware,
+)
+from ai_coding_harness.agent.turn_state import (
+    ABORT_REASON,
+    LOOP_ABORT_MARKER,
+    TurnState,
+    TurnStop,
 )
 
 __all__ = [
@@ -97,6 +102,7 @@ __all__ = [
     "LoopGuardMiddleware",
     "MemoryMiddleware",
     "ModelRedactionMiddleware",
+    "PlanRecoveryMiddleware",
     "ReadGuardMiddleware",
     "RedactionMiddleware",
     "StreamUsageMiddleware",

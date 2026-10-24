@@ -76,8 +76,9 @@
   planner / coder 只给「基本信息 + 当前缺口 + 长期约束」；reviewer 子智能体
   **不注入**（`MemoryMiddleware(sections=())`，连读都不读）。
 - **拦截一律是代码拦，不是提示词**：`BoundaryMiddleware` 管「这个角色能用哪些工具、能写哪些
-  目录」，`LoopGuardMiddleware` 管空转。PR 状态拦截在意图判定后由
-  `server/intent.gate_intent_for_state` 一次性完成；`MemoryMiddleware` 只加载 / 注入记忆。
+  目录」，`LoopGuardMiddleware` 管空转。PR 归属拦截在意图判定前完成，PR 状态候选与最终闸门由
+  `server/repo_state.py` / `server/intent.gate_intent_for_state` 完成；`MemoryMiddleware`
+  只加载 / 注入记忆。
 - **两份记忆模板必须逐字一致**：`docs/repo-memory-template.md` 与
   `sandbox/policies/repo-memory-template.md`（有测试钉着）。
 - **模型配置按智能体存库，而且没有「出厂默认」**（2026-10-15 用户口径：干掉 `.env` 那套回落）：
@@ -96,17 +97,32 @@
   但只有两行要配。映射在 `agent/llm._AGENT_KEY`（守卫测试逐个角色钉住；界面上的分组与
   「这一行服务哪些角色」由 `config.MODEL_AGENT_ROLES` / `CODING_GROUP` 下发，**前端不硬编码行名**），
   别再把三个子智能体都塞进 `coding`。
-- **意图识别是状态候选 + 严格二选一**（2026-10-22 用户口径）：先按仓库 open PR 状态收口候选
-  （无 open PR：qa / plan / coding；有 open PR：qa / rework；未知：qa），JEV / 大模型各自一行配置（JEV 那一行供应商
+- **意图识别是状态候选 + 严格二选一**（2026-10-22 用户口径）：先按仓库 open PR 状态收口候选。
+  无 open PR：qa / plan / coding；open PR **全部无评论**：qa / coding
+  （coder 已建 PR 但 reviewer 尚未成功时必须能继续收尾；尚无返工对象，不能 rework）；
+  任一 open PR 已有评论：
+  qa / rework；未知：qa。JEV / 大模型各自一行配置（JEV 那一行供应商
   锁死 `typesafe`），选了哪一侧就只走哪一侧 —— 没配齐 / 判不出来一律落**关键字口径**，
   **不互借**（`server/intent.detect_intent`）。JEV 的凭据也走界面（`typesafe_*` 由那一行灌入），
   `.env` 的 `TYPESAFE_*` / `INTENT_MODEL|BASE_URL|API_KEY` 全部作废。
-- **PR 列表每轮只查一次，不做接口缓存**（`server/repo_state.py`）：轮首查全量 PR，
-  同一份列表同时用于意图候选与仓库记忆同步。`server/repo_memory_sync.py` 按记忆里最新 PR
+- **PR 列表分两路查，不做接口缓存**（`server/repo_state.py`）：轮首查最近 10 条全部状态 PR
+  用于仓库记忆；另查完整 `state=open`（分页取尽）用于归属、状态闸门、评论与工作区同步。
+  最近 10 条若与 PR 表上一轮最大编号完全没有重叠，说明两轮间新增超过一页，继续翻页直到重叠。
+  同一份快照同时用于意图候选、仓库记忆同步与主控状态块。关键字识别也只看这份候选，
+  coding 关键字在有评论的 open PR 下不可直通。`server/repo_memory_sync.py` 按记忆里最新 PR
   编号识别新增 PR，批量调用一次 `qa` 模型生成摘要；已有 PR 只更新与平台不一致的状态，
   有差异就真实写回 StoreBackend。PR 查询失败时本轮只保留 qa。
 - **仓库记忆的 PR 同步只有两个入口**：轮首记忆拦截点，以及 coding / rework 轮末。
   `save_repo_memory` 不再查 PR，只合并模型提交的正文与落盘。
+- **PR 归属只认 `pull_requests` 表**（迁移 `c3d4e5f6a7b8`）：`create_pr` 新建 / 复用后立即登记
+  `source=agent`、本轮 `plan_id` 与 head SHA；一个 plan 可关联多个替代 PR。
+  历史 open PR 首次出现时，用沙箱静态 git 身份检查 commits 纳管为 `legacy_agent`；不匹配是
+  `external`，查询失败是 `unknown`。标题、PR 创建者、`GIT_USERNAME`（可能是 `oauth2`）都不是
+  归属依据。`external` / `unknown` 的 open PR 在意图识别前硬拦截并提示用户先处理。
+- **rework 前必须同步 PR head**（`server/pr_workspace.py`）：目标 PR 唯一或用户明确写 `#N`
+  时，平台在 Agent 启动前 `fetch`，确认工作区干净且本地分支是远端祖先，再切到 PR 的
+  `head_sha`。脏工作区、force-push 后分叉、fetch 失败一律停止，不 reset / rebase / 强推。
+  成功后更新 `synced_head_sha`；下次 `head_sha` 不同即说明用户或其他协作者追加了提交。
 - **运行期配置是表 `app_settings`**（迁移 `e3f4a5b6c7d8`）：代码缓存路径 / 默认分支 / 上下文告警线
   与各家窗口。**键与类型只认 `config.RUNTIME_SETTINGS` 那一张表**，接口 `GET/PUT /app-settings`，
   写入后赋回 `Settings` 实例 → **改完立刻生效**（配合「agent 不缓存」）。新增可配项就在那张表里加一行，
@@ -240,20 +256,18 @@
   `previous_intent`（最近一条 assistant 记录的 `extra.intent`），JEV 与大模型两条路都看它。
   `qa` 的裸「为什么」不覆盖
   「为什么不派 / 为什么没改」这类对上一轮动作的追问。
-- **意图上下文是最近两轮对话**（`dao.recent_dialogue` / `service._dialogue`）：用户消息
-  **全文**，助手消息用 `head_tail_excerpt`（前 200 / 后 300 字）截断。语义口径：
+- **意图上下文是最近三个用户轮次**（`dao.recent_dialogue` / `service._dialogue`）：
+  user / assistant / plan 记录全部取**正文全文**，不按两轮或首尾截断。语义口径：
   `qa` 合并原 `analysis`，管已有数据问答、解释功能/用户疑问、排查原因与需求澄清；
   **计划、方案、任务完成度一律 plan**；
-  「继续 / 修正 / 纠正 / 重来」按未完成轮次沿用上一轮可执行意图。短追问（B/确认事实/
-  修复吧）不要因为 target 漂移换形态；明确「实施/执行方案」无 open PR 时归 coding，
+  「继续 / 修正 / 纠正 / 重来」只结合紧邻的上一轮判定与完整对话理解，**不再维护跨
+  qa 的 active task**。短追问（B/确认事实/修复吧）不要因为 target 漂移换形态；
+  明确「实施/执行方案」无 open PR 时归 coding，
   有 open PR 时归 rework；「只想知道/不要做」归 qa。
-- **会话 active task**（`service._active_tasks`）：只记最近一次**可执行**意图
-  （coding/rework/plan），qa 不覆盖；短追问/“继续”优先沿用它。PR 已合并/已关闭后的
-  收尾、关闭/删除方案时清空。路由 JSON 解析失败重试一次。
 - **低置信度转 qa 澄清**（`config.intent_clarify_confidence`，默认 **0.55**，0=关闭）：
   JEV/LLM 的 confidence 低于阈值时转 `qa` + `SOURCE_CLARIFY`，qa 用**提示词澄清模式**
   （先只读了解上下文，按需要列 1~3 步可选项），**不把
-  `write_todos` 还给 qa**。`active_task_override` 命中时优先继续干活，不追问。
+  `write_todos` 还给 qa**。
   **澄清轮禁止 `handoffTask`**：工具层直接拒绝，避免把低置信度判断交给另一个形态长跑；
   这条不能只靠提示词。
   阈值来自 200 条实测：JEV <0.55 的 16 条只对 43.8%，≥0.55 的 147 条对 91.2%。
@@ -267,18 +281,24 @@
 - **qa 没有 `write_todos`，也不许伪造清单**：`V3Translator(allow_todos=False)` 必须丢弃
   qa 模型产生的 `write_todos` tool-call；澄清成功后不要保存原始过程正文 / `<CLARIFY>` /
   伪待办到 `extra.parts`，历史回放遇 `extra.clarification` 时以 `content` 为准。
+- **`TurnState` 是公共运行状态，不属于中间件**：定义在 `agent/turn_state.py`，
+  `middleware/__init__.py` 只做兼容导出。每轮新增字段 `pr` 与 `plan_id`：
+  `create_pr` 成功 / 复用写 `pr` 并登记 PR 表，`storePlan` 与 `get_unexecuted_plan` 写
+  `plan_id`，PR 行同时保存这个方案关联。
+- **方案执行状态由 `PlanRecoveryMiddleware` 回收**：coding 主控、planner、coder 都挂。
+  `before_agent` 修复上一轮遗留的 `executing`；coder `after_agent` 处理正常结束漏回写。
+  有本轮 PR 或轮首 open PR 快照 → `executing` 收口为 `done`；没有 PR → 恢复 `pending`，
+  `running` 步骤退回 `pending`。只处理 `executing`，主动 `failed` / `done` / `closed`
+  不动。**`after_agent` 不是 `finally`**：`CancelledError`、未捕获异常与进程退出不会执行，
+  必须靠下一轮 `before_agent`。
 - **SSE 只有收到 `done` 才算完成**（`frontend/src/lib/api.ts`）：正常 EOF 也可能是代理
   截断；没有 `done` 就带游标重连。轮次收尾后前端按 `/records` 回填持久化助手记录，
   **数据库是最终事实来源**，直播半截内容不能覆盖已落库正文。
 - **大模型分类输出是四行**：意图 / 置信度 / 候选 / 理由；`parse_reply` 仍兼容旧两行。
   改提示词或解析要同时跑 `tests/test_intent_detection.py`。
-- **意图评测先固定轴**：`eval_intent.py run --out` 保存逐样本路由轴，`policy` 用固定轴
-  离线重算策略（不调模型）；`--normal-only` 只跑现有判定。**别拿单次端到端波动直接调策略**
-  —— 同批样本的路由轴会漂（实测 coding→plan 从 0 到 7）。
-- **意图评测与影子路由**（`server/intent_router.py` / `scripts/eval_intent.py`）：把
-  一句话拆成 `speech_act / wants`（change / lookup / analyze / decide）/ `target` /
-  `continuation` 四个轴，策略表只给**建议**；
-  `INTENT_ROUTER_SHADOW=true` 时只记 `INTENT_ROUTER` 日志，**不改变本轮形态**（默认关）。
+- **意图评测只跑现有链路**（`scripts/eval_intent.py`）：`keyword` 与 `normal`
+  （口令 → JEV / 大模型 → 关键字兜底）两路对比，输出准确率、混淆矩阵、clarify 模拟与错例。
+  四轴 shadow router 已彻底删除，不要重新引入第二套在线分类器。
   真实评测样本写 `docs/intent-eval.jsonl`（已 gitignore，别提交用户消息）；示例文件是
   `docs/intent-eval.example.jsonl`。
 - **目录权限口径**看 `docs/workspace-directories.md`。**沙箱里的 Maven 已配好**（阿里云镜像 +

@@ -54,12 +54,26 @@ class PrClient(Protocol):
     async def get_pull(self, *, owner: str, repo: str, number: int) -> dict: ...
 
     async def list_pulls(
-        self, *, owner: str, repo: str, state: str = "all", limit: int = 20
+        self,
+        *,
+        owner: str,
+        repo: str,
+        state: str = "all",
+        limit: int = 20,
+        page: int = 1,
+        sort: str = "created",
+        direction: str = "desc",
     ) -> list[dict] | dict: ...
 
-    async def open_pulls(self) -> list[dict]: ...
+    async def list_pull_commits(
+        self, *, number: int, page: int = 1, limit: int = 100
+    ) -> list[dict] | dict: ...
 
-    async def all_pulls(self) -> list[dict]: ...
+    async def open_pulls(self, *, limit: int = 100) -> list[dict]: ...
+
+    async def all_pulls(
+        self, *, limit: int = 10, until_number: int | None = None
+    ) -> list[dict]: ...
 
     async def find_open_pull(self, *, head: str, base: str) -> dict | None: ...
 
@@ -121,7 +135,14 @@ def pull_summary(pull: Mapping[str, Any]) -> dict[str, str]:
 
 
 async def pulls_or_raise(
-    client: PrClient, repo: RepoSpec, *, state: str, limit: int = 100
+    client: PrClient,
+    repo: RepoSpec,
+    *,
+    state: str,
+    limit: int = 100,
+    page: int = 1,
+    sort: str = "created",
+    direction: str = "desc",
 ) -> list[dict]:
     """本仓库的 PR 列表；任何失败一律抛 ``PrLookupError``。
 
@@ -131,7 +152,13 @@ async def pulls_or_raise(
     """
     try:
         pulls = await client.list_pulls(
-            owner=repo.owner, repo=repo.repo, state=state, limit=limit
+            owner=repo.owner,
+            repo=repo.repo,
+            state=state,
+            limit=limit,
+            page=page,
+            sort=sort,
+            direction=direction,
         )
     except httpx.HTTPStatusError as exc:
         raise PrLookupError(
@@ -147,6 +174,58 @@ async def pulls_or_raise(
     return pulls
 
 
+async def all_pages_or_raise(
+    client: PrClient, repo: RepoSpec, *, state: str, limit: int = 100
+) -> list[dict]:
+    """分页取完某一状态；open PR 的闸门不能只看前 100 条。"""
+    out: list[dict] = []
+    for page in range(1, 21):
+        batch = await pulls_or_raise(
+            client,
+            repo,
+            state=state,
+            limit=limit,
+            page=page,
+        )
+        out.extend(batch)
+        if len(batch) < limit:
+            return out
+    raise PrLookupError("PR 列表超过 20 页，拒绝在状态不完整时继续")
+
+
+async def recent_pulls_or_raise(
+    client: PrClient,
+    repo: RepoSpec,
+    *,
+    limit: int = 10,
+    until_number: int | None = None,
+) -> list[dict]:
+    """取最近一页；与内部水位没有重叠时继续翻页，直到能覆盖上次数据。"""
+    out: list[dict] = []
+    for page in range(1, 21):
+        batch = await pulls_or_raise(
+            client,
+            repo,
+            state="all",
+            limit=limit,
+            page=page,
+        )
+        out.extend(batch)
+        numbers = []
+        for pull in batch:
+            try:
+                numbers.append(int(str(pull.get("number") or "")))
+            except ValueError:
+                continue
+        if (
+            len(batch) < limit
+            or until_number is None
+            or (numbers and min(numbers) <= until_number)
+        ):
+            return out
+    raise PrLookupError("PR 增量超过 20 页，拒绝在历史同步不完整时继续")
+
+
 async def find_open_pull(
     client: PrClient, repo: RepoSpec, *, head: str, base: str
 ) -> dict | None:
@@ -155,10 +234,9 @@ async def find_open_pull(
     用列表接口在本地过滤，而非依赖平台的 ``head``/``base`` 查询参数 ——
     两边对 ``owner:branch`` 形式的接受度不一致，本地过滤结果确定。
     """
-    pulls = await client.list_pulls(
-        owner=repo.owner, repo=repo.repo, state="open", limit=100
-    )
-    if not isinstance(pulls, list):
+    try:
+        pulls = await all_pages_or_raise(client, repo, state="open", limit=100)
+    except PrLookupError:
         return None  # 未配置 token 等，交由后续创建流程报错
     this_repo = repo.full_name
     for pull in pulls:
@@ -171,6 +249,29 @@ async def find_open_pull(
             continue  # 同名分支来自 fork，不算本仓库的 PR
         return pull
     return None
+
+
+def commits_match_agent_identity(
+    commits: list[dict],
+    *,
+    name: str,
+    email: str,
+) -> bool:
+    """PR 的每个提交是否都来自当前沙箱的静态 git 身份。"""
+    wanted_name = name.strip().casefold()
+    wanted_email = email.strip().casefold()
+    if not commits or not wanted_name or not wanted_email:
+        return False
+    for commit in commits:
+        nested = commit.get("commit")
+        author = nested.get("author") if isinstance(nested, Mapping) else None
+        if not isinstance(author, Mapping):
+            return False
+        got_name = str(author.get("name") or "").strip().casefold()
+        got_email = str(author.get("email") or "").strip().casefold()
+        if got_name != wanted_name or got_email != wanted_email:
+            return False
+    return True
 
 
 def _mergeable_text(value: Any) -> str:

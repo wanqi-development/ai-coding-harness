@@ -57,6 +57,7 @@ def build_subagents(
     safety: CommandSafety | None = None,
     fallbacks: Mapping[str, FallbackMiddleware] | None = None,
     memory_factory: Callable[[str], MemoryMiddleware] | None = None,
+    plan_recovery_factory: Callable[[str], AgentMiddleware | None] | None = None,
     summarization_for: Callable[[str, BaseChatModel], AgentMiddleware | None] | None = None,
 ) -> list[SubAgent]:
     """按角色装配子智能体：只产出 ``tools_by_role`` 里给了条目（含空表）的角色。
@@ -103,6 +104,9 @@ def build_subagents(
         # 模型每角色只建一次：压缩中间件要用**同一个实例**（窗口挂在它的 profile 上）
         model = model_for(role)
         summarization = None if summarization_for is None else summarization_for(role, model)
+        plan_recovery = (
+            plan_recovery_factory(role) if plan_recovery_factory is not None else None
+        )
         specs.append(
             {
                 "name": role,
@@ -113,6 +117,8 @@ def build_subagents(
                 "middleware": [
                     # 与主控同序：边界在最外侧，记忆紧随其后
                     BoundaryMiddleware(policies[role], safety),
+                    # planner / coder 也要在进入与正常退出时回收 executing 方案。
+                    *([plan_recovery] if plan_recovery is not None else []),
                     # 各角色一份新实例：它们可能在同一回合里并发跑（见上面的 ``memory_factory``）
                     *([memory_factory(role)] if memory_factory is not None else []),
                     # 读文件红线：policies / project 不许整文件读（与主控同一份规则）

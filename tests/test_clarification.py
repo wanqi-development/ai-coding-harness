@@ -8,7 +8,13 @@ from typing import Any
 
 import pytest
 
-from ai_coding_harness.agent.clarification import parse_clarification
+from ai_coding_harness.agent.clarification import (
+    CLARIFY_INVALID_FALLBACK,
+    CLARIFY_SAVE_FALLBACK,
+    clarification_fallback_text,
+    parse_clarification,
+    strip_clarification_block,
+)
 from ai_coding_harness.config import Settings
 from ai_coding_harness.db import dao
 from ai_coding_harness.server.service import HarnessService
@@ -136,6 +142,31 @@ class TestParse:
                 ]
             )
         ) is None
+
+    def test_strip_clarification_removes_closed_or_unclosed_protocol(self):
+        closed = _payload()
+        unclosed = '前置说明\n<CLARIFY>\n{"steps": ['
+
+        assert strip_clarification_block(closed) == "前置说明\n\n后置说明"
+        assert strip_clarification_block(unclosed) == "前置说明"
+
+    def test_save_failure_fallback_keeps_question_without_protocol(self):
+        raw = _payload()
+        parsed = parse_clarification(raw)
+
+        text = clarification_fallback_text(raw, parsed)
+
+        assert text.startswith(CLARIFY_SAVE_FALLBACK)
+        assert "你想让我做哪一类？" in text
+        assert "<CLARIFY>" not in text
+        assert '"options"' not in text
+
+    def test_invalid_protocol_fallback_never_exposes_the_block(self):
+        text = clarification_fallback_text("<CLARIFY>{not json}</CLARIFY>")
+
+        assert text == CLARIFY_INVALID_FALLBACK
+        assert "<CLARIFY>" not in text
+        assert "not json" not in text
 
 
 class _SessionCtx:

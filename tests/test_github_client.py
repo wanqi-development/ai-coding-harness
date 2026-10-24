@@ -58,6 +58,12 @@ CALLS = [
         "/repos/acme/demo/issues/6/comments",
     ),
     (
+        "list_pull_commits",
+        lambda c: c.list_pull_commits(number=6),
+        "GET",
+        "/repos/acme/demo/pulls/6/commits",
+    ),
+    (
         "get_pull",
         lambda c: c.get_pull(owner="acme", repo="demo", number=6),
         "GET",

@@ -23,7 +23,148 @@
 
 ## 修改记录
 
+### 2026-10-24
+
+#### 彻底删除四轴影子路由
+
+- **动机**：影子路由默认关闭，线上形态从不采用它的建议，但模块、配置、后台 task、
+  测试和评测分支持续增加维护与认知成本。
+- **改动**：
+  - 删除 `server/intent_router.py`、`tests/test_intent_router.py`；
+  - 删除 `HarnessService` 的 router 模型与后台 shadow task 状态；
+  - 删除 `TurnIntentMixin._shadow_route` / `_router_model_for` 与 runner 触发分支；
+  - 删除 `INTENT_ROUTER_SHADOW`、`INTENT_ROUTER_TIMEOUT_SECONDS`；
+  - `scripts/eval_intent.py` 只保留 keyword / normal、clarify 模拟、混淆矩阵与错例，
+    删除 router-only、normal-only、policy 和 router_axes 输出；
+  - 重写 `docs/intent-eval.md`，更新 AGENTS 与 backlog。
+- **关键决策**：不再维护第二套四轴在线分类器；意图质量评估只针对真实上线的
+  `detect_intent` 链路。
+- **验证**：`scripts/eval_intent.py --help` 只剩 `collect / run / enrich / format`；
+  全量 `pytest` **1292 passed, 2 warnings**（随 router 测试删除减少 34 条）；
+  `ruff check`、`scripts/check_prompts.py`（冲突 0 条）与 `git diff --check` 通过。
+
+#### PR 归属表、方案关联与 rework 最新提交同步
+
+- **动机**：PR 创建者可能和用户共用同一个 token，标题 / commit 作者也不适合每轮反复猜测。
+  同时需要在用户向 PR 追加提交后，基于最新代码继续返工，不能只看分支名。
+- **改动**：
+  - 新增 `pull_requests` 表（迁移 `c3d4e5f6a7b8`，列注释迁移 `d4e5f6a7b8c9`）：
+    按平台 + 仓库 + PR 编号唯一，
+    保存 `source`、方案 / 会话关联、head/base、远端 `head_sha` 与
+    `synced_head_sha`。
+  - `create_pr` 新建或复用后立即登记 `source=agent`，并写入本轮 `plan_id`；一个方案可
+    关联多个替代 PR。
+  - 轮首 PR 查询拆成最近 10 条全部状态（供记忆）和完整 open 分页列表（供归属 / 闸门 /
+    评论 / 同步），不再拉 100 条历史 PR。
+  - 历史 open PR 首次出现时只查一次 commits：全部匹配沙箱静态 git 身份记为
+    `legacy_agent`，明确不匹配为 `external`，无法确认是 `unknown`。后两者在意图识别前
+    硬停止，并提示用户先处理。
+  - rework 唯一目标或用户明确写 `#N` 时，Agent 启动前把工作区安全同步到 PR 最新
+    `head_sha`；脏工作区、分叉、force-push 或 fetch 失败直接停止，不覆盖用户提交。
+  - 新增 `docs/pull-request-registry.md`，同步更新 README、AGENTS 与业务流程图。
+- **关键决策**：归属以后只认 PR 表；`source` 不会被普通平台快照从 `external` 自动改写为
+  Agent。工作区同步只允许 fast-forward 条件，不使用 reset / rebase / 强推。
+- **验证**：迁移 `c3d4e5f6a7b8` / `d4e5f6a7b8c9` 已在本地 PostgreSQL 执行到 head；全量 `pytest`
+  **1326 passed, 2 warnings**；PR / 客户端 / 方案 / 工作区同步定向测试 **120 passed**；
+  `ruff check`、`scripts/check_prompts.py`（冲突 0 条）与 `git diff --check` 通过。
+- **遗留**：真实 Gitee / GitHub 仓库上的历史上作者纳管、force-push 分叉提示与
+  rework 同步还需各跑一轮线上验收。
+
+#### 澄清弹窗落库失败时不再把协议 JSON 当正文返回
+
+- **动机**：多步澄清迁移未执行时，`clarifications.steps` 落库失败；后台把它降级成普通
+  文本，前端因此看到原始 `<CLARIFY>` JSON，既没有弹窗也不可读。
+- **改动**：新增澄清协议清理与回退文案。解析成功但落库失败时只展示提示和问题正文；
+  协议不合法时剥掉完整或未闭合的 `<CLARIFY>` 块，清理后为空则提示用户重新描述。
+- **关键决策**：协议块属于内部传输格式，任何失败路径都不向用户暴露标签和 JSON；
+  数据库异常仍由后台日志记录，用户侧只看到可操作的回退说明。
+- **验证**：澄清协议 / 聊天流定向测试 **22 passed**；全量 `pytest`
+  **1308 passed, 2 warnings**；`ruff check`、`scripts/check_prompts.py`
+  （冲突 0 条）与 `git diff --check` 通过。
+
+#### 公共 TurnState 与方案执行状态自动恢复
+
+- **动机**：coder 把方案置为 `executing` 后若用户终止、异常退出或忘记回写，
+  方案会永久失去“未执行”资格。仅靠跟踪 coder delegation 复杂且容易漏；改为利用中间件
+  `before_agent` 和正常 `after_agent`，并按本轮是否已有 PR 决定收口方向。
+- **改动**：
+  - `TurnState` / `TurnStop` 从 `agent/middleware/guard.py` 移到公共模块
+    `agent/turn_state.py`，中间件包只保留兼容导出。
+  - `TurnState` 新增 `pr` 与 `plan_id`。`create_pr` 成功 / 复用时写 PR 编号；
+    `storePlan` 与 `get_unexecuted_plan` 写方案编号。
+  - 新增 `PlanRecoveryMiddleware`，挂到 coding 主控、planner、coder。
+  - `before_agent` 修复上一轮遗留；coder `after_agent` 兜底正常结束漏回写。
+    有本轮 PR 或轮首 open PR 快照时 `executing → done`；没有 PR 时
+    `executing → pending`，并把 `running` 步骤退回 `pending`。
+  - 主动 `failed`、`done`、`closed` 不自动修改；回收 DAO 只更新 `executing`，
+    `session_id + status` 条件更新保证 multi-worker 幂等。
+- **关键决策**：`after_agent` 不是异常 `finally`；取消、未捕获异常和进程退出由下一轮
+  `before_agent` 恢复。跨轮恢复除本轮 `pr` 外，还使用轮首 `open_prs` 快照兜底。
+- **验证**：方案恢复 / 方案工具定向测试 **56 passed**；全量 `pytest`
+  **1303 passed, 2 warnings**；`ruff check`、`scripts/check_prompts.py`
+  （冲突 0 条）与 `git diff --check` 通过。
+- **遗留**：真实 PostgreSQL 的 `reclaim_executing_plan` 条件更新需在可连接环境补一组
+  集成验证。
+
 ### 2026-10-23
+
+#### 删除意图识别中的跨轮 active task
+
+- **动机**（用户口径）：active task 每增加一层“短追问 / 选择 / 问句”判断，维护成本和
+  误判率都上升，实际带来的准确率收益不足；意图应由最近三轮完整对话和紧邻上一轮判定
+  自行理解。
+- **改动**：
+  - 删除 `_active_tasks` 会话状态，以及 `_active_task` / `_remember_active_task`。
+  - 删除 `active_task_override` / `active_task_continuation` 和 `SOURCE_ACTIVE`。
+  - JEV、大模型分类、`handoffTask` 重判、影子路由与 `eval_intent.py` 全部不再接收
+    `active_intent`。
+  - 保留 `previous_intent`：它只表示紧邻上一轮的判定，不跨 qa 累积。
+  - 评测 JSON 中旧的 `active_intent` 字段保留为历史数据，但新流程完全忽略。
+- **关键决策**：不再单独记忆“最近一次可执行任务”；继续 / 修正 / 选择统一根据最近三轮
+  完整会话理解。
+- **验证**：意图 / router / 澄清 / chat 路由定向测试 **93 passed**；全量 `pytest`
+  **1294 passed, 2 warnings**；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check` 与 `git diff --check` 通过。
+- **遗留**：需要观察真实意图评测，确认删除 active 后短选择样本准确率变化。
+
+#### open PR 尚未评论时保留 coding 意图
+
+- **动机**：coder 建完 PR 后 reviewer 可能失败，此时 PR 为 open 但没有任何评论；
+  旧状态闸门仍只保留 qa / rework，导致本应继续收尾的 coding 被错误拦住。
+- **改动**：
+  - 轮首 PR 快照为每个 open PR 补查一次评论（只取 1 条判断有无）。
+  - 无 open PR：qa / plan / coding；open PR 全部无评论：qa / coding（尚无返工对象）；
+    任一 open PR 已有评论：qa / rework。
+  - 关键字口令仍按同一份 `allowed_intents` 收口：未评论 PR 下 coding 关键字可命中，
+    已评论后 coding 关键字被状态闸门挡住。
+  - 主控仓库状态块标出每个 PR 是“暂无评论，coding 可继续”还是“已有评论，只走 rework”。
+- **关键决策**：评论是 reviewer 是否进入过后续链路的信号；多个 open PR 中只要有一个
+  已评论，就按存在可返工任务处理，暂停 coding。
+- **验证**：PR 快照 / 意图 / state gate 定向测试 **43 passed**；全量 `pytest`
+  **1297 passed, 2 warnings**；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check` 与 `git diff --check` 通过。
+- **遗留**：每个 open PR 多一次评论查询；当前先按每轮实时数据优先，暂不缓存。
+
+#### 意图判定改用最近三轮完整会话，并收紧 active task 沿用条件
+
+- **动机**：真实会话中用户已连续选择方案、要求继续，但“选择1”被 JEV 判成低置信度
+  `coding=0.40` 后又转成 qa 澄清。旧上下文只有约两轮，且助手正文被首尾截断；同时
+  active-task 判断只处理“分类器判成 qa”的情况，无法阻止低置信度把 coding 改回 qa。
+- **改动**：
+  - 意图上下文改为最近 **3 个用户轮次**，包含期间全部 user / assistant / plan 记录，
+    正文不做首尾截断。plan 按独立时间线记录标注为“方案”。
+  - `intent_history_turns` 默认从 4 改为 3，并按用户轮次数解释，不再按消息条数解释。
+  - 新增 `active_task_continuation`：只有上一项可执行任务为 coding / plan / rework，
+    且本轮是选择、继续、修正或短动作时才沿用；出现“为什么 / 怎么 / 什么 / 讲讲 /
+    看一下”等问句信号时不覆盖分类结果。
+  - active task 判断移到低置信度澄清之前，并对分类器已经猜成 coding/rework 的情况同样生效。
+  - JEV prompt 明确完整历史、方案记录与不截断口径。
+- **关键决策**：不是所有短消息都沿用上一任务；“选择1 / 方案A / 继续”等明确选择才沿用，
+  真实问句仍走 qa。
+- **验证**：意图 / 澄清 / chat 路由定向测试 **53 passed**；全量 `pytest`
+  **1294 passed, 2 warnings**；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check` 与 `git diff --check` 通过。
+- **遗留**：先用三轮观察真实数据，再根据评测决定是否扩到四轮。
 
 #### 澄清改为分步弹窗，并修复 qa 幽灵待办与原始 CLARIFY 回放
 

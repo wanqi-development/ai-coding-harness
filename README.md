@@ -10,7 +10,8 @@
 
 - 状态优先意图：无 open PR 时使用 `qa / plan / coding`，有 open PR 时使用 `qa / rework`。
 - 三种主形态：`qa`、`plan`、`orchestrate`；coding/rework 共用 orchestrate，并挂 planner / coder / reviewer 三个子智能体。
-- PR 感知：每轮实时查询一次 PR，同时用于意图候选、状态闸门和仓库记忆同步。
+- PR 感知：轮首读取最近 10 条 PR 用于记忆，另分页读取全部 open PR；PR 归属、方案关联和
+  rework 工作区同步水位持久化在 `pull_requests` 表。
 - 上下文工程：中英混合 token 估算、在线校准、持久化工具裁剪事件、到线摘要与完整历史 offload。
 - 流式可观测：正文、reasoning、待办、工具、方案、token、文件 diff、handoff 内层 run 树。
 - 本地工作台：聊天、代码、记忆、PR、日志、Token，以及整页设置。
@@ -19,7 +20,7 @@
 
 - **接口**：FastAPI + SSE。`POST /chat/{session_id}` 起一轮并订阅，`GET /chat/{session_id}/stream?after=<帧号>` 刷新后接回；运行与 HTTP 请求生命周期解耦，终止必须调用 cancel。
 - **模型路由**：按智能体角色选择设置页里的模型行。主智能体不缓存，每轮现建，因此模型配置下一轮生效。
-- **意图判定**：轮首先取一次 PR 快照和仓库记忆状态，再按候选集、口令、JEV 或大模型、关键字兜底依次判定。PR 状态不一致时由纯函数闸门拦截写操作。
+- **意图判定**：轮首先取 PR 快照和仓库记忆状态，再按候选集、口令、JEV 或大模型、关键字兜底依次判定。外部 / 归属未知的 open PR 在分类前直接停止；PR 状态不一致时再由纯函数闸门拦截写操作。
 - **装配轴**：`agent/profiles.py` 决定主形态挂哪些工具、子智能体和提示词，避免多套分支漂移。
 - **执行环境**：每会话一个 OpenSandbox 容器，项目位于 `/ai_coding/project`；policies、skills、Maven 与初始化脚本建会话时从仓库推入。
 - **文件后端**：CompositeBackend 将普通文件、`/memories/`、`/conversation_history/`、`/large_tool_results/` 路由到沙箱或持久 StoreBackend。
@@ -32,15 +33,24 @@
 |---|---|---|
 | `qa` | `qa` | 只读问答、解释、排查、需求澄清，以及查询现有仓库/PR/文件/任务状态 |
 | `plan` | `plan` | 方案讨论、方案落库、步骤设计；不写任务代码 |
-| `coding` | `orchestrate` | 没有 open PR 时实施新任务；普通代码走 planner → coder → reviewer，纯文档由 coder 直做并创建 PR |
+| `coding` | `orchestrate` | 没有 open PR（或只有尚待收尾的 Agent PR）时实施新任务；普通代码走 planner → coder → reviewer，纯文档由 coder 直做并创建 PR |
 | `rework` | `orchestrate` | 跟进已有 open PR：审查、回评、按用户要求或审查意见修改既有分支 |
 
 约束：
 
 - 有 open PR 时，`coding` / `plan` 会被状态闸门拦截，写操作只能走 `rework`。
+- 非本 Harness 创建或归属无法确认的 open PR 会在意图分类前硬拦截，提示用户先处理；
+  历史 PR 的归属通过一次 commit 作者核验后写入 `pull_requests`，之后不再重复猜。
+- 例外：open PR **全部没有评论**时，说明 coder 可能已建 PR 但 reviewer 还没完成；
+  此时 `coding` 继续可用，用于收尾同一任务；没有审查评论时 `rework` 暂不可用。
+  任一 open PR 已有评论后，coding 才被拦回 `rework`。
 - 没有 open PR 时不能进入 `rework`。
 - `review` 不再是独立主控形态；reviewer 是 coding/rework 的内部子智能体。
 - `qa` 和 `plan` 不写仓库记忆；仓库记忆正文只在 coding/rework 收尾写回。
+- **方案执行状态自动恢复**：coding 主控、planner、coder 进入时会把上一轮遗留的
+  `executing` 方案按 PR 状态收口；coder 正常结束也会兜底。存在 PR 时方案记为 `done`，
+  没有 PR 时恢复 `pending`。用户终止或异常未执行 `after_agent` 时，由下一轮
+  `before_agent` 修复。
 - **纯文档直做**：任务只新增 / 修改 `AGENTS.md`、README、`docs/` 或其他 `.md` / `.mdx` /
   `.rst` / `.adoc`，且不涉及源码、测试、配置、依赖或构建文件时，coding 主控只维护任务清单并
   直接派 coder；不查询或创建方案，不派 planner，也不派 reviewer。
@@ -112,7 +122,12 @@
 
 ## PR、仓库记忆与文件变更
 
-- 每轮只查询一次全量 PR，不做跨轮接口缓存。
+- 每轮查询最近 10 条全部状态 PR，并分页查询完整 open PR；不做跨轮接口缓存。
+- `pull_requests` 保存 PR 编号、状态、作者、head/base 分支、远端 `head_sha`、已同步
+  `synced_head_sha`、来源（`agent / legacy_agent / external / unknown`）和产出它的 `plan_id`。
+- `create_pr` 在平台成功后立即写 PR 表；一个方案可以关联一个或多个替代 PR。
+- rework 目标唯一或用户明确写出 `#N` 时，平台先把工作区安全快进到 PR 最新 `head_sha`。
+  工作区脏、远端 force-push 造成分叉或 fetch 失败时直接停止，绝不覆盖用户提交。
 - 新 PR 批量生成摘要后增量写入仓库记忆；已有 PR 只同步变化的状态。
 - PR 同步入口只有两个：轮首记忆拦截点、coding/rework 轮末。
 - `save_repo_memory(section, payload)` 只接受 `change / gaps / decisions / basic`，平台负责合并、去重、渲染和限长。

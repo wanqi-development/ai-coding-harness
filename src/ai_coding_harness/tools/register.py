@@ -102,7 +102,15 @@ def build_main_tools(
     wanted = _FORM_TOOLS[form]
     online = [web_search_tool, fetch_url_tool]
 
-    pool: dict[str, BaseTool] = {t.name: t for t in build_pr_tools(settings, repo)}
+    pool: dict[str, BaseTool] = {
+        t.name: t
+        for t in build_pr_tools(
+            settings,
+            repo,
+            database=database,
+            session_id=plan_ctx.session_db_id if plan_ctx is not None else None,
+        )
+    }
     if "save_repo_memory" in wanted:
         # PR 查询与状态对账在轮首 / coding/rework 轮末完成；此工具只合并并落盘正文。
         pool.update(
@@ -143,7 +151,12 @@ def build_subagent_tools(
       PR 上的回复统一由主智能体负责）
     - reviewer: comment_pr + list_pr_comments + get_pr_info
     """
-    pr_tools = build_pr_tools(settings, repo)
+    pr_tools = build_pr_tools(
+        settings,
+        repo,
+        database=database,
+        session_id=plan_ctx.session_db_id if plan_ctx is not None else None,
+    )
     plan_tools = build_plan_tools(database, plan_ctx) if (database and plan_ctx) else []
 
     if role == "planner":

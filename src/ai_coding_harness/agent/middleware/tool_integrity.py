@@ -57,7 +57,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
-from ai_coding_harness.agent.middleware.guard import TurnStop
+from ai_coding_harness.agent.turn_state import TurnStop
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.safety.redact import redact
 from ai_coding_harness.tools.context import get_redact_terms

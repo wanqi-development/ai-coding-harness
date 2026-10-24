@@ -3,9 +3,6 @@
 API 路由只做 HTTP 转换，业务逻辑集中在这一层。
 """
 
-
-import asyncio
-
 from deepagents.backends import StoreBackend
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -76,9 +73,6 @@ class HarnessService(
         self._intent_jev = intent_jev
         # 分类模型懒建一次即可：每会话每轮都建一个新实例会攒下未关闭的连接
         self._classifier: BaseChatModel | None = None
-        #: 影子路由用的模型：优先「意图识别（大模型）」那一行；没配就退到任一条
-        #: 已配置的 agent 行（原型阶段，分类任务不挂工具）。
-        self._router_model: BaseChatModel | None = None
         #: 本轮意图判定的 token 累加器（``{"input":…, "output":…, "calls":…}``）。
         #: 判定跑在事件流之外，用量没法从 ``AgentRunLog`` 里拿到，所以在这里攒、
         #: 轮末并进本轮那份账（归类名 ``INTENT_ACTOR``，单独一项而不是并进主控）。
@@ -92,11 +86,6 @@ class HarnessService(
         #: 上一次推 usage 帧的时刻（``time.monotonic()``；0 ＝ 本轮还没推过）。
         #: 逐轮清零，好让每轮的第一个进度点就能把账推出去。
         self._last_usage_frame = 0.0
-        #: 影子路由器的后台 task（只记日志、不改变本轮形态）；持有引用防止被 GC。
-        self._shadow_tasks: set[asyncio.Task[None]] = set()
-        #: 会话 → 最近一次可执行意图（coding/rework/plan）；qa 不覆盖。
-        #: 进程重启后从最近 assistant 记录回溯，不引入新表。
-        self._active_tasks: dict[str, str] = {}
         #: 仓库记忆在沙箱准备前也要读写：直连 StoreBackend，路径用 store key。
         store = getattr(manager, "store", None)
         self._memory_backend = (

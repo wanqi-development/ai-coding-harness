@@ -20,7 +20,6 @@ from ai_coding_harness.server.intent import (
     IntentDecision,
     _system_prompt,
     _user_prompt,
-    active_task_override,
     clarification_decision,
     classify,
     detect_intent,
@@ -76,7 +75,6 @@ class _FakeJev:
         usage: dict[str, int] | None = None,
         previous_reply: str | None = None,
         previous_intent: str | None = None,
-        active_intent: str | None = None,
         dialogue: Sequence[Mapping[str, str]] = (),
         allowed_intents: Sequence[str] | None = None,
         repo_state: str | None = None,
@@ -115,6 +113,11 @@ class TestStrongKeywords:
         assert match_strong("写 AGENTS.md") == "coding"
         assert match_strong("给我出一个写文档的方案") is None
         assert match_strong("先讨论文档结构，不要写") is None
+        assert (
+            match_strong("开始写代码", allowed_intents=("qa", "coding"))
+            == "coding"
+        )
+        assert match_strong("开始写代码", allowed_intents=("qa", "rework")) is None
 
     def test_open_pr_review_and_fix_commands_are_rework(self) -> None:
         for message in (
@@ -205,7 +208,7 @@ class TestGate:
     def test_function_gate_blocks_rework_without_a_pr(self) -> None:
         result = gate_intent_for_state("rework", ("qa", "plan", "coding"))
         assert result.intent is None
-        assert "没有还开着的 PR" in result.reason
+        assert "当前没有可返工的 PR" in result.reason
 
 
 class TestContext:
@@ -215,22 +218,16 @@ class TestContext:
             ["上一轮"],
             ["rework(评审提)"],
             previous_intent="rework",
-            active_intent="rework",
             dialogue=[{"role": "assistant", "content": "要修哪条？"}],
             repo_state="有 1 个 open PR",
         )
 
         assert "当前仓库状态：有 1 个 open PR" in text
         assert "上一轮判定：rework" in text
-        assert "最近两轮对话" in text
+        assert "最近三个用户轮次内的完整会话记录" in text
+        assert "以下正文未截断" in text
         assert "rework(评审提)" in text
-
-    def test_short_continuation_keeps_an_execution_task(self) -> None:
-        assert active_task_override("继续吧", "qa", "rework") == "rework"
-        assert active_task_override("修复吧", "qa", "plan") == "coding"
-
-    def test_questions_do_not_override(self) -> None:
-        assert active_task_override("那是不是可以读一部分", "qa", "coding") is None
+        assert "当前未完成任务" not in text
 
     def test_low_confidence_clarification_is_still_qa(self) -> None:
         decision = IntentDecision("rework", SOURCE_LLM, confidence=0.31)

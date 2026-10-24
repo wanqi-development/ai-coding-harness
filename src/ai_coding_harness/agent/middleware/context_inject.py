@@ -116,7 +116,16 @@ def repo_state_block(state: Any) -> str:
             head = pull.get("head")
             if isinstance(head, Mapping):
                 branch = str(head.get("ref") or "").strip()
-            suffix = f"（分支 {branch}）" if branch else ""
+                sha = str(head.get("sha") or "").strip()[:8]
+            else:
+                sha = ""
+            review = "已有评论，后续只走 rework" if pull.get("_has_comments") else "暂无评论，coding 可继续收尾"
+            target = f"分支 {branch}" if branch else ""
+            if sha:
+                target = f"{target}，head {sha}" if target else f"head {sha}"
+            if pull.get("_head_changed"):
+                target = f"{target}，有新提交" if target else "有新提交"
+            suffix = f"（{target}；{review}）" if target else f"（{review}）"
             lines.append(f"  - #{number} {title}{suffix}".rstrip())
     return "\n".join(lines)
 
