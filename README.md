@@ -345,4 +345,3 @@ npm.cmd --prefix frontend run build
 - `docs/workspace-directories.md`：工作区目录与权限。
 - `docs/code-platform-pr-api.md`：Gitee/GitHub PR API 差异。
 - `docs/repo-memory-template.md`：仓库记忆模板。
-- `docs/backlog.md`：已立项但尚未实施的事项。
