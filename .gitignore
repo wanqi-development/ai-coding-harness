@@ -22,6 +22,8 @@ logs/
 docs/intent-eval.jsonl
 # 个人简历 / 面试材料只保留在本机，不随产品仓库发布
 docs/resume*.md
+# 项目 backlog 只作为本机工作清单，不随产品仓库发布
+docs/backlog.md
 
 # 本地一次性排查脚本 / 临时笔记：不进库，也不占根目录
 scratch/

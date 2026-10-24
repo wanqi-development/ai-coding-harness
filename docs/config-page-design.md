@@ -1,7 +1,7 @@
 # 设置页的设计（三栏工作台 + 模型配置弹窗）
 
 这份文档说的是**界面上的「设置」长什么样、每一项存在哪、什么时候生效**。
-「最近改了什么」看 `CHANGELOG.md`；「还没做的」看 `docs/backlog.md`。
+「最近改了什么」看 `CHANGELOG.md`。
 
 入口是左栏品牌行那颗齿轮（`frontend/src/components/settings/SettingsPage.vue`），`Esc` 或左上角返回回到聊天。
 切页时聊天区用 `v-show` 藏在原地（不卸 DOM：正在跑的流还在往 App 的状态里写）；
