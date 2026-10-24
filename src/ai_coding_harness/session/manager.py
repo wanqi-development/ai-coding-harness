@@ -28,10 +28,11 @@ from opensandbox.models.sandboxes import Volume
 from ai_coding_harness.agent.graph import build_agent
 from ai_coding_harness.agent.middleware import (
     FallbackMiddleware,
+    PlanRecoveryMiddleware,
     build_memory_middleware,
 )
 from ai_coding_harness.agent.middleware.summarization import build_summarization
-from ai_coding_harness.agent.profiles import AgentProfile
+from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM, AgentProfile
 from ai_coding_harness.agent.prompts import build_main_prompt
 from ai_coding_harness.agent.subagents import build_subagents
 from ai_coding_harness.backends.composite import build_composite_backend
@@ -174,6 +175,11 @@ class SessionManager:
         self._safety = CommandSafety()
         self._runtimes: dict[str, SessionRuntime] = {}
         self._pending: dict[str, _Pending] = {}
+
+    @property
+    def store(self) -> BaseStore:
+        """持久 Store；仓库记忆在沙箱建立前也要读写。"""
+        return self._store
 
     # -- 会话（只落库）-----------------------------------------------------
     async def create_session(
@@ -410,8 +416,17 @@ class SessionManager:
                 if (fb := self._fallback_middleware(role, role)) is not None
             },
             # 子智能体也各挂一份记忆中间件（每次调用现给一个实例：它们可能并发跑）
-            memory_factory=lambda: build_memory_middleware(
-                self._settings, session.repo, runtime.backend
+            memory_factory=lambda role: build_memory_middleware(
+                self._settings, session.repo, runtime.backend, role=role
+            ),
+            plan_recovery_factory=lambda role: (
+                PlanRecoveryMiddleware(
+                    database=self._db,
+                    session_id=session.db_id,
+                    role=role,
+                )
+                if role in {"planner", "coder"}
+                else None
             ),
             # 压缩（含压缩线处的应急裁剪）：每个角色按**它自己那个模型**的窗口算触发线。
             # 上游那份已在 ``agent/graph.py`` 里按类排掉，所以这里不给就是「这个角色不压缩」
@@ -437,6 +452,15 @@ class SessionManager:
             # 才带（先查 PR、刷新记忆，有未合入的就拦下本轮），其余形态是只读注入。
             memory=build_memory_middleware(
                 self._settings, session.repo, runtime.backend, profile.form
+            ),
+            plan_recovery=(
+                PlanRecoveryMiddleware(
+                    database=self._db,
+                    session_id=session.db_id,
+                    role=MAIN_AGENT,
+                )
+                if profile.form == ORCHESTRATE_FORM
+                else None
             ),
             # 压缩（同一根开关，含压缩线处的应急裁剪）：上游那份已排掉，不传就是不压
             summarization=build_summarization(

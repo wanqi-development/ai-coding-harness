@@ -10,10 +10,13 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.runnables.config import var_child_runnable_config
 
+from ai_coding_harness.agent.turn_state import TurnState
 from ai_coding_harness.config import Settings
+from ai_coding_harness.tools import git as git_mod
 from ai_coding_harness.tools import plan as plan_mod
-from ai_coding_harness.tools.git import GiteeRepo
+from ai_coding_harness.tools.git import GiteeRepo, build_pr_tools
 from ai_coding_harness.tools.plan import (
     PlanContext,
     _format_plan,
@@ -31,6 +34,12 @@ def _plan(**over) -> SimpleNamespace:
     base = {"id": 7, "status": "pending", "title": None, "content": "正文", "steps": None}
     base.update(over)
     return SimpleNamespace(**base)
+
+
+class _Db:
+    @asynccontextmanager
+    async def session(self):
+        yield None
 
 
 class TestNormalizeSteps:
@@ -409,8 +418,173 @@ class TestPlanCrud:
 
     async def test_get_plan_without_any_plan_says_so(self, monkeypatch):
         msg, _ = await self._call(monkeypatch, "getPlan", latest=None)
-
         assert "还没有方案" in msg
+
+
+class TestRoundStateCapture:
+    async def test_store_plan_writes_plan_id_to_turn_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_store(db, **kwargs):
+            return _plan(id=9)
+
+        monkeypatch.setattr(plan_mod.dao, "store_plan", fake_store)
+        state = TurnState()
+        token = var_child_runnable_config.set(
+            {"configurable": {"turn_state": state}}
+        )
+        try:
+            tool = next(
+                t for t in build_plan_tools(_Db(), _ctx()) if t.name == "storePlan"
+            )
+            await tool.ainvoke(
+                {
+                    "content": "甲" * 120,
+                    "steps": [{"goal": "改 A"}],
+                }
+            )
+        finally:
+            var_child_runnable_config.reset(token)
+
+        assert state.plan_id == 9
+
+    async def test_get_unexecuted_plan_writes_plan_id_to_turn_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_get(db, *, session_id):
+            return _plan(id=11, content="方案正文", steps=[])
+
+        monkeypatch.setattr(plan_mod.dao, "get_unexecuted_plan", fake_get)
+        state = TurnState()
+        token = var_child_runnable_config.set(
+            {"configurable": {"turn_state": state}}
+        )
+        try:
+            tool = next(
+                t
+                for t in build_plan_tools(_Db(), _ctx())
+                if t.name == "get_unexecuted_plan"
+            )
+            await tool.ainvoke({})
+        finally:
+            var_child_runnable_config.reset(token)
+
+        assert state.plan_id == 11
+
+    async def test_create_pr_records_the_reused_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Client:
+            async def find_open_pull(self, *, head, base):
+                return {"number": 88, "html_url": "https://example/pr/88"}
+
+        monkeypatch.setattr(git_mod, "build_git_client", lambda *_a, **_kw: _Client())
+        state = TurnState()
+        token = var_child_runnable_config.set(
+            {"configurable": {"turn_state": state}}
+        )
+        try:
+            tool = next(
+                t
+                for t in build_pr_tools(
+                    Settings(_env_file=None),
+                    GiteeRepo(owner="owner", repo="repo", token="t"),
+                )
+                if t.name == "create_pr"
+            )
+            await tool.ainvoke(
+                {"title": "t", "head": "feature/x", "base": "master", "body": "b"}
+            )
+        finally:
+            var_child_runnable_config.reset(token)
+
+        assert state.pr == 88
+
+    async def test_create_pr_records_a_new_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Client:
+            async def find_open_pull(self, *, head, base):
+                return None
+
+            async def create_pr(self, *, title, head, base, body):
+                return {"number": 99, "html_url": "https://example/pr/99"}
+
+        monkeypatch.setattr(git_mod, "build_git_client", lambda *_a, **_kw: _Client())
+        state = TurnState()
+        token = var_child_runnable_config.set(
+            {"configurable": {"turn_state": state}}
+        )
+        try:
+            tool = next(
+                t
+                for t in build_pr_tools(
+                    Settings(_env_file=None),
+                    GiteeRepo(owner="owner", repo="repo", token="t"),
+                )
+                if t.name == "create_pr"
+            )
+            await tool.ainvoke(
+                {"title": "t", "head": "feature/x", "base": "master", "body": "b"}
+            )
+        finally:
+            var_child_runnable_config.reset(token)
+
+        assert state.pr == 99
+
+    async def test_create_pr_registers_agent_pull_with_plan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Client:
+            async def find_open_pull(self, *, head, base):
+                return None
+
+            async def create_pr(self, *, title, head, base, body):
+                return {
+                    "number": 100,
+                    "title": title,
+                    "state": "open",
+                    "html_url": "https://example/pr/100",
+                    "user": {"login": "agent-owner"},
+                    "head": {"ref": head, "sha": "a" * 40},
+                    "base": {"ref": base},
+                }
+
+        seen: dict = {}
+
+        async def fake_upsert(db, **kwargs):
+            seen.update(kwargs)
+            return _plan(id=1)
+
+        monkeypatch.setattr(git_mod, "build_git_client", lambda *_a, **_kw: _Client())
+        monkeypatch.setattr(git_mod.dao, "upsert_pull_request", fake_upsert)
+        state = TurnState(plan_id=57)
+        token = var_child_runnable_config.set(
+            {"configurable": {"turn_state": state}}
+        )
+        try:
+            tool = next(
+                t
+                for t in build_pr_tools(
+                    Settings(_env_file=None),
+                    GiteeRepo(owner="owner", repo="repo", token="t"),
+                    database=_Db(),
+                    session_id=7,
+                )
+                if t.name == "create_pr"
+            )
+            await tool.ainvoke(
+                {"title": "t", "head": "feature/x", "base": "master", "body": "b"}
+            )
+        finally:
+            var_child_runnable_config.reset(token)
+
+        assert seen["number"] == 100
+        assert seen["plan_id"] == 57
+        assert seen["session_id"] == 7
+        assert seen["source"] == "agent"
+        assert seen["mark_synced"] is True
+        assert seen["head_sha"] == "a" * 40
 
 
 def test_exports_all_nine_tools():

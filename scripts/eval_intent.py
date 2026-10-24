@@ -1,4 +1,4 @@
-"""意图判定评测：收集真实样本、跑现有判定与影子路由、出准确率与混淆矩阵。
+"""意图判定评测：收集真实样本、跑现有判定、出准确率与混淆矩阵。
 
 用法（在仓库根目录）：
 
@@ -11,8 +11,6 @@
         docs/intent-eval.jsonl
 
 ``collect`` / ``enrich`` 只读业务库；``run`` 只读一次库里的模型配置（不写库）。
-影子路由器的建议**不改变线上形态**，线上要记录它需显式打开
-``INTENT_ROUTER_SHADOW=true``。
 """
 
 from __future__ import annotations
@@ -27,23 +25,15 @@ from typing import Any
 
 from sqlalchemy import select
 
-from ai_coding_harness.agent.llm import build_classifier_model, build_model
+from ai_coding_harness.agent.llm import build_classifier_model
 from ai_coding_harness.config import Settings
 from ai_coding_harness.db import Database
 from ai_coding_harness.db.models import SessionRecord, SessionRecordDetail
 from ai_coding_harness.server.intent import (
-    EXECUTION_INTENTS,
-    SOURCE_ACTIVE,
-    active_task_override,
     build_jev_decider,
     classify,
     detect_intent,
     head_tail_excerpt,
-)
-from ai_coding_harness.server.intent_router import (
-    RouterDecision,
-    route,
-    suggest_intent,
 )
 
 
@@ -188,18 +178,6 @@ async def enrich(path: Path) -> None:
                         row["previous_intent"] = extra["intent"]
                     if isinstance(content, str) and content.strip():
                         row["previous_reply"] = head_tail_excerpt(content)
-                active = next(
-                    (
-                        str(extra["intent"])
-                        for kind, extra, _content in reversed(conv)
-                        if kind == "assistant"
-                        and isinstance(extra, dict)
-                        and extra.get("intent") in EXECUTION_INTENTS
-                    ),
-                    None,
-                )
-                if active:
-                    row["active_intent"] = active
                 touched += 1
     finally:
         await database.dispose()
@@ -246,26 +224,6 @@ def _classifier_or_none(settings: Settings) -> Any:
         return None
 
 
-def _router_or_none(settings: Settings, classifier: Any) -> Any:
-    """路由模型：优先分类行；没有就借一条已配置的 agent 行（原型阶段不挂工具）。"""
-    if classifier is not None:
-        return classifier
-    if not settings.intent_llm_enabled:
-        return None
-    for role in ("qa", "analysis", "coding", "plan", "review"):
-        model = _build_role_model(settings, role)
-        if model is not None:
-            return model
-    return None
-
-
-def _build_role_model(settings: Settings, role: str) -> Any:
-    try:
-        return build_model(settings, role=role)
-    except Exception:  # noqa: BLE001 —— 某一行没配就试下一行
-        return None
-
-
 def _accuracy(pairs: list[tuple[str, str]]) -> tuple[int, int, float]:
     correct = sum(1 for expected, got in pairs if expected == got)
     total = len(pairs)
@@ -276,8 +234,6 @@ async def run(
     path: Path,
     limit: int = 0,
     ids: set[int] | None = None,
-    router_only: bool = False,
-    normal_only: bool = False,
     out: Path | None = None,
 ) -> None:
     rows = _read_rows(path)
@@ -300,18 +256,10 @@ async def run(
         print(f"JEV 不可用：{type(exc).__name__}: {exc}")
         jev = None
     model = _classifier_or_none(settings)
-    router_model = _router_or_none(settings, model)
-    print(
-        "模型："
-        f"分类={'有' if model else '无'}；路由={'有' if router_model else '无'}；"
-        f"JEV={'有' if jev else '无'}"
-    )
+    print(f"模型：分类={'有' if model else '无'}；JEV={'有' if jev else '无'}")
 
     keyword_pairs: list[tuple[str, str]] = []
     normal_pairs: list[tuple[str, str]] = []
-    router_pairs: list[tuple[str, str]] = []
-    router_missing = 0
-    router_sync_skipped = 0
     details: list[dict[str, Any]] = []
 
     for row in labelled:
@@ -320,66 +268,31 @@ async def run(
         history = [str(item) for item in (row.get("history") or [])]
         previous_reply = row.get("previous_reply") or None
         previous_intent = row.get("previous_intent") or None
-        active_intent = row.get("active_intent") or previous_intent
         dialogue = row.get("dialogue") or []
 
         keyword = classify(message)
         normal_intent = ""
         normal_source = ""
         normal_confidence = None
-        if not router_only:
-            use_usage: dict[str, int] = {}
-            normal = await detect_intent(
-                message,
-                history=history,
-                jev=jev,
-                model=model,
-                timeout=settings.intent_timeout_seconds,
-                usage=use_usage,
-                previous_reply=previous_reply,
-                previous_intent=previous_intent,
-            active_intent=active_intent,
-                dialogue=dialogue,
-                mode=settings.intent_mode,
-            )
-            normal_intent = normal.intent
-            normal_source = normal.source
-            normal_confidence = normal.confidence
-            override = active_task_override(message, normal_intent, active_intent)
-            if override:
-                normal_intent = override
-                normal_source = SOURCE_ACTIVE
-        router_decision: RouterDecision | None = None
-        suggested = ""
-        if router_model is not None and not normal_only:
-            router_decision = await route(
-                router_model,
-                message,
-                history=history,
-                previous_reply=previous_reply,
-                previous_intent=previous_intent,
-                active_intent=active_intent,
-                dialogue=dialogue,
-                timeout=settings.intent_router_timeout_seconds,
-            )
-            if router_decision is not None:
-                suggested = suggest_intent(
-                    router_decision,
-                    previous_intent,
-                    message,
-                    active_intent=active_intent,
-                )
+        use_usage: dict[str, int] = {}
+        normal = await detect_intent(
+            message,
+            history=history,
+            jev=jev,
+            model=model,
+            timeout=settings.intent_timeout_seconds,
+            usage=use_usage,
+            previous_reply=previous_reply,
+            previous_intent=previous_intent,
+            dialogue=dialogue,
+            mode=settings.intent_mode,
+        )
+        normal_intent = normal.intent
+        normal_source = normal.source
+        normal_confidence = normal.confidence
 
         keyword_pairs.append((expected, keyword))
-        if not router_only:
-            normal_pairs.append((expected, normal_intent))
-        if expected == "sync":
-            # sync 是关键字独占的直接执行路径，路由器本来就不该判它
-            router_sync_skipped += 1
-        elif suggested:
-            router_pairs.append((expected, suggested))
-        else:
-            router_missing += 1
+        normal_pairs.append((expected, normal_intent))
         details.append(
             {
                 "expected": expected,
@@ -388,61 +301,42 @@ async def run(
                 "normal": normal_intent,
                 "normal_source": normal_source,
                 "normal_confidence": normal_confidence,
-                "router_axes": router_decision.as_dict() if router_decision else None,
-                "router_suggested": suggested or None,
                 "previous_intent": previous_intent,
-                "active_intent": active_intent,
                 "record_id": row.get("record_id"),
             }
         )
 
-    methods = [("keyword", keyword_pairs)]
-    if not router_only:
-        methods.append(("normal", normal_pairs))
-    if not normal_only:
-        methods.append(("router", router_pairs))
+    methods = [("keyword", keyword_pairs), ("normal", normal_pairs)]
     for name, pairs in methods:
         correct, total, accuracy = _accuracy(pairs)
         print(f"\n{name}: {correct}/{total} = {accuracy:.1%}")
         _print_matrix(name, pairs)
-    if not router_only:
-        threshold = float(settings.intent_clarify_confidence or 0)
-        low = [
-            item
-            for item in details
-            if item["normal_confidence"] is not None
-            and item["normal_source"] in {"jev", "llm"}
-            and item["normal_confidence"] < threshold
-        ]
-        if low:
-            correct = sum(1 for item in low if item["normal"] == item["expected"])
-            print(
-                f"\nclarify 模拟：{len(low)} 条 confidence < {threshold:.2f}，"
-                f"其中原判定 {correct}/{len(low)} 正确"
-            )
-    if router_missing:
-        print(f"\nrouter 未给出结论：{router_missing} 条（模型不可用或 JSON 解析失败）")
-    if router_sync_skipped:
-        print(f"router 跳过 sync：{router_sync_skipped} 条（sync 由关键字独占）")
+    threshold = float(settings.intent_clarify_confidence or 0)
+    low = [
+        item
+        for item in details
+        if item["normal_confidence"] is not None
+        and item["normal_source"] in {"jev", "llm"}
+        and item["normal_confidence"] < threshold
+    ]
+    if low:
+        correct = sum(1 for item in low if item["normal"] == item["expected"])
+        print(
+            f"\nclarify 模拟：{len(low)} 条 confidence < {threshold:.2f}，"
+            f"其中原判定 {correct}/{len(low)} 正确"
+        )
 
-    print("\n错例（最多 20 条，便于补评测集 / 调策略表）")
+    print("\n错例（最多 20 条，便于补评测集 / 调提示词与词典）")
     shown = 0
     for item in details:
-        normal_ok = router_only or item["normal"] == item["expected"]
-        router_ok = (
-            normal_only
-            or not item["router_suggested"]
-            or item["router_suggested"] == item["expected"]
-        )
-        if normal_ok and router_ok:
+        if item["normal"] == item["expected"]:
             continue
         if shown >= 20:
             break
         shown += 1
         print(
             f"- expected={item['expected']} normal={item['normal'] or '-'}"
-            f" ({item['normal_source']}) router={item['router_suggested']}"
-            f" axes={item['router_axes']}\n  {item['message']}"
+            f" ({item['normal_source']})\n  {item['message']}"
         )
     if shown == 0:
         print("- 没有错例（在当前标注集上）")
@@ -455,69 +349,8 @@ async def run(
         print(f"\n已保存 {len(details)} 条逐样本结果 → {out}")
 
 
-def policy(path: Path, *, show: int = 20) -> None:
-    """离线重算策略表：读 `run --out` 的逐样本结果，不调用任何模型。
-
-    路由轴是模型产出的，会抖动；策略表是确定性的。把轴固定下来之后再调策略，
-    才能分清「模型判错」还是「策略判错」。
-    """
-    rows = _read_rows(path)
-    labelled = [row for row in rows if str(row.get("expected") or "").strip()]
-    if not labelled:
-        print("没有 expected，先跑 run --out 生成逐样本结果。")
-        return
-
-    pairs: list[tuple[str, str]] = []
-    errors: list[dict[str, Any]] = []
-    for row in labelled:
-        axes = row.get("router_axes")
-        if not isinstance(axes, dict):
-            continue
-        decision = RouterDecision(
-            str(axes.get("speech_act") or ""),
-            str(axes.get("wants") or ""),
-            str(axes.get("target") or ""),
-            str(axes.get("continuation") or ""),
-        )
-        expected = str(row["expected"]).strip()
-        if expected == "sync":
-            # sync 是关键字独占路径，路由器本来就不该判它（与 run 的统计口径一致）。
-            continue
-        suggested = suggest_intent(
-            decision,
-            row.get("previous_intent") or None,
-            str(row.get("message") or ""),
-            active_intent=row.get("active_intent") or None,
-        )
-        pairs.append((expected, suggested))
-        if suggested != expected:
-            errors.append(
-                {
-                    "expected": expected,
-                    "suggested": suggested,
-                    "message": row.get("message"),
-                    "axes": axes,
-                    "previous_intent": row.get("previous_intent"),
-                    "active_intent": row.get("active_intent"),
-                }
-            )
-
-    correct, total, accuracy = _accuracy(pairs)
-    print(f"policy: {correct}/{total} = {accuracy:.1%}（轴固定，不调用模型）")
-    if errors:
-        print("\n错例：")
-        for item in errors[:show]:
-            print(
-                f"- expected={item['expected']} suggested={item['suggested']}"
-                f" axes={item['axes']} previous={item['previous_intent']}"
-                f" active={item['active_intent']}\n  {item['message']}"
-            )
-    else:
-        print("- 没有错例")
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="意图判定评测 / 影子路由对比")
+    parser = argparse.ArgumentParser(description="意图判定评测")
     sub = parser.add_subparsers(dest="command", required=True)
     p_collect = sub.add_parser("collect", help="从业务库导出待标注用户消息")
     p_collect.add_argument("--out", required=True, type=Path, help="输出文件路径")
@@ -531,26 +364,11 @@ def main(argv: list[str] | None = None) -> int:
         help="只跑指定 record_id（逗号分隔，便于迭代错例）",
     )
     p_run.add_argument(
-        "--router-only",
-        action="store_true",
-        help="只跑影子路由（跳过现有判定，节省模型调用）",
-    )
-    p_run.add_argument(
-        "--normal-only",
-        action="store_true",
-        help="只跑现有判定（JEV/LLM），跳过影子路由",
-    )
-    p_run.add_argument(
         "--out",
         type=Path,
         default=None,
-        help="保存逐样本结果（JSON），供 policy 离线重算",
+        help="保存逐样本结果（JSON）",
     )
-    p_policy = sub.add_parser(
-        "policy", help="用固定路由轴离线重算策略表（不调用模型）"
-    )
-    p_policy.add_argument("file", type=Path, help="run --out 生成的逐样本结果")
-    p_policy.add_argument("--show", type=int, default=20, help="最多打印多少条错例")
     p_enrich = sub.add_parser("enrich", help="给已有标注文件补上一轮意图与回复末尾")
     p_enrich.add_argument("file", type=Path, help="已标注 JSON / JSONL（原地更新）")
     p_format = sub.add_parser("format", help="把 JSONL / JSON 统一格式化成缩进 JSON 数组")
@@ -561,8 +379,6 @@ def main(argv: list[str] | None = None) -> int:
         _run(collect(args.out, args.limit))
     elif args.command == "enrich":
         _run(enrich(args.file))
-    elif args.command == "policy":
-        policy(args.file, show=args.show)
     elif args.command == "format":
         format_file(args.file)
     else:
@@ -576,8 +392,6 @@ def main(argv: list[str] | None = None) -> int:
                 args.file,
                 args.limit,
                 ids or None,
-                args.router_only,
-                args.normal_only,
                 args.out,
             )
         )

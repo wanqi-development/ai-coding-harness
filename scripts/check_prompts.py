@@ -1,6 +1,6 @@
-"""提示词自检：渲染八个装配好的提示词，并扫一遍跨形态的口径冲突。
+"""提示词自检：渲染六个装配好的提示词，并扫一遍跨形态的口径冲突。
 
-为什么不用 ``pytest`` 就够了：这里要的是**渲染后的成品**（主控五形态经
+为什么不用 ``pytest`` 就够了：这里要的是**渲染后的成品**（主控三形态经
 ``build_main_prompt`` 拼上输出形态规则，三个子智能体各是一份独立常量）——
 单测钉的是「某句话在不在某份提示词里」，这个脚本回答的是「同一句话在**别**的形态里
 是否成了一句做不到的指令」。
@@ -65,9 +65,7 @@ def _forms(profiles, prompts) -> dict[str, str]:
         for form in (
             profiles.ORCHESTRATE_FORM,
             profiles.QA_FORM,
-            profiles.ANALYSIS_FORM,
             profiles.PLAN_FORM,
-            profiles.REVIEW_FORM,
         )
     }
     return main | {
@@ -114,8 +112,8 @@ def _scan(forms: dict[str, str], profiles, policy) -> list[str]:
         if "必须优先委派" in text and not is_orchestrate:
             flag("C2 越界委派", name, "被要求委派 reviewer，但本形态没有 task")
 
-        # 3. PR 回评只给持有 comment_pr 的形态（qa / analysis / plan 都没有）
-        if name in ("主控/qa", "主控/analysis", "主控/plan") and "在 PR 上回复" in text:
+        # 3. PR 回评只给持有 comment_pr 的形态（qa / plan 都没有）
+        if name in ("主控/qa", "主控/plan") and "在 PR 上回复" in text:
             flag("C3 越界回评", name, "被要求回评 PR，但本形态没有 comment_pr")
 
         # 4. git 写命令只给 coder：其余形态的身份是「不写码 / 零动手 / 全程只读」
@@ -124,10 +122,10 @@ def _scan(forms: dict[str, str], profiles, policy) -> list[str]:
                 if step in text:
                     flag("C4 越界写命令", name, f"拿到写仓库的命令「{step}」")
 
-        # 5. 记忆正文只在 coding / review / analysis 收尾时写：出方案轮不能声称自己会写记忆
+        # 5. 记忆正文只在 coding / rework 收尾时写：出方案轮不能声称自己会写记忆
         if name == "主控/plan":
-            if "save_repo_memory" in text:
-                flag("C5 plan 记忆", name, "声称要写记忆（出方案轮不写，正文只在 coding / review / analysis 收尾时写）")
+            if "不写仓库记忆" not in text:
+                flag("C5 plan 记忆", name, "没写清出方案轮不写仓库记忆")
             if "（StoreBackend，**只读**）" not in text:
                 flag("C5 plan 记忆", name, "没写清仓库记忆是只读的")
 
@@ -140,7 +138,7 @@ def _scan(forms: dict[str, str], profiles, policy) -> list[str]:
                 flag("C6 目录可写", name, f"说 `/ai_coding/{directory}/` 可写，边界却不允许")
 
         # 7. 只读形态不该收到「改了代码就 commit + push」这类无条件落地要求
-        if name in ("主控/qa", "主控/analysis") and "代码 commit + push" in text:
+        if name == "主控/qa" and "代码 commit + push" in text:
             flag("C7 落地口径", name, "无条件要求 commit + push")
 
     return bad

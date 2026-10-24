@@ -37,9 +37,7 @@ logger = logging.getLogger(__name__)
 _AGENT_KEY: dict[str, str] = {
     "orchestrate": "coding",
     "qa": "qa",
-    "analysis": "analysis",
     "plan": "plan",
-    "review": "review",
     "planner": "plan",
     "coder": "coder",
     "reviewer": "review",

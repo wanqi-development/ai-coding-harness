@@ -19,11 +19,11 @@
 3. **keep 是 ``("fraction", 0.10)``**：1M 窗口下等于「压完还留 100k」，而旧口径触发线只有 120k，
    压了等于没压。改成绝对值。
 
-4. **压缩前先剪工具**（2026-10-17，2026-10-19 加工作笔记）：到线后先做一次应急裁剪，
-   保留「当前这一步」以及模型在 90% 提醒后写下的 ``KEEP:`` 清单点名的工具返回；
-   **剪完只有落到触发线的 80% 以下才免压**（裁剪只改请求副本，勉强压到线边会让原历史
-   在下次调用再剪一遍，2026-10-20 真机 38 次原地裁剪）；否则继续压。供应商自报的
-   上一轮用量只用来触发节点，剪完后按估算值决定；估算偏小导致真实调用溢出时，回退压缩兜底。
+4. **压缩前先写工具裁剪事件**（2026-10-22）：事件只存 `tool_call_id`，每次请求把原始
+   checkpoint 投影成“大结果占位符 / 大入参压缩、关键字段保留”的视图；事件持久化后不会
+   在下一轮恢复成未裁剪。落到触发线 70% 以下才免压；没有新增可裁项或仍超线时继续压。
+   供应商自报的上一轮用量只用来触发节点，剪完后按估算值决定；估算偏小导致真实调用
+   溢出时，回退压缩兜底。
 
 位置也由我们自己定（``agent/graph.py`` / ``agent/subagents.py``）：现在**没有单独的
 常规剪裁中间件**，压缩中间件自己负责到线后的应急裁剪，所以它数到的就是「真要发出去的
@@ -43,10 +43,13 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import Annotated, Any, NotRequired
 
 from deepagents.backends.protocol import BackendProtocol
-from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    SummarizationState,
+)
 
 try:  # deepagents >= 0.6.12 的长名字
     from deepagents.middleware.summarization import (
@@ -56,15 +59,24 @@ except ImportError:  # deepagents 0.6.11：conda 里实际装的是这个
     from deepagents.middleware.summarization import (
         DEFAULT_SUMMARY_PROMPT as _DEFAULT_SUMMARY_PROMPT,
     )
-from langchain.agents.middleware import ModelRequest, ModelResponse
+from langchain.agents.middleware import (
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+)
+from langchain.agents.middleware.types import PrivateStateAttr
 from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage
+from langgraph.types import Command
 
 from ai_coding_harness.agent.middleware.context_calibration import CalibratedTokenCounter
 from ai_coding_harness.agent.middleware.context_trim import (
+    ContextTrimEvent,
+    apply_context_trim_event,
     keep_items_from_messages,
-    pretrim_tool_results,
+    plan_context_trim_event,
+    prune_context_trim_event,
 )
 from ai_coding_harness.config import Settings
 from ai_coding_harness.observability.logging import MAIN_AGENT
@@ -77,6 +89,10 @@ SUMMARY_LOG_TAG = "CONTEXT_SUMMARY"
 
 #: 查「压缩前应急裁剪」走这个关键字：grep CONTEXT_PRETRIM logs/agent.log
 PRETRIM_LOG_TAG = "CONTEXT_PRETRIM"
+#: 应急裁剪后只有落到触发线以内这个比例才算安全，避免下一轮继续原地重剪。
+PRETRIM_SAFE_RATIO = 0.7
+#: 投影事件写回 checkpoint 的私有状态键。
+CONTEXT_TRIM_STATE_KEY = "_context_trim_event"
 
 #: 临近压缩线时注入的系统提醒：让模型在旧工具返回被剪之前，先把它读到的东西写成
 #: 工作笔记 + ``KEEP:`` 清单。没有额外模型调用 —— 这段文字随本轮正常回复产出。
@@ -138,9 +154,17 @@ def _build_summary_prompt() -> str:
 HARNESS_SUMMARY_PROMPT = _build_summary_prompt()
 
 
+class HarnessSummarizationState(SummarizationState):
+    """摘要 state + 本项目自己的裁剪投影事件。"""
+
+    _context_trim_event: Annotated[
+        NotRequired[ContextTrimEvent | None], PrivateStateAttr
+    ]
+
+
 class HarnessSummarizationMiddleware(SummarizationMiddleware):
     """① **有个能被区分的身份**（见模块说明最后一段）；② 记一条压缩账；
-    ③ 到压缩线先应急裁剪工具返回，剪完不到线就不压。
+    ③ 到压缩线先写持久化裁剪事件，投影后不到线就不压。
 
     账记四样：**什么时候压的**（日志行首那个时间戳）、**压前多长 / 压后多长**、
     **逐出的原文落到哪个文件**（``/conversation_history/{thread_id}.md`` —— 压完之后模型
@@ -160,6 +184,8 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
     只实现异步版：服务端统一走 ``astream_events``（与 ``boundary.py`` 同一约定）。
     """
 
+    state_schema = HarnessSummarizationState
+
     def __init__(
         self,
         *args: Any,
@@ -167,7 +193,9 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         mode: str = "burst",
         trigger_text: str = "-",
         pretrim: bool = True,
-        pretrim_clear_inputs: bool = False,
+        pretrim_compact_inputs: bool = False,
+        pretrim_min_result_chars: int = 2_000,
+        pretrim_min_arg_chars: int = 2_000,
         notice_at: int = 0,
         trigger_at: int = 0,
         **kwargs: Any,
@@ -177,23 +205,27 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         触发线在**构造时**就渲染成文字（``describe_trigger``），不去读上游的私有字段：
         日志里要能看出「这次是哪条线触发的」，而 fraction 那条只有乘上窗口才有意义。
 
-        ``pretrim`` 是「到压缩线先应急裁剪工具结果、剪完不到线就不压」这一层；它跟随
+        ``pretrim`` 是「到压缩线先写裁剪事件、投影后不到线就不压」这一层；它跟随
         ``CONTEXT_TRIM_TOOL_RESULTS`` 总开关（见 ``build_summarization``）。关掉时退回
         上游原来的行为：到线直接压，供应商自报的上一轮用量也能强制触发。
+
+        ``pretrim_compact_inputs`` 打开后才选择性压缩历史超大工具入参；路径与短字段保留。
 
         ``notice_at`` 是「压缩线的 90%」那条提醒线：到这条线先让模型写工作笔记，
         下一轮真正裁剪时按笔记里的 ``KEEP:`` 清单保留；0 = 关闭。
 
         ``trigger_at`` 是数值触发线（``trigger_line`` 折出来的最小值）：应急裁剪后
-        只有落到它的 80% 以下才允许免压。只勉强压到线边（>80%）时下次调用会再剪一遍
-        —— 因为裁剪只改请求副本、不改 checkpoint（2026-10-20 真机 38 次原地裁剪）。
+        只有落到它的 70% 以下才允许免压。事件已经持久化，下一轮不会恢复成未裁剪视图；
+        没有新增可裁项或仍高于安全区时直接摘要。
         """
         super().__init__(*args, **kwargs)
         self._agent = agent
         self._mode = mode
         self._trigger_text = trigger_text
         self._pretrim = pretrim
-        self._pretrim_clear_inputs = pretrim_clear_inputs
+        self._pretrim_compact_inputs = pretrim_compact_inputs
+        self._pretrim_min_result_chars = max(0, int(pretrim_min_result_chars))
+        self._pretrim_min_arg_chars = max(0, int(pretrim_min_arg_chars))
         self._notice_at = notice_at
         self._trigger_at = trigger_at
 
@@ -202,46 +234,57 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        # 上游 ``awrap_model_call`` 的前半段先复刻一遍：取有效消息、计一次数、截断老工具
-        # 入参。只有先知道「到没到压缩线」，才能在压之前做应急裁剪；而上游一旦决定压，
-        # 就没有「剪完再判一次」的钩子 —— 所以后半段由我们自己接管。
-        effective = self._get_effective_messages(request)
+        # 摘要事件先把原始历史压成“摘要 + 保留尾部”，再叠加本项目自己的裁剪事件。
+        # 两个事件都只改模型请求；state.messages 始终保留原文。
+        base_effective = self._get_effective_messages(request)
+        stored_trim = request.state.get(CONTEXT_TRIM_STATE_KEY)
+        existing_trim = stored_trim if self._pretrim else None
+        clearing_disabled_trim = stored_trim is not None and not self._pretrim
+        effective = apply_context_trim_event(base_effective, existing_trim)
         total = self._count_tokens(effective, request.system_message, request.tools)
-        truncated, args_modified = self._truncate_args(effective, total)
-        if args_modified:
-            total = self._count_tokens(truncated, request.system_message, request.tools)
 
         # 到压缩线的 90%：先提醒模型写工作笔记，下一轮再按 KEEP 清单裁。
         # 如果这一轮已经过线，就先不剪，给它一次正常回复的机会；真溢出再回落。
         request, notice_sent = self._maybe_notice(request, total)
-        if notice_sent and self._should_summarize_estimate(truncated, total):
+        if notice_sent and self._should_summarize_estimate(effective, total):
             response = await self._call_without_summary(
-                request, truncated, handler, estimated=total
+                request, effective, handler, estimated=total
             )
             if response is not None:
-                return response
+                return (
+                    self._with_trim_event(response, None)
+                    if clearing_disabled_trim
+                    else response
+                )
 
-        if not self._should_summarize(truncated, total):
-            response = await handler(request.override(messages=truncated))
+        if not self._should_summarize(effective, total):
+            response = await handler(request.override(messages=effective))
             self._record_usage(response, total)
-            return response
+            return (
+                self._with_trim_event(response, None)
+                if clearing_disabled_trim
+                else response
+            )
 
         # 到了压缩节点。先看是不是只有「供应商自报的上一轮用量」在撑线：正常剪裁已经把
         # 当前请求剪小了，那个旧值不该再强制压缩 —— 否则「剪完不到线就不压」永远不成立。
-        if self._pretrim and not self._should_summarize_estimate(truncated, total):
+        if self._pretrim and not self._should_summarize_estimate(effective, total):
             self._log_pretrim_skip(total)
             response = await self._call_without_summary(
-                request, truncated, handler, estimated=total
+                request, effective, handler, estimated=total
             )
             if response is not None:
-                return response
+                return (
+                    self._with_trim_event(response, None)
+                    if clearing_disabled_trim
+                    else response
+                )
             # 真实调用溢出：落到下面的压缩路径。
 
-        # 应急裁剪：只保留末尾连续的工具返回（当前这一步），其余换成带身份占位符。
-        # 它只用来判断「能否免压」；真正继续压缩时仍用上面那份原文，别让摘要与 offload
-        # 读到占位符。
+        # 新增裁剪先写进事件候选；只有模型调用成功后才把事件写回 checkpoint。
+        # 摘要路径始终拿 base_effective 的原文，不把裁剪占位符带进 offload。
         if self._pretrim:
-            keep_items = keep_items_from_messages(truncated)
+            keep_items = keep_items_from_messages(base_effective)
             if keep_items:
                 logger.info(
                     "%s 工作笔记 KEEP=%s（按笔记保留这些工具返回）",
@@ -249,30 +292,45 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                     list(keep_items),
                     extra={"agent": self._agent},
                 )
-            pretrimmed, cleared = pretrim_tool_results(
-                truncated,
-                clear_tool_inputs=self._pretrim_clear_inputs,
+            candidate_event, new_results, new_args = plan_context_trim_event(
+                base_effective,
+                existing=existing_trim,
+                compact_tool_inputs=self._pretrim_compact_inputs,
                 keep_items=keep_items,
+                min_result_chars=self._pretrim_min_result_chars,
+                min_arg_chars=self._pretrim_min_arg_chars,
             )
-            if cleared:
+            if new_results or new_args:
+                pretrimmed = apply_context_trim_event(base_effective, candidate_event)
                 after = self._count_tokens(
                     pretrimmed, request.system_message, request.tools
                 )
                 still_over = self._should_summarize_estimate(pretrimmed, after)
-                # 裁剪只改这一次请求：原历史仍在 checkpoint 里。若只是勉强压到线边，
-                # 下一次调用会原样再剪一遍，所以只有落到安全区（≤80% 线）才免压。
-                safe = not self._trigger_at or after <= self._trigger_at * 0.8
-                self._log_pretrim(total, after, cleared, still_over, safe)
-                if not still_over and safe:
+                # 事件写回 checkpoint 后，下一次调用继续复用同一投影；只有落到
+                # 安全区（≤70% 线）才值得免压，否则直接摘要。
+                safe = (
+                    not self._trigger_at
+                    or after <= self._trigger_at * PRETRIM_SAFE_RATIO
+                )
+                self._log_pretrim(
+                    total,
+                    after,
+                    new_results,
+                    new_args,
+                    still_over,
+                    safe,
+                )
+                if not still_over and safe and candidate_event is not None:
                     response = await self._call_without_summary(
                         request, pretrimmed, handler, estimated=after
                     )
                     if response is not None:
-                        return response
+                        return self._with_trim_event(response, candidate_event)
                     # 真实调用溢出：落到下面的压缩路径。
+            else:
+                self._log_pretrim_exhausted(total)
 
-        # 继续压缩。用预剪前的 ``request``（而不是 ``pretrimmed``）：摘要与逐出原文保留
-        # 更多细节，预剪只承担「能否免压」这一次判断。
+        # 继续压缩：上游只应用摘要事件，不应用裁剪事件，因此 offload 能拿到完整原文。
         sent: ModelRequest | None = None
 
         async def spy(inner: ModelRequest) -> ModelResponse:
@@ -284,12 +342,22 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         result = await super().awrap_model_call(request, spy)
         if sent is not None:
             cost = time.perf_counter() - started
-            self._log_compaction(request, truncated, sent.messages, result, cost)
+            self._log_compaction(request, base_effective, sent.messages, result, cost)
             # 压缩后的那一份才是真正发出去的：它的估算与 usage 才是同一个请求的两面。
             sent_tokens = self._count_tokens(
                 sent.messages, sent.system_message, sent.tools
             )
             self._record_usage(result, sent_tokens)
+        summary_event = _summarization_event(result)
+        if summary_event is not None:
+            cutoff = summary_event.get("cutoff_index")
+            if isinstance(cutoff, int):
+                trimmed_event = prune_context_trim_event(
+                    existing_trim, request.messages, cutoff
+                )
+                result = self._with_trim_event(result, trimmed_event)
+        elif clearing_disabled_trim:
+            result = self._with_trim_event(result, None)
         return result
 
     def _should_summarize_estimate(
@@ -338,6 +406,25 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         if callable(recorder):
             recorder(response, estimated)
 
+    def _with_trim_event(
+        self,
+        response: ModelResponse,
+        event: ContextTrimEvent | None,
+    ) -> ModelResponse:
+        """保留已有模型响应/状态更新，并追写裁剪事件。"""
+        update: dict[str, Any] = {}
+        if isinstance(response, ExtendedModelResponse):
+            command = getattr(response, "command", None)
+            update.update(getattr(command, "update", None) or {})
+            model_response = response.model_response
+        else:
+            model_response = response
+        update[CONTEXT_TRIM_STATE_KEY] = event
+        return ExtendedModelResponse(
+            model_response=model_response,
+            command=Command(update=update),
+        )
+
     def _maybe_notice(
         self, request: ModelRequest, total: int
     ) -> tuple[ModelRequest, bool]:
@@ -376,14 +463,17 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         self,
         before: int,
         after: int,
-        cleared: int,
+        trimmed_results: int,
+        compacted_args: int,
         still_over: bool,
         safe: bool,
     ) -> None:
         logger.info(
-            "%s 压缩前应急裁剪工具返回：清掉 %d 条，%d → %d tokens（省 %d；触发线 %s）；%s",
+            "%s 新增裁剪事件：工具结果 %d 条、工具入参 %d 条；"
+            "%d → %d tokens（省 %d；触发线 %s）；%s",
             PRETRIM_LOG_TAG,
-            cleared,
+            trimmed_results,
+            compacted_args,
             before,
             after,
             before - after,
@@ -394,9 +484,20 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
                 else (
                     "已低于压缩线且落在安全区，本轮不压缩"
                     if safe
-                    else "仅勉强低于压缩线（>80%），继续压缩"
+                    else (
+                        f"仅勉强低于压缩线（>{PRETRIM_SAFE_RATIO:.0%}），继续压缩"
+                    )
                 )
             ),
+            extra={"agent": self._agent},
+        )
+
+    def _log_pretrim_exhausted(self, total: int) -> None:
+        logger.info(
+            "%s 没有新的大工具结果或大入参可裁（当前 %d tokens；触发线 %s）；直接压缩",
+            PRETRIM_LOG_TAG,
+            total,
+            self._trigger_text,
             extra={"agent": self._agent},
         )
 
@@ -414,19 +515,6 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
         after = self._count_tokens(list(sent), request.system_message, request.tools)
         event = _summarization_event(result)
         if event is None:
-            # 走到这里＝只截断了老消息里的工具入参（上游那份 truncate_args_settings），没做摘要
-            logger.info(
-                "%s 截断历史工具入参：%d → %d tokens（省 %d；触发线 %s；消息 %d 条不变，"
-                "耗时 %.1fs）",
-                SUMMARY_LOG_TAG,
-                before,
-                after,
-                before - after,
-                self._trigger_text,
-                len(sent),
-                cost,
-                extra={"agent": self._agent},
-            )
             return
         summary = event.get("summary_message")
         logger.info(
@@ -467,13 +555,6 @@ def _summarization_event(result: Any) -> dict[str, Any] | None:
     return event if isinstance(event, dict) else None
 
 
-#: 模型没有 profile 那一档的工具入参截断口径，照抄上游 ``compute_summarization_defaults``。
-_ARG_TRUNCATE_BY_MESSAGES: dict[str, Any] = {
-    "trigger": ("messages", 20),
-    "keep": ("messages", 20),
-}
-
-
 def profile_window(model: Any) -> int | None:
     """模型 profile 里的 ``max_input_tokens``；没有（或不是正整数）就 ``None``。
 
@@ -497,15 +578,13 @@ CONTEXT_MODE_LABELS = {
 }
 
 _STEADY_AGENTS = frozenset(
-    {"qa", "analysis", "coding", "orchestrate", "rework"}
+    {"qa", "coding", "orchestrate", "rework"}
 )
 _BURST_AGENTS = frozenset(
-    {"plan", "planner", "coder", "review", "reviewer"}
+    {"plan", "planner", "coder", "reviewer"}
 )
-_STEADY_FORMS = frozenset(
-    {"qa", "analysis", "coding", "orchestrate", "rework"}
-)
-_BURST_FORMS = frozenset({"plan", "review"})
+_STEADY_FORMS = frozenset({"qa", "coding", "orchestrate", "rework"})
+_BURST_FORMS = frozenset({"plan"})
 
 
 def resolve_context_mode(agent: str = MAIN_AGENT, form: str | None = None) -> str:
@@ -537,6 +616,10 @@ def summarization_defaults(
     爆发取窗口 40%，**再与一条绝对上限取 OR**（先到先触发）：比例线保护小窗口，
     绝对值防 1M 窗口把线推到 40 万（2026-10-20 真机：coder 194k 都没触发）。
     没有窗口时退回 ``CONTEXT_SUMMARY_TRIGGER_TOKENS``（保守兜底）。
+
+    历史工具入参不再交给上游 ``truncate_args_settings``：它会把字段截成前 20 字符，
+    与本项目“只压超大字段、保留路径与结构”的事件投影冲突。需要压缩时由
+    ``CONTEXT_TRIM_CLEAR_INPUTS`` 显式开启。
     """
     if mode not in CONTEXT_MODE_LABELS:
         raise ValueError(f"未知上下文模式：{mode}")
@@ -545,7 +628,7 @@ def summarization_defaults(
         return {
             "trigger": ("tokens", settings.context_summary_trigger_tokens),
             "keep": keep,
-            "truncate_args_settings": dict(_ARG_TRUNCATE_BY_MESSAGES),
+            "truncate_args_settings": None,
         }
     ratio = (
         settings.context_steady_trigger_fraction
@@ -562,7 +645,7 @@ def summarization_defaults(
     return {
         "trigger": trigger,
         "keep": keep,
-        "truncate_args_settings": {"trigger": trigger, "keep": keep},
+        "truncate_args_settings": None,
     }
 
 
@@ -620,8 +703,8 @@ def build_summarization(
 ) -> HarnessSummarizationMiddleware | None:
     """按配置造压缩中间件；开关关掉就返回 ``None``（＝这个智能体不压）。
 
-    ``summary_prompt`` 与工具入参截断的 ``max_length``（上游默认 2000 字符）都用上游默认值 ——
-    这次只改「什么时候压 / 压完留多少 / 摘要调用最多吃多少」这三件。
+    ``summary_prompt`` 用本项目的“必须保留”版本；摘要调用输入上限单独配置。历史工具
+    入参不再使用上游截断，改由本项目裁剪事件按字段选择性投影。
 
     ``backend`` 要是当前会话那份混合后端：被逐出的原文由上游写到
     ``/conversation_history/{thread_id}.md``，那个前缀被 ``backends/composite.py`` 路由到
@@ -630,9 +713,8 @@ def build_summarization(
     ``agent`` 只喂日志的 ``%(agent)s`` 那一列（主控 ``main``、子智能体用角色名）：
     触发线是**按各自模型的窗口**算的，不标出来就对不上是哪一家的账。
 
-    ``pretrim`` 跟随 ``CONTEXT_TRIM_TOOL_RESULTS``：到压缩线先做一次应急裁剪，剪完
-    落到线以下 80% 才免压（只勉强低于线仍会压）；关掉工具裁剪总开关时退回上游原来的
-    「到线直接压」。
+    ``pretrim`` 跟随 ``CONTEXT_TRIM_TOOL_RESULTS``：到压缩线先尝试写一个裁剪事件，
+    投影后落到线以下 70% 才免压；没有新增可裁项或仍超线时直接压。
     """
     if not settings.context_summary_enabled:
         return None
@@ -664,7 +746,9 @@ def build_summarization(
             f"{describe_trigger(defaults['trigger'], window)}"
         ),
         pretrim=settings.context_trim_enabled,
-        pretrim_clear_inputs=settings.context_trim_clear_inputs,
+        pretrim_compact_inputs=settings.context_trim_clear_inputs,
+        pretrim_min_result_chars=settings.context_pretrim_min_result_chars,
+        pretrim_min_arg_chars=settings.context_pretrim_min_arg_chars,
         notice_at=notice_at,
         trigger_at=line or 0,
     )

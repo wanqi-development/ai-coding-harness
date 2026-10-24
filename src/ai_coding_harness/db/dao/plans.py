@@ -146,6 +146,71 @@ async def set_plan_status(
     return bool(result.rowcount)
 
 
+async def reclaim_executing_plan(
+    db: AsyncSession,
+    *,
+    session_id: int,
+    has_pr: bool,
+    plan_id: int | None = None,
+) -> int | None:
+    """回收上一轮遗留的 executing 方案。
+
+    有 PR：方案视为已完成，所有步骤收口为 done。
+    无 PR：coder 未交付 PR，方案恢复 pending，running 步骤退回 pending。
+
+    只匹配 ``status='executing'``，所以重复调用、multi-worker 竞争都是幂等的。
+    """
+    query = select(Plan).where(
+        Plan.session_id == session_id,
+        Plan.status == "executing",
+    )
+    if plan_id is not None:
+        query = query.where(Plan.id == plan_id)
+    plan = await db.scalar(query.order_by(Plan.id.desc()).limit(1))
+    if plan is None:
+        return None
+
+    steps = [
+        dict(step) if isinstance(step, dict) else step
+        for step in (plan.steps or [])
+    ]
+    now = _now()
+    if has_pr:
+        status = "done"
+        for step in steps:
+            if isinstance(step, dict):
+                step["status"] = "done"
+        values: dict = {
+            "status": status,
+            "steps": steps,
+            "updated_at": now,
+            "finished_at": now,
+        }
+    else:
+        status = "pending"
+        for step in steps:
+            if isinstance(step, dict) and step.get("status") == "running":
+                step["status"] = "pending"
+        values = {
+            "status": status,
+            "steps": steps,
+            "updated_at": now,
+            "started_at": None,
+            "finished_at": None,
+        }
+    result = await db.execute(
+        update(Plan)
+        .where(
+            Plan.id == plan.id,
+            Plan.session_id == session_id,
+            Plan.status == "executing",
+        )
+        .values(**values)
+        .returning(Plan.id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def set_plan_step_status(
     db: AsyncSession,
     *,

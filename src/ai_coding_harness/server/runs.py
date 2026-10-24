@@ -91,6 +91,7 @@ class RunHub:
         *,
         clarification_id: str | None = None,
         choice: int | str | None = None,
+        answers: list[dict[str, Any]] | None = None,
     ) -> None:
         """起一轮；同一会话已有在跑的轮次时抛 ``RunInProgress``。
 
@@ -114,6 +115,7 @@ class RunHub:
                 run,
                 clarification_id=clarification_id,
                 choice=choice,
+                answers=answers,
             ),
             name=f"run:{session_id}",
         )
@@ -132,6 +134,7 @@ class RunHub:
         *,
         clarification_id: str | None = None,
         choice: int | str | None = None,
+        answers: list[dict[str, Any]] | None = None,
     ) -> None:
         """把 ``service.chat()`` 的帧搬进缓冲，直到它结束。
 
@@ -145,6 +148,7 @@ class RunHub:
                 for key, value in (
                     ("clarification_id", clarification_id),
                     ("choice", choice),
+                    ("answers", answers),
                 )
                 if value is not None
             }

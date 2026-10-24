@@ -23,7 +23,511 @@
 
 ## 修改记录
 
+### 2026-10-24
+
+#### backlog 改为仅本机维护
+
+- **动机**：`docs/backlog.md` 是个人工作清单，不属于产品仓库的发布内容。
+- **改动**：整个文件加入 `.gitignore` 并从 Git 索引移除，本地文件保留；删除 README、
+  AGENTS 与配置设计文档中对仓库内 backlog 的当前指引。
+- **关键决策**：backlog 内容本身不做删改或脱敏，而是整个文件退出版本库。
+- **验证**：`git check-ignore` 命中 `docs/backlog.md`，本地文件仍存在，Git 不再跟踪。
+
+#### 彻底删除四轴影子路由
+
+- **动机**：影子路由默认关闭，线上形态从不采用它的建议，但模块、配置、后台 task、
+  测试和评测分支持续增加维护与认知成本。
+- **改动**：
+  - 删除 `server/intent_router.py`、`tests/test_intent_router.py`；
+  - 删除 `HarnessService` 的 router 模型与后台 shadow task 状态；
+  - 删除 `TurnIntentMixin._shadow_route` / `_router_model_for` 与 runner 触发分支；
+  - 删除 `INTENT_ROUTER_SHADOW`、`INTENT_ROUTER_TIMEOUT_SECONDS`；
+  - `scripts/eval_intent.py` 只保留 keyword / normal、clarify 模拟、混淆矩阵与错例，
+    删除 router-only、normal-only、policy 和 router_axes 输出；
+  - 重写 `docs/intent-eval.md`，更新 AGENTS 与 backlog。
+- **关键决策**：不再维护第二套四轴在线分类器；意图质量评估只针对真实上线的
+  `detect_intent` 链路。
+- **验证**：`scripts/eval_intent.py --help` 只剩 `collect / run / enrich / format`；
+  全量 `pytest` **1292 passed, 2 warnings**（随 router 测试删除减少 34 条）；
+  `ruff check`、`scripts/check_prompts.py`（冲突 0 条）与 `git diff --check` 通过。
+
+#### PR 归属表、方案关联与 rework 最新提交同步
+
+- **动机**：PR 创建者可能和用户共用同一个 token，标题 / commit 作者也不适合每轮反复猜测。
+  同时需要在用户向 PR 追加提交后，基于最新代码继续返工，不能只看分支名。
+- **改动**：
+  - 新增 `pull_requests` 表（迁移 `c3d4e5f6a7b8`，列注释迁移 `d4e5f6a7b8c9`）：
+    按平台 + 仓库 + PR 编号唯一，
+    保存 `source`、方案 / 会话关联、head/base、远端 `head_sha` 与
+    `synced_head_sha`。
+  - `create_pr` 新建或复用后立即登记 `source=agent`，并写入本轮 `plan_id`；一个方案可
+    关联多个替代 PR。
+  - 轮首 PR 查询拆成最近 10 条全部状态（供记忆）和完整 open 分页列表（供归属 / 闸门 /
+    评论 / 同步），不再拉 100 条历史 PR。
+  - 历史 open PR 首次出现时只查一次 commits：全部匹配沙箱静态 git 身份记为
+    `legacy_agent`，明确不匹配为 `external`，无法确认是 `unknown`。后两者在意图识别前
+    硬停止，并提示用户先处理。
+  - rework 唯一目标或用户明确写 `#N` 时，Agent 启动前把工作区安全同步到 PR 最新
+    `head_sha`；脏工作区、分叉、force-push 或 fetch 失败直接停止，不覆盖用户提交。
+  - 新增 `docs/pull-request-registry.md`，同步更新 README、AGENTS 与业务流程图。
+- **关键决策**：归属以后只认 PR 表；`source` 不会被普通平台快照从 `external` 自动改写为
+  Agent。工作区同步只允许 fast-forward 条件，不使用 reset / rebase / 强推。
+- **验证**：迁移 `c3d4e5f6a7b8` / `d4e5f6a7b8c9` 已在本地 PostgreSQL 执行到 head；全量 `pytest`
+  **1326 passed, 2 warnings**；PR / 客户端 / 方案 / 工作区同步定向测试 **120 passed**；
+  `ruff check`、`scripts/check_prompts.py`（冲突 0 条）与 `git diff --check` 通过。
+- **遗留**：真实 Gitee / GitHub 仓库上的历史上作者纳管、force-push 分叉提示与
+  rework 同步还需各跑一轮线上验收。
+
+#### 澄清弹窗落库失败时不再把协议 JSON 当正文返回
+
+- **动机**：多步澄清迁移未执行时，`clarifications.steps` 落库失败；后台把它降级成普通
+  文本，前端因此看到原始 `<CLARIFY>` JSON，既没有弹窗也不可读。
+- **改动**：新增澄清协议清理与回退文案。解析成功但落库失败时只展示提示和问题正文；
+  协议不合法时剥掉完整或未闭合的 `<CLARIFY>` 块，清理后为空则提示用户重新描述。
+- **关键决策**：协议块属于内部传输格式，任何失败路径都不向用户暴露标签和 JSON；
+  数据库异常仍由后台日志记录，用户侧只看到可操作的回退说明。
+- **验证**：澄清协议 / 聊天流定向测试 **22 passed**；全量 `pytest`
+  **1308 passed, 2 warnings**；`ruff check`、`scripts/check_prompts.py`
+  （冲突 0 条）与 `git diff --check` 通过。
+
+#### 公共 TurnState 与方案执行状态自动恢复
+
+- **动机**：coder 把方案置为 `executing` 后若用户终止、异常退出或忘记回写，
+  方案会永久失去“未执行”资格。仅靠跟踪 coder delegation 复杂且容易漏；改为利用中间件
+  `before_agent` 和正常 `after_agent`，并按本轮是否已有 PR 决定收口方向。
+- **改动**：
+  - `TurnState` / `TurnStop` 从 `agent/middleware/guard.py` 移到公共模块
+    `agent/turn_state.py`，中间件包只保留兼容导出。
+  - `TurnState` 新增 `pr` 与 `plan_id`。`create_pr` 成功 / 复用时写 PR 编号；
+    `storePlan` 与 `get_unexecuted_plan` 写方案编号。
+  - 新增 `PlanRecoveryMiddleware`，挂到 coding 主控、planner、coder。
+  - `before_agent` 修复上一轮遗留；coder `after_agent` 兜底正常结束漏回写。
+    有本轮 PR 或轮首 open PR 快照时 `executing → done`；没有 PR 时
+    `executing → pending`，并把 `running` 步骤退回 `pending`。
+  - 主动 `failed`、`done`、`closed` 不自动修改；回收 DAO 只更新 `executing`，
+    `session_id + status` 条件更新保证 multi-worker 幂等。
+- **关键决策**：`after_agent` 不是异常 `finally`；取消、未捕获异常和进程退出由下一轮
+  `before_agent` 恢复。跨轮恢复除本轮 `pr` 外，还使用轮首 `open_prs` 快照兜底。
+- **验证**：方案恢复 / 方案工具定向测试 **56 passed**；全量 `pytest`
+  **1303 passed, 2 warnings**；`ruff check`、`scripts/check_prompts.py`
+  （冲突 0 条）与 `git diff --check` 通过。
+- **遗留**：真实 PostgreSQL 的 `reclaim_executing_plan` 条件更新需在可连接环境补一组
+  集成验证。
+
+### 2026-10-23
+
+#### 删除意图识别中的跨轮 active task
+
+- **动机**（用户口径）：active task 每增加一层“短追问 / 选择 / 问句”判断，维护成本和
+  误判率都上升，实际带来的准确率收益不足；意图应由最近三轮完整对话和紧邻上一轮判定
+  自行理解。
+- **改动**：
+  - 删除 `_active_tasks` 会话状态，以及 `_active_task` / `_remember_active_task`。
+  - 删除 `active_task_override` / `active_task_continuation` 和 `SOURCE_ACTIVE`。
+  - JEV、大模型分类、`handoffTask` 重判、影子路由与 `eval_intent.py` 全部不再接收
+    `active_intent`。
+  - 保留 `previous_intent`：它只表示紧邻上一轮的判定，不跨 qa 累积。
+  - 评测 JSON 中旧的 `active_intent` 字段保留为历史数据，但新流程完全忽略。
+- **关键决策**：不再单独记忆“最近一次可执行任务”；继续 / 修正 / 选择统一根据最近三轮
+  完整会话理解。
+- **验证**：意图 / router / 澄清 / chat 路由定向测试 **93 passed**；全量 `pytest`
+  **1294 passed, 2 warnings**；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check` 与 `git diff --check` 通过。
+- **遗留**：需要观察真实意图评测，确认删除 active 后短选择样本准确率变化。
+
+#### open PR 尚未评论时保留 coding 意图
+
+- **动机**：coder 建完 PR 后 reviewer 可能失败，此时 PR 为 open 但没有任何评论；
+  旧状态闸门仍只保留 qa / rework，导致本应继续收尾的 coding 被错误拦住。
+- **改动**：
+  - 轮首 PR 快照为每个 open PR 补查一次评论（只取 1 条判断有无）。
+  - 无 open PR：qa / plan / coding；open PR 全部无评论：qa / coding（尚无返工对象）；
+    任一 open PR 已有评论：qa / rework。
+  - 关键字口令仍按同一份 `allowed_intents` 收口：未评论 PR 下 coding 关键字可命中，
+    已评论后 coding 关键字被状态闸门挡住。
+  - 主控仓库状态块标出每个 PR 是“暂无评论，coding 可继续”还是“已有评论，只走 rework”。
+- **关键决策**：评论是 reviewer 是否进入过后续链路的信号；多个 open PR 中只要有一个
+  已评论，就按存在可返工任务处理，暂停 coding。
+- **验证**：PR 快照 / 意图 / state gate 定向测试 **43 passed**；全量 `pytest`
+  **1297 passed, 2 warnings**；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check` 与 `git diff --check` 通过。
+- **遗留**：每个 open PR 多一次评论查询；当前先按每轮实时数据优先，暂不缓存。
+
+#### 意图判定改用最近三轮完整会话，并收紧 active task 沿用条件
+
+- **动机**：真实会话中用户已连续选择方案、要求继续，但“选择1”被 JEV 判成低置信度
+  `coding=0.40` 后又转成 qa 澄清。旧上下文只有约两轮，且助手正文被首尾截断；同时
+  active-task 判断只处理“分类器判成 qa”的情况，无法阻止低置信度把 coding 改回 qa。
+- **改动**：
+  - 意图上下文改为最近 **3 个用户轮次**，包含期间全部 user / assistant / plan 记录，
+    正文不做首尾截断。plan 按独立时间线记录标注为“方案”。
+  - `intent_history_turns` 默认从 4 改为 3，并按用户轮次数解释，不再按消息条数解释。
+  - 新增 `active_task_continuation`：只有上一项可执行任务为 coding / plan / rework，
+    且本轮是选择、继续、修正或短动作时才沿用；出现“为什么 / 怎么 / 什么 / 讲讲 /
+    看一下”等问句信号时不覆盖分类结果。
+  - active task 判断移到低置信度澄清之前，并对分类器已经猜成 coding/rework 的情况同样生效。
+  - JEV prompt 明确完整历史、方案记录与不截断口径。
+- **关键决策**：不是所有短消息都沿用上一任务；“选择1 / 方案A / 继续”等明确选择才沿用，
+  真实问句仍走 qa。
+- **验证**：意图 / 澄清 / chat 路由定向测试 **53 passed**；全量 `pytest`
+  **1294 passed, 2 warnings**；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check` 与 `git diff --check` 通过。
+- **遗留**：先用三轮观察真实数据，再根据评测决定是否扩到四轮。
+
+#### 澄清改为分步弹窗，并修复 qa 幽灵待办与原始 CLARIFY 回放
+
+- **动机**：低置信度澄清已经使用弹窗，但单步协议无法承载多个关键口径；同时 qa 没有
+  `write_todos`，模型伪造的 `write_todos` tool-call 仍被流翻译器收成幽灵待办，并连同原始
+  `<CLARIFY>` 和过程旁白写进 `extra.parts`，前端回放时出现怪异文字版。
+- **改动**：
+  - `<CLARIFY>` 协议扩展为 1~3 个 `steps`：第一步用 intent 选项确定轮次，后续步骤用
+    `value + label` 收集业务口径。
+  - `clarifications` 新增 `steps` JSONB；旧记录继续用 `question/options` 回退。
+  - 新请求一次提交 `answers[{step_id,choice}]`，后端校验每一步都有选择，再组装原用户消息
+    与全部选项并按第一步 intent 执行。
+  - `ClarificationDialog` 改成逐页选择、可返回上一步、最后统一确认；支持旧单题协议。
+  - `V3Translator(allow_todos=False)` 用于 qa，丢弃模型伪造的 `write_todos`。
+  - 澄清成功后不再保存原始过程正文/伪待办；前端回放旧记录时若存在 `extra.clarification`
+    则只展示最终 `content`。
+- **关键决策**：第一页固定负责意图，后续页面只补业务口径；选择过程在前端本地暂存，最终
+  一次提交后才消费 pending，避免产生半完成状态。
+- **验证**：定向测试 **124 passed**；全量 `pytest` **1293 passed, 2 warnings**；
+  `npm --prefix frontend run build` 通过；`scripts/check_prompts.py` 冲突 0 条；
+  `ruff check`、`git diff --check` 通过；Alembic head 为 `b2c3d4e5f6a7`，离线 SQL 生成通过。
+- **遗留**：本地 PostgreSQL 当前从 `192.168.220.1` 访问 `192.168.220.128:5432` 被
+  `pg_hba.conf` 拒绝，真实库尚未升级；修好网络 / `pg_hba` 后执行
+  `python -m alembic upgrade head`。中途刷新会回到第一步，尚未持久化未完成的分步选择。
+
+#### 纯文档任务跳过 planner 与 reviewer，由 coder 直做
+
+- **动机**（用户口径）：`AGENTS.md`、README、`docs/` 下的技术文档等纯文档任务不涉及代码行为，
+  不应为了走固定流程先出方案；coder 可以直接修改、校验并创建 PR。
+- **改动**：
+  - coding 主控新增最高优先级的纯文档分支：只写清单，直接派 coder；不查 / 不建方案，
+    不派 planner 和 reviewer。
+  - coder 新增流程 C：纯文档直做；不调用方案工具，从 `docs/<主题>` 分支修改文档、
+    校验链接 / 路径 / 命令 / 事实后提交并创建 PR。
+  - 明确纯文档白名单：`AGENTS.md`、README、`docs/` 与其他 `.md` / `.mdx` / `.rst` / `.adoc`；
+    不得改源码、测试、配置、依赖或构建文件。
+  - 文档与代码混合、或文档必须依赖代码改动才成立时，仍走普通 coding 流程。
+  - 意图层把“写 / 补 / 修改 / 更新文档”纳入 coding，避免在进入纯文档分支前被判成 qa / plan。
+  - `task` 工具中的 coder 描述同步说明纯文档能力。
+- **关键决策**：纯文档跳过 planner 和 reviewer 两步；coder 一旦发现必须改代码，立即停止并回报，
+  不静默扩大范围。
+- **验证**：提示词 / 意图路由 / profile / 工具注册定向测试 **84 passed**；
+  全量 `pytest` **1288 passed, 2 warnings**；`npm --prefix frontend run build` 通过；
+  `scripts/check_prompts.py` 冲突 0 条；`ruff check` 与 `git diff --check` 通过。
+- **遗留**：本次只改行为契约；尚未用真实会话跑一遍纯文档 PR 做端到端验证。
+
+#### 修复长交接后界面显示 0 字并封死澄清轮执行
+
+- **动机**：真实会话 `cb4c905c-b6af-4cbf-9435-ba1e49cbff19` 中，用户消息
+  `运费规则选择1， 配置粒度用商家级` 对应助手记录有 1440 字且正常落库，但直播界面可能
+  留下空消息。根因是低置信度澄清轮被允许 `handoffTask` 执行了近两小时，主控正文又被
+  压到轮末才发；长连接若以正常 EOF 提前结束，前端会把没有 `done` 的半截流当成完成。
+- **改动**：
+  - 前端把收到 SSE `done` 作为正常完成的必要条件；无 `done` 的正常 EOF 会带游标重连。
+  - 流收尾后按 `/records` 回填本轮持久化助手记录，数据库成为界面的最终事实来源。
+  - 如果仍无记录且没有 `done`，界面明确提示“连接在完成帧前中断”，不再静默显示空回复。
+  - 低置信度澄清轮在 `handoffTask` 工具层直接拒绝交接，提示词同步禁止调用；该拒绝不消耗
+    本轮交接额度。
+- **关键决策**：澄清轮只负责问清意图，代码边界优先于提示词；SSE EOF 不再等同于业务完成，
+  直播只是过程态，持久化记录才是最终态。
+- **验证**：handoff / intent middleware / clarification / prompt 定向测试 **71 passed**；
+  全量 `pytest` **1286 passed, 2 warnings**；`npm --prefix frontend run build` 通过；
+  `scripts/check_prompts.py` 冲突 0 条；改动 Python 文件 `ruff check` 与
+  `git diff --check` 通过。
+- **遗留**：需要真机验证长连接被代理截断时的自动接回；本次未改动旧记录的展示数据。
+
+#### 移除 OAuth 登录并按当前实现重写 README
+
+- **动机**（用户口径）：代码平台只使用配置项中的 Gitee/GitHub access token，不再提供
+  OAuth 授权登录；README 已长期落后于当前意图、中间件、前端、API 和运行方式。
+- **改动**：
+  - 删除 `api/routes/auth.py` 与 `tests/test_auth_routes.py`，从 FastAPI app 卸载 `/auth/*`。
+  - 删除 Gitee/GitHub OAuth client id/secret/redirect 配置与 `.env.example` 对应键。
+  - `CreateSessionRequest` 只保留 `repo_url`；创建会话不再接受请求级
+    `gitee_token/github_token`，统一取平台配置的 `GITEE_ACCESS_TOKEN` /
+    `GITHUB_ACCESS_TOKEN`。
+  - 清理 backlog、沙箱安全文档和代码注释中把 OAuth 当默认凭据来源的表述。
+  - 按当前实现重写 README：状态优先意图、三形态、一主三从、上下文裁剪事件、PR/记忆同步、
+    handoff run 树、整页设置、右侧栏、当前 API、目录结构、启动与验证。
+- **关键决策**：不做 OAuth 兼容入口；配置 token 是唯一凭据来源。已有会话继续使用数据库里
+  已保存的旧凭据，直到删除并重建会话。
+- **验证**：建会话 / 路由 / 平台 / 运行配置定向测试 **39 passed**；全量 `pytest`
+  **1285 passed, 2 warnings**；改动文件 `ruff check` 与 `git diff --check` 干净。
+- **遗留**：无。
+
+#### handoff 内层改为 run 树：正文、思考、工具与日志内嵌展示
+
+- **动机**：`handoffTask` 为了避免内层正文混进外层回答，把内层 v3 事件完全摘掉了。
+  结果用户只能看到一张工具卡和最终回报，内层正文、工具执行与日志全靠 `handoff ` 文本
+  前缀辨认，无法从父子关系看清一次交接里发生了什么。
+- **改动**：
+  - `tools/handoff.py` 注入 `ToolRuntime`，用 `stream_writer` 发
+    `harness-run` 自定义事件；run_id / parent_run_id / root_run_id 显式记录。
+  - 内层 model、reasoning、tool、todos、handoff 生命周期都翻译成 run trace；内层原始
+    事件仍不混入外层 namespace。
+  - `core/stream.py` 增加 run id 提取与正文提取；外层正文 / 思考 / 工具帧也带可用
+    run id，旧事件没有 id 时不增加空字段。
+  - `runner.py` 转发 `custom` run 事件，脱敏截断后随本轮记录保存为
+    `{kind:"handoff", events:[...]}`，刷新后重建同一棵树。
+  - 新增 `HandoffRun.vue`：在工具卡内嵌显示内层正文、浅色思考、工具、待办和折叠日志。
+  - `AgentRunLog` 的 handoff 行增加 `[run=... parent=...]`；`log_tail` 解析为结构化字段，
+    `LogPanel` 默认按 run 父子树缩进展示，旧日志保持根节点。
+- **关键决策**：不复用内层原始 namespace，而是保留隔离后重发 trace；外层最终总结逻辑
+  不变。日志展示分为聊天内嵌的 run 事件树与日志面板的完整文件树，两者共享同一组 id。
+- **验证**：handoff / stream / runner / logs 定向测试 **184 passed**；全量 `pytest`
+  **1299 passed, 2 warnings**；`npm --prefix frontend run build`、ruff 和
+  `git diff --check` 均通过。
+- **遗留**：单段 run 文本 8000 字、列表 200 项的上限先用于控制记录体积，真机后再调。
+
+#### 修复 invalid tool call 污染 checkpoint 后所有 provider 400
+
+- **动机**：2026-10-23 11:47:13 的 QA 轮次报
+  `message at position 408 with role 'assistant' contains an invalid part type:
+  invalid_tool_call`；主模型 422、兜底模型同样 400。根因是历史修复只补 ID 与配对，
+  却把 `AIMessage.invalid_tool_calls` 原样留在 checkpoint，LangChain 再把它序列化成
+  OpenAI-compatible 网关不接受的内容块。
+- **改动**：
+  - `agent/middleware/tool_integrity.py`：invalid call 降级成普通文本说明
+    `[工具调用未执行] ...`，并清空 `invalid_tool_calls`。
+  - 同时识别并清除已经固化进 `AIMessage.content` 的
+    `{"type": "invalid_tool_call"}` block。真实坏 checkpoint 的
+    `invalid_tool_calls` 字段为空，坏数据只在 content block 里，上一版只查字段仍会漏。
+  - 模型出口与 `HistoryRepairMiddleware` 历史整表修复共用同一重建逻辑。
+  - invalid call 在模型出口先附上具体错误原因重试，最多 3 次；只有持续失败才降级。
+  - 不再为 invalid call 伪造 `ToolMessage`；旧版本已经生成过的伪响应会被删除。
+  - runner 在流正常结束但正文为空时，从最终 AI 消息补发非 reasoning 正文，避免
+    handler 返回后追加的降级说明没有流 delta、前端显示 0 字。
+  - 同一条 AI 消息里的正常 `tool_calls` 与对应响应保持不变。
+  - README、AGENTS 同步记录 provider 兼容边界。
+- **关键决策**：保留“哪个工具、为什么没执行”的可读信息，但不保留 provider 无法序列化
+  的 `invalid_tool_call` part；原始诊断文本进入普通 assistant content。
+- **验证**：`tests/test_tool_integrity.py` **34 passed**；全量 `pytest`
+  **1293 passed, 2 warnings**；ruff 与 `git diff --check` 干净。
+- **遗留**：运行中的后端必须重启后才会加载新中间件；现有坏 checkpoint 会在下一次
+  `HistoryRepairMiddleware.abefore_agent` 时自动整表修复。
+
+### 2026-10-22
+
+#### 工具裁剪改为持久化事件投影：大内容才裁、原始 checkpoint 不动
+
+- **动机**：旧应急裁剪只修改本次 `ModelRequest`，下一次仍从完整 checkpoint 恢复并重复
+  裁剪同一批历史；真机日志里同一角色几十秒内反复走 `CONTEXT_PRETRIM`。同时，旧实现会把
+  很小的结果也换成占位符、把历史入参整体清成 `{}`，已出现 `read_file 参数={}` 这类误导。
+- **改动**：
+  - 新增 `_context_trim_event` 私有 state：只保存 `trimmed_result_ids` /
+    `compacted_arg_ids`，不复制原文；每次模型调用按“摘要事件 → 裁剪事件”动态投影。
+  - 工具结果默认超过 **2000 字符**才裁；工具入参选择性压缩也默认关闭，开启后只压超大
+    字符串字段，保留 `file_path/path/offset/limit/timeout` 等结构。
+  - 当前步骤、`KEEP:` 点名项与 `KEEP_TOOLS` 不进入事件。
+  - 没有新增可裁项或仍高于触发线 70% 时直接摘要，删除“三次应急裁剪后强制摘要”计数器。
+  - 摘要与 offload 使用裁剪事件之前的原始消息；摘要成功后清理 cutoff 之前的裁剪 ID。
+  - 关闭上游 `truncate_args_settings`，避免它把历史入参截成前 20 字符。
+  - 设计说明写入 `docs/context-trim-event.md`，并同步 README、AGENTS、`.env.example`。
+- **关键决策**：不把占位符写回 `state.messages`，而是持久化稳定 ID 并在请求时投影；
+  这样后续调用不会重复裁剪原文，摘要仍能拿到可 offload 的完整内容。
+- **验证**：全量 `pytest` **1286 passed, 2 warnings**；定向上下文测试 **107 passed**；
+  `scripts/check_prompts.py` 6 份提示词、0 条冲突；改动文件 `ruff check` 干净；
+  `git diff --check` 通过。
+- **遗留**：2000 字符阈值先用于真机观察，后续应按工具结果 / 参数长度分布调整；原始
+  checkpoint 的物理体积仍由摘要与 offload 控制。
+
+#### 应急裁剪的安全区收紧到压缩线 70%
+
+- **动机**：应急裁剪后的历史只改本次请求副本，checkpoint 里的原文仍在。如果剪完只降到
+  触发线以下的 70%～100% 区间，下一次调用仍会接近压缩线并重复裁剪，容易形成「裁剪 → 原样
+  重读 → 再裁剪」的空转。
+- **改动**：`agent/middleware/summarization.py` 把免压安全区从触发线的 80% 收紧到 70%，
+  并抽出 `PRETRIM_SAFE_RATIO` 常量；日志中的判定文字同步显示 70%。更新工作笔记保留用例，
+  避免它被安全区阈值变化误判。
+- **关键决策**：只有应急裁剪后**既低于压缩线、又落到触发线 70% 以下**才跳过摘要；否则仍按
+  原文继续压缩。第三次应急裁剪强制摘要的既有规则不变。
+- **验证**：`tests/test_summarization.py` **43 passed**；全量 `pytest` **1280 passed,
+  2 warnings**；本次改动文件 `ruff check` 干净。
+- **遗留**：无。
+
+#### 意图改为状态优先：每轮 PR 同步、函数闸门、qa/analysis 合并
+
+- **动机**（用户口径 2026-10-22）：`coding ↔ rework` 并不是同一场景下的两个选项 ——
+  没有 open PR 时只能 coding，有 open PR 时只能 rework。继续把所有意图一次性交给模型，
+  再靠提示词和记忆中间件补边界，既不准确也挡不住模型“接力做”。同时去掉场景极少的独立
+  `review` 主控形态与已无必要的 `sync`，把 qa / analysis 合并成一个只读形态。
+- **改动**：
+  - `server/repo_state.py` 每轮实时查询一次全量 PR，不做跨轮接口缓存；同一份列表同时
+    用于意图候选和仓库记忆同步。
+  - 新增 `server/repo_memory_sync.py`：比记忆里最新 PR 编号更新的 PR，用一次 `qa` 模型
+    批量生成摘要后落盘；已有 PR 只修正与平台不一致的状态。写入直接进 StoreBackend。
+  - 意图候选按状态收口：无 open PR 为 `qa / plan / coding`，有 open PR 为 `qa / rework`，
+    状态未知时只留 `qa`。同一候选集同时作用于口令、JEV、大模型与关键字兜底，澄清选项
+    也按本轮候选过滤。
+  - PR 拦截从 `MemoryMiddleware` 移到意图判定后的纯函数闸门：待合并 PR 时拦截
+    `coding / plan`，放行 `qa / rework`；无 PR 的 `rework`、状态未知的写操作在建模前
+    直接停下。记忆中间件只保留加载与注入。
+  - 删除 `review` 主控形态和 `sync` 直接执行路径；保留 `reviewer` 子智能体。`rework`
+    扩成“PR 跟进”：可只派 reviewer 审查，也可派 coder 在既有分支修改；改码后必须再派一次
+    reviewer 复查，但本轮不自动无限闭环。
+  - `analysis` 合并进 `qa`：问答、解释、排查、需求澄清共用同一形态；qa 可写
+    `/ai_coding/tmp` 取证台账，但仍不能改任务代码。仓库记忆正文只允许 coding / rework
+    收尾写回，qa / plan 只读。
+  - `_ROLE_ORCHESTRATE` 收敛为纯编排角色：删除与 qa 重复的“直接处理”职责，把 coding /
+    rework 的具体流程留给逐轮指令；PR 合并、关闭、回评只保留红线与必要时的工作流说明。
+    仓库记忆收成基础规则与 coding/rework 共用写回格式两层。
+  - 读文件规则合并回唯一条“读码纪律”：默认先定位，已知文件可直接分段读；禁止用不同
+    offset 拆段扫全文；保留 policies ≤80 / project ≤200 的硬上限，并要求读后立即记结论。
+  - 模型配置删除 analysis 行；“评审”行只服务 reviewer。Token 面板只保留 qa / plan 两个
+    独立主控形态，rework 仍并入 coding 组。
+- **关键决策**：
+  - **状态候选在分类前收口，拦截在分类后立即执行**。这比把同一套规则塞进系统提示词更硬，
+    模型不会先拿到任务、再在中间件里被中止。
+  - **PR 同步只保留两个入口**：轮首记忆拦截点，以及 coding / rework 轮末。`save_repo_memory`
+    不再自行查 PR，只负责合并正文与落盘，避免第三处隐式刷新。
+  - **review 是动作，不是主控形态**；reviewer 是 coding / rework 的内部角色。删除独立
+    review 形态不会削弱审查，反而减少一个意图候选。
+- **验证**：全量 `pytest` **1280 passed**；`scripts/check_prompts.py` 渲染 6 份提示词、
+  **0 条冲突**；本次改动文件 `ruff check` 干净。
+- **遗留**：plan 的仓库级旧方案冲突检查、一个仓库多会话并行与用户隔离 / 仓库级编码锁、
+  coder ↔ reviewer 自动闭环均记入 `docs/backlog.md`。
+
+### 2026-10-21
+
+#### 能力交接的内层不再「隐形」：日志与用量并回外层
+
+- **动机**：真机一轮 `handoffTask` 之后 8 分钟里日志一片空白、Token 面板也没有任何数字。
+  内层为了不把正文混进外层流，用 `ainvoke` + 摘掉 `var_child_runnable_config` 跑整轮 ——
+  代价是 LLM 调用、工具调用、耗时、用量全都看不到。
+- **改动**：
+  - `tools/handoff.py`：内层改用 `astream_events(version="v3")`，自己消费事件流，喂给一份
+    **带 `handoff ` 前缀**的 `AgentRunLog` —— 日志里能看到 `handoff LLM 调用完成` /
+    `handoff 工具调用 → …` 与耗时；**正文仍然不流给前端**（保持隔离）。
+  - 内层用量通过 `TurnState.usage_sink` 交回外层 `AgentRunLog.merge_usage`，轮末并进本轮
+    账；上下文压力（主控峰值/末值）不混入内层的窗口。
+  - 交接开始/结束各加一条 info（形态、线程、耗时、回正文长度）。
+  - `AgentRunLog` 增加 `prefix` 参数与 `merge_usage()`；`runner._run_agent` 挂上
+    `state.usage_sink`。
+- **验证**：`tests/test_handoff_tool.py` + `tests/test_run_logging.py` **61 passed**；
+  全量 `pytest` **1615 passed**；`ruff check` 干净。
+
+#### 「本轮改动」移到右栏内嵌页：文件列表 + 左右 diff；右侧标签二次点击收起
+
+- **动机**（用户口径 2026-10-21）：coding 结束后消息下的 `改动 N 个文件` 角标只有 11px 灰字、
+  不显眼；点开是消息内联的 unified diff，文件多时不好看。要求：角标醒目；点角标在右侧栏
+  内嵌一页，列出全部改动文件，点文件看**左右两排**的 diff；右侧标签再点一次收起。
+- **改动**：
+  - 角标：11px 灰字 → **13px 正文色 + accent 浅底 + 边框**，圆点放大。
+  - 新增 `components/panels/ChangesPanel.vue`：右上「← 返回」、改动摘要、base…head、
+    全部文件列表（A/M/D/R + 增删行数）；点文件用现有 `GET /sessions/{id}/repo/diff`
+    拉 unified diff，**前端拆成左右两列**（连续 `-`/`+` 配对，context 两边显示，hunk 头通栏）。
+  - 点角标 → 右栏盖一层「本轮改动」内嵌页（不新增竖标签）；再点同一个角标或「返回」关闭。
+  - 消息内联 diff 整块删除（只留角标）；旧的 `msg-change*` 样式一并删掉。
+  - 右侧标签：点当前标签且已展开 → **收起**；点别的标签 → 切换并展开；内嵌页开着时点标签
+    先关页再切换（2026-10-21 用户口径）。
+- **验证**：`npm --prefix frontend run build`（含 vue-tsc）通过。
+
 ### 2026-10-20
+
+#### 应急裁剪复发时强制摘要（同一轮 3 次）
+
+- **动机**：真机一轮 coder 出现 **303 次 LLM 调用 / 24.8M 输入**，其中应急裁剪 **84 次**
+  （每次 120k→74k）。裁剪只改本次请求、不改 checkpoint，于是上下文在 74k~120k 之间反复
+  循环，一次摘要都没做。
+- **改动**：`HarnessSummarizationMiddleware` 增加 `forced_after`（默认 3，运行期配置
+  `context_pretrim_forced_summary_after`）：同一轮累计 3 次应急裁剪后，**即使剪完低于压缩线
+  也强制摘要**；摘要成功后计数清零、重新累计，失败则保留计数下次重试。日志带
+  `应急裁剪计数 N/3`，清零单独打 `CONTEXT_TRIM_RESET`（不混进 pretrim 统计）。
+- **验证**：`tests/test_summarization.py` **43 passed**（新增：3 次强制摘要、成功后清零、
+  失败不清零）。
+
+#### 仓库记忆按形态分档注入：qa/analysis 全文，其余节选，review 不注入
+
+- **动机**（用户口径 2026-10-20）：记忆改成 6k 上限后仍是**每次模型调用**都整篇注入；
+  而「变更记录」对写码与审查这两类活没有用处 —— 它们要的是「怎么做才符合仓库」与「还差什么」。
+- **改动**：
+  - `agent/middleware/memory_sections.py` 新增 `digest()`：只保留指定几节（基本信息 / 当前缺口 /
+    长期约束），末尾注明「变更记录没有注入，需要历史回报主控」。
+  - `MemoryMiddleware` 新增 `sections` 参数：`None` = 全文、`()` = **不注入**（连读都不读）、
+    元组 = 只注入这几节；`build_memory_middleware(settings, repo, backend, form, role)` 按形态 / 角色决定。
+  - 分档：**qa / analysis 全文**；**coding / plan 主控 + planner / coder 子智能体**只给
+    「基本信息 + 当前缺口 + 长期约束」；**review 主控 + reviewer 子智能体一律不注入**。
+  - `build_subagents` 的 `memory_factory` 改成按角色建（`Callable[[str], MemoryMiddleware]`），
+    `session/manager.py` 的 lambda 同步传 `role=role`。
+  - 提示词同步：共用段写清分档口径；planner / coder 的「当前全文」改成「按角色节选」；
+    reviewer 段从「仓库记忆只读」改成「本轮不注入仓库记忆，不要为了补上下文去读它」。
+- **关键决策**：
+  - review 不给记忆，是因为审查的第一手材料永远是 **diff + `/ai_coding/policies/`**；
+    给了历史反而容易拿「以前是这么写的」当审查依据。
+  - qa / analysis 保持全文：它们的常见问法就是「这仓库有什么 / 以前做过什么」。
+- **验证**：全量 `pytest` **1604 passed**（新增注入分档用例：全文 / 节选 / 不注入，以及
+  「review 连读都不读」）；`ruff check` 干净；`scripts/check_prompts.py` 0 条冲突。
+
+#### 仓库记忆改成按节增量写：`save_repo_memory(section, payload)` + 长度上限
+
+- **动机**（用户口径 2026-10-20）：`wanqi-mall` 的记忆已经 **24,148 字**（20 条变更记录），
+  而它是**每次模型调用都整篇注入**——一轮 80 次调用就是上百万输入 tokens。同时观察到两个
+  坏习惯：模型把「本次改动」写进「仓库基本信息」；「关键决策」写得像第二份变更记录。
+- **改动**：
+  - `save_repo_memory` 的入参从 `content: str`（整篇）改成 `section + payload`：
+    `change`（追加一条：kind / summary / pr）、`gaps`（整节替换）、`decisions`（整节替换）、
+    `basic`（按白名单字段替换）。**不再接受整篇提交**。
+  - 新增 `agent/middleware/memory_sections.py`：解析四节（兼容老标题「项目概览 / 当前进度 /
+    关键决策 / 约定与注意事项」）、合并、渲染、按 PR 去重、滚动窗口。
+  - 长度上限（代码里硬拒，不静默截断）：基本信息 2000 / 当前缺口 1500 / 长期约束 1500 /
+    全文 6000 字；单字段 300、单条缺口 200、单条约束 120；变更记录只留最近 8 条、
+    摘要 ≤120 字。超了回执里报「哪一节 / 多少字」。
+  - 「关键决策」改名「**长期约束**」，每条必须三栏：约束 / 原因 / **影响**（写不出影响说明
+    它只是历史，应记进变更记录）；最多 8 条，整节替换。
+  - 「变更记录」一条只写两行：`### 日期 · 类型 · 摘要` + `- **PR**：#N ｜ **状态**`；
+    涉及文件与验证细节留在 PR 里（每轮全文注入，写细节等于每轮都付 token）。
+  - 模板（`docs/` 与 `sandbox/policies/` 两份逐字一致）与提示词同步：写明增量口径、
+    各节职责、上限，以及「本次改动不许写进基本信息」。
+  - 工具描述从「覆盖写」改成「按节增量写」；注入块同步改口径。
+  - **`basic` 写入时顺手归一化整节**（2026-10-20 补）：只拦新写入不够 —— 存量里已经躺着
+    「认证体系」「服务间鉴权」这类非白名单字段，下一次写 basic 时会把它们清掉（散文行保留），
+    回执里报「清掉 N 条」。
+- **数据迁移（一次性）**：4 份存量记忆已压缩并备份到 `store` 的 `memories_backup` 前缀：
+  `wanqi-mall` 24,148 → **5,392** 字（20 条变更 → 8 条；6 条滚出、6 条无 PR 丢弃），
+  `java-for-test` 6,495 → 3,030，`java_test_demo` 4,563 → 3,288，
+  `multi_model_rag_demo` 5,118 → 3,736。补做归一化后：`wanqi-mall` → **4,721**（清掉
+  「认证体系 / 服务间鉴权」2 条）、`java-for-test` → 2,828（3 条）、`java_test_demo` → 3,186（1 条）。
+- **关键决策**：
+  - 「变更记录」是唯一追加式的一节（按 PR 去重 + 滚动窗口）；缺口与长期约束是**整节替换**，
+    因为过时的结论必须能删掉，只追加会越写越乱。
+  - 上限落在**代码**里而不是提示词里：超长直接拒写并报数字，避免「模型自己截断」这种
+    不可预期行为。
+- **验证**：全量 `pytest` **1595 passed**；`ruff check` 改动文件干净；
+  `scripts/check_prompts.py` 0 条冲突。
+
+#### qa / analysis 允许跑测试与构建；装依赖只许落在 /tmp 副本
+
+- **动机**（用户口径 2026-10-20）：这两个形态此前是「只读」，运行时行为（测试过不过、构建
+  失败在哪、这段代码实际输出什么）只能靠读代码猜。要求：**允许执行验证**，但**仍不许写
+  任务代码**；缺依赖可以装，但项目里不能留下不需要的依赖。
+- **改动**：
+  - `prompts._READONLY_BOUNDARY`（qa / analysis 共用）重写：明确「可以执行验证」——
+    跑测试 / 构建、用 `python -c` / `node -e` 看输出；「缺依赖可以装，但只许在
+    `/tmp` 的仓库副本里」（`cp -a /ai_coding/project /tmp/verify-<repo>`），`/tmp` 随
+    沙箱销毁，项目目录里不留 node_modules / lockfile 改动；并写明**不许**跑
+    `--fix` / `--write` / `format`、不许 `git add/commit/push/checkout/merge`。
+  - `_ROLE_QA`「怎么查」新增第 4 条、`_ROLE_ANALYSIS`「分析工作法」第 2 条：
+    **能跑就别只读**，运行时事实优先。
+  - `safety/policy.py` 的 `AgentPolicy` 增加 `writes_project` / `project_root` /
+    `allow_install`，新增 `check_command`：
+    - 写根里没有 project 的形态（qa / analysis / plan / review / planner）**硬拦**
+      `git add|commit|push|checkout|merge|rebase|reset|…` 与 `--fix` / `--write` /
+      `gofmt -w` / `black` / `rustfmt`；
+    - 装依赖（npm / pip / poetry / uv / go mod / mvn dependency）只允许
+      `cd /tmp/…` 之后执行；没 `cd` 或 `cd` 进仓库一律拒；
+    - `cp` / `ln` / `rsync` 只把**目标**当写目标（源是只读的），所以
+      `cp -a /ai_coding/project /tmp/verify` 不会被自己的边界挡住。
+- **关键决策**：
+  - 依赖装在 `/tmp` 副本里，「清理」变成结构性的（沙箱销毁即没了），不依赖模型自觉；
+    qa 的写根仍然为空、analysis 仍然只有 `/ai_coding/tmp`。
+  - 拦截落在中间件（`BoundaryMiddleware` → `AgentPolicy`）而不是只写提示词 ——
+    提示词负责「劝它别选」，中间件负责「选了也不执行」。
+- **验证**：全量 `pytest` **1599 passed**；`ruff check` 改动文件干净；
+  `scripts/check_prompts.py` 0 条冲突。
+- **遗留**：装依赖需要沙箱能联网；连不上时如实报「依赖装不上」，不要退回猜测。
 
 #### Token 面板删掉上下文块；环图改看「最近一次主控调用」；子智能体折叠
 
@@ -71,6 +575,47 @@
 - **遗留**：改版之前的历史记录里 `context` 仍是峰值口径（`max_input`）；环图对老记录
   按原样显示，不重算。
 
+#### 需求澄清落到 qa：新增 `requirement-clarifier`，删掉旧的补全 skill
+
+- **动机**（用户口径 2026-10-20）：用户抛来的需求常常是一句话、群聊碎片、只写了正常流程的
+  PRD。需要的是「理解 → 反问 → 确认 → 产出一份详细需求描述」。上一轮已经把**需求讨论**
+  的意图从 coding 挪到 qa，这一轮把**方法**也挪过去。
+- **改动**：
+  - 新增 `sandbox/skills/requirement-clarifier/SKILL.md`：吸收与分级（原文逐字、先查仓库、
+    信源冲突不互相覆盖）→ 按盲区清单挑漏洞（范围 / 状态 / 权限 / 并发 / 量级 / 存量 / 时序 /
+    删除语义 / 异常 / 边界，只留「不问清就得返工」的）→ 一次最多问 3 个、尽量选择题化 →
+    验收回答（剥离新需求、冲突检测、回答退化成「方向」就收口）→ 产出需求描述
+    （背景 / 范围 / 场景 / 功能明细 / 约束 / 验收标准（含反向用例）/ 待确认 / 下一步）。
+  - 删除 `sandbox/skills/coding-requirement-completer/SKILL.md`：它的终点是「产出可运行代码块」，
+    意图域是通用编程助手的 write/modify/debug…，默认值是「语言默认 Python、脚本形态」——
+    与这套「已有仓库 + 方案 + coder」的流程正好相反。
+  - `prompts.py`：coding 流程第 2.a 步不再指向 skill，改成「有歧义就别猜，讲清楚停下等答复」；
+    `_ROLE_QA` 新增「需求澄清（用户抛需求时）」一节，指明按该 skill 走、产物进回复正文。
+- **关键决策**：
+  - **产出进回复，不落文件**：qa 是只读形态（不改仓库、不写 `/ai_coding/output/`）。
+  - **方案设计不进这份 skill**：技术选型、步骤拆分、工作量估算归 plan，否则两个形态各写一遍。
+  - 参考的三份外部 skill 里，`docs/requirements/` 持久目录、HTML 确认单 + 问卷脚本、
+    `verify_evidence.py` 机检、「业务方不碰 AI、由开发转达」都**不适用**（没有那些脚本、
+    需求方就在这个界面里），只保留纪律部分。
+  - 追问格式：**意图不明**走 `<CLARIFY>` 弹窗，**需求细节**走正文 —— 现有弹窗的选项是
+    「选意图」用的（`_consume_clarification` 返回 intent），装不进需求细节。
+- **验证**：`tests/test_prompts.py` 146 passed；`scripts/check_prompts.py` 0 条冲突。
+- **遗留**：需求描述能否落库（`save_requirement` + 一张表，供 plan 直接引用）—— 本轮只进
+  回复，要沉淀时再立项。
+
+#### 意图口径：需求讨论归 qa、方案设计 / 讨论归 plan
+
+- **动机**（用户口径 2026-10-20）：「这个需求还能加个条件」这类**需求讨论**被判成 coding，
+  白读一遍代码；方案还在讨论阶段也被当成开工。要求：需求讨论一律 qa，方案设计 / 方案讨论
+  一律 plan。
+- **改动**：`server/intent.py` 的 `coding` 说明写明「讨论需求本身不是 coding」，`qa` 加
+  「需求讨论 / 需求补充 / 需求澄清」，`_BOUNDARY` 加两条分界（需求讨论 vs coding、
+  方案设计 / 方案讨论 → plan）。JEV 与大模型两条判定路共用同一份提示词，一并生效。
+- **关键决策**：**关键字层不动** —— 往强口令里塞「需求」「方案讨论」会把「方案讨论完了，
+  开始实施」判成 plan（plan 规则排在 coding 前面，先命中就赢）。这类句子交给模型判。
+- **验证**：`tests/test_intent_detection.py`、`tests/test_prompts.py` 全过；
+  `scripts/check_prompts.py` 0 条冲突。
+
 #### 代码平台令牌进配置，取消 OAuth 登录
 
 - **动机**：OAuth 登录后端做完之后前端一直没接，令牌散在 `.env` 里、改一次要重启；
@@ -97,6 +642,14 @@
   `npm --prefix frontend run build` 通过。
 - **遗留**：`sessions.gitee_token` / `gitee_username` 两列的名字仍按 Gitee 命名（实际也存
   GitHub 的），改名要迁移，暂不动。
+
+#### 日志补 LLM 调用耗时（毫秒）
+
+- **动机**：日志里只有工具调用带耗时，LLM 调用看不出慢在哪。
+- **改动**：`observability/run_log.py` 在 `message-start` 记起始时刻（按 namespace ＋
+  是否内部调用两维配对），`message-finish` 输出「…，耗时 1834ms」；子智能体收尾那行从
+  `%.1fs` 改成毫秒，与工具完成同口径。
+- **验证**：`tests/test_run_logging.py` 全过（含「配对后起始时刻必须清空」）。
 
 #### 第二批：三个大文件按功能拆包
 

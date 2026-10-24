@@ -44,25 +44,23 @@ const hasUsage = computed(() => (data.value?.rounds_with_usage ?? 0) > 0)
 /**
  * 面板的行结构（2026-10-20 用户口径）：
  *
- * - 主控**按形态**拆开：analysis / qa / plan / review 各一行；
+ * - 主控**按形态**拆开：qa / plan 各一行；
  * - `coding` 是一组，子项是 coder / reviewer / planner；
  * - **rework 不单列**：它与 coding 共用 `orchestrate` 形态，主控开销并进 coding 那一组；
  * - `intent`（判定）与 `internal`（摘要）是别处的开销，各自平铺。
  */
 const SUB_AGENT_KEYS = ['coder', 'reviewer', 'planner'] as const
 /** 独立成行的形态（主控按 ``extra.intent`` 聚合出来的） */
-const STANDALONE_FORMS = ['analysis', 'qa', 'plan', 'review'] as const
+const STANDALONE_FORMS = ['qa', 'plan'] as const
 /** 并进 coding 组的两个形态：rework 与 coding 共用同一套「主控 + 三个子智能体」 */
 const CODING_FORMS = ['coding', 'rework'] as const
 
 /** 形态的两个名字：拉丁名（与后端 key 对齐）+ 中文。 */
 const FORM_LABELS: Record<string, [string, string]> = {
-  analysis: ['analysis', '分析'],
   qa: ['qa', '问答'],
   plan: ['plan', '方案'],
-  review: ['review', '审查'],
   coding: ['coding', '编码'],
-  rework: ['rework', '返工'],
+  rework: ['rework', 'PR 跟进'],
 }
 
 /** 子智能体的两个名字（与 /ai_coding/skills 里的角色名一致）。 */

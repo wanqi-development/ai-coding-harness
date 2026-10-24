@@ -62,7 +62,7 @@ class Platform(str, Enum):
     def default_git_username(self) -> str:
         """askpass 回给 git 的用户名。
 
-        Gitee 的 OAuth 令牌配 ``oauth2``；GitHub 的 PAT / 安装令牌配 ``x-access-token``。
+        Gitee 的 HTTP token 默认用户名用 ``oauth2``；GitHub 用 ``x-access-token``。
         两边都允许用真实用户名（PAT 场景），所以这只是一份**默认值**。
         """
         return _GIT_USERNAMES[self]

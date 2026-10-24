@@ -13,9 +13,13 @@ from ai_coding_harness.core.stream import (
     event_name,
     finished_items,
     is_internal_call,
+    last_ai_text,
     metadata_of,
     namespace_of,
+    parent_run_id_of,
     payload_of,
+    run_id_of,
+    text_of_content,
     todo_items,
 )
 from tests.v3_events import (
@@ -58,9 +62,47 @@ def test_metadata_and_namespace() -> None:
     assert namespace_of(message_start(ns=SUB_NS)) == SUB_NS
 
 
+def test_run_ids_can_build_a_parent_child_tree() -> None:
+    event = text_delta("正文")
+    event["run_id"] = "child"
+    event["parent_ids"] = ["root", "handoff"]
+
+    assert run_id_of(event) == "child"
+    assert parent_run_id_of(event) == "handoff"
+    part = V3Translator().feed(event)[0]
+    assert part["run_id"] == "child"
+    assert part["parent_run_id"] == "handoff"
+
+
 def test_event_name_follows_the_channel() -> None:
     assert event_name(messages("content-block-delta")) == "content-block-delta"
     assert event_name(tool_finish()) == "tool-finished"
+
+
+def test_text_of_content_keeps_only_plain_text() -> None:
+    content = [
+        {"type": "reasoning", "reasoning": "不要展示"},
+        {"type": "text", "text": "第一段"},
+        "第二段",
+        {"type": "invalid_tool_call", "name": "x"},
+    ]
+
+    assert text_of_content(content) == "第一段第二段"
+    assert text_of_content("纯字符串") == "纯字符串"
+    assert text_of_content(None) == ""
+
+
+def test_last_ai_text_skips_reasoning_and_empty_messages() -> None:
+    messages = [
+        {"type": "human", "content": "问题"},
+        {"type": "ai", "content": [{"type": "text", "text": "旧回答"}]},
+        {
+            "type": "ai",
+            "content": [{"type": "reasoning", "reasoning": "只有思考"}],
+        },
+    ]
+
+    assert last_ai_text(messages) == "旧回答"
 
 
 def test_call_id_of_pairs_the_two_frames() -> None:
@@ -291,6 +333,17 @@ def test_todos_emitted_progressively_then_authoritative_on_finish() -> None:
         {"kind": "todos", "items": [T("读代码", "completed"), T("写补丁")]}
     ]
     assert tr.parts.has_todos is True
+
+
+def test_disallowed_todos_are_ignored_even_if_the_model_hallucinates_them() -> None:
+    """qa 没有 write_todos；模型伪造该调用时不能生成前端/落库用的幽灵清单。"""
+    tr = V3Translator(allow_todos=False)
+
+    assert tr.feed(todo_start()) == []
+    assert tr.feed(todo_delta('{"todos":[{"content":"幽灵任务","status":"pending"}]}')) == []
+    assert tr.feed(todo_finish([{"content": "幽灵任务", "status": "completed"}])) == []
+    assert tr.parts.has_todos is False
+    assert tr.parts.data == []
 
 
 def test_todos_args_is_accumulated_not_appended() -> None:

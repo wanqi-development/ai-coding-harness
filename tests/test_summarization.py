@@ -115,9 +115,17 @@ def _pretrim_logs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [r for r in caplog.records if PRETRIM_LOG_TAG in r.getMessage()]
 
 
-def _request(messages: list[BaseMessage]) -> ModelRequest:
+def _request(
+    messages: list[BaseMessage],
+    *,
+    state: dict[str, Any] | None = None,
+) -> ModelRequest:
     """``state`` 必须给：上游要从里面读上一次的压缩事件（``_summarization_event``）。"""
-    return ModelRequest(model=_model(), messages=messages, state={"messages": messages})
+    return ModelRequest(
+        model=_model(),
+        messages=messages,
+        state={"messages": messages, **(state or {})},
+    )
 
 
 def _long_history(blocks: int = 30) -> list[BaseMessage]:
@@ -246,18 +254,16 @@ class TestTrigger:
 
 class TestModeMapping:
     def test_burst_roles(self):
-        for role in ("plan", "planner", "coder", "review", "reviewer"):
+        for role in ("plan", "planner", "coder", "reviewer"):
             assert resolve_context_mode(role) == CONTEXT_MODE_BURST
 
     def test_steady_roles(self):
-        for role in ("qa", "analysis", "coding", "orchestrate", "rework"):
+        for role in ("qa", "coding", "orchestrate", "rework"):
             assert resolve_context_mode(role) == CONTEXT_MODE_STEADY
 
     def test_the_main_agent_uses_its_form(self):
         assert resolve_context_mode(MAIN_AGENT, "qa") == CONTEXT_MODE_STEADY
-        assert resolve_context_mode(MAIN_AGENT, "analysis") == CONTEXT_MODE_STEADY
         assert resolve_context_mode(MAIN_AGENT, "plan") == CONTEXT_MODE_BURST
-        assert resolve_context_mode(MAIN_AGENT, "review") == CONTEXT_MODE_BURST
         assert resolve_context_mode(MAIN_AGENT, "orchestrate") == CONTEXT_MODE_STEADY
         assert resolve_context_mode(MAIN_AGENT, "coding") == CONTEXT_MODE_STEADY
         assert resolve_context_mode(MAIN_AGENT, "rework") == CONTEXT_MODE_STEADY
@@ -497,30 +503,15 @@ class TestTheCompactionIsLogged:
 
         assert _summary_logs(caplog) == []
 
-    async def test_truncating_args_is_logged_as_its_own_kind(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ):
-        """只截断入参、没做摘要时也要记一行：它同样在省上下文，而阈值是另一套。"""
-        middleware = build_summarization(
-            _model(window=None),
-            _backend(),
-            _settings(
-                context_summary_trigger_tokens=1_000, context_summary_keep_tokens=200
-            ),
-        )
-        history = _long_history(4)
-        # 条数一样、对象换过 ＝ 上游那份 truncate_args_settings 动过手（没做摘要）
-        truncated = [message.model_copy(deep=True) for message in history]
-        monkeypatch.setattr(
-            SummarizationMiddleware, "awrap_model_call", self._fake_upstream(truncated, None)
+    def test_upstream_argument_truncation_is_disabled(self):
+        """历史入参只走显式裁剪事件，不能再被上游截成前 20 字符。"""
+        values = summarization_defaults(
+            _model(),
+            _settings(),
+            mode=CONTEXT_MODE_BURST,
         )
 
-        with caplog.at_level(logging.INFO):
-            await middleware.awrap_model_call(_request(history), _ok_handler)
-
-        (record,) = _summary_logs(caplog)
-        assert "截断历史工具入参" in record.getMessage()
-        assert "消息 4 条不变" in record.getMessage()
+        assert values["truncate_args_settings"] is None
 
 
 class TestPreSummaryTrim:
@@ -561,25 +552,199 @@ class TestPreSummaryTrim:
         monkeypatch.setattr(SummarizationMiddleware, "awrap_model_call", boom)
 
         with caplog.at_level(logging.INFO):
-            await middleware.awrap_model_call(_request(history), handler)
+            result = await middleware.awrap_model_call(_request(history), handler)
 
         tools = [m for m in seen["messages"] if isinstance(m, ToolMessage)]
         assert tools[-1].content.startswith("当前结果"), "当前这一步必须原样保留"
         assert all(m.content.startswith("〔已裁剪〕") for m in tools[:-1])
+        assert isinstance(result, ExtendedModelResponse)
+        event = result.command.update["_context_trim_event"]
+        assert event["trimmed_result_ids"] == [f"c{i}" for i in range(6)]
         (record,) = _pretrim_logs(caplog)
         text = record.getMessage()
-        assert "清掉 6 条" in text
+        assert "工具结果 6 条" in text
         assert "已低于压缩线且落在安全区，本轮不压缩" in text
         assert record.agent == "coder"
 
-    async def test_it_compresses_when_the_trim_only_barely_gets_under_the_line(
+    @staticmethod
+    def _fake_summary(monkeypatch: pytest.MonkeyPatch, *, fail_times: int = 0):
+        """把上游压缩换成可控假实现：记录调用次数，可选前 N 次抛错。"""
+        state = {"calls": 0}
+
+        async def fake(self: Any, request: ModelRequest, handler: Any) -> Any:
+            state["calls"] += 1
+            if state["calls"] <= fail_times:
+                raise RuntimeError("摘要失败")
+            response = await handler(
+                request.override(
+                    messages=[HumanMessage(content="摘要"), *request.messages[-1:]]
+                )
+            )
+            return ExtendedModelResponse(
+                model_response=response,
+                command=Command(
+                    update={
+                        "_summarization_event": {
+                            "cutoff_index": 1,
+                            "summary_message": HumanMessage(content="摘要"),
+                            "file_path": None,
+                        }
+                    }
+                ),
+            )
+
+        monkeypatch.setattr(SummarizationMiddleware, "awrap_model_call", fake)
+        return state
+
+    async def test_a_persisted_event_is_reused_without_replanning(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        """只压到线边（>80%）不算免压：原历史还在，下一次会原样重剪。
+        """checkpoint 里的裁剪事件是持久投影：第二次调用不重新生成同一批 ID。"""
+        middleware = self._middleware()
+        history = _tool_steps(6) + _current_step()
+        summary_state = self._fake_summary(monkeypatch)
+
+        first = await middleware.awrap_model_call(_request(history), _ok_handler)
+        assert isinstance(first, ExtendedModelResponse)
+        event = first.command.update["_context_trim_event"]
+
+        seen: dict[str, list[BaseMessage]] = {}
+
+        async def handler(request: ModelRequest) -> ModelResponse:
+            seen["messages"] = list(request.messages)
+            return ModelResponse(result=[AIMessage(content="ok")])
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            second = await middleware.awrap_model_call(
+                _request(history, state={"_context_trim_event": event}),
+                handler,
+            )
+
+        tools = [m for m in seen["messages"] if isinstance(m, ToolMessage)]
+        assert all(m.content.startswith("〔已裁剪〕") for m in tools[:-1])
+        assert tools[-1].content.startswith("当前结果")
+        assert not isinstance(second, ExtendedModelResponse), "没有新事件需要写回"
+        assert summary_state["calls"] == 0
+        assert _pretrim_logs(caplog) == [], "已有事件已经生效，不该重复裁剪"
+
+    async def test_the_total_switch_ignores_and_clears_an_existing_event(self):
+        middleware = build_summarization(
+            _model(window=None),
+            _backend(),
+            _settings(
+                context_summary_trigger_tokens=100_000,
+                context_summary_keep_tokens=100,
+                context_trim_enabled=False,
+            ),
+            agent="coder",
+        )
+        history = _tool_steps(1) + _current_step()
+        event = {
+            "version": 1,
+            "trimmed_result_ids": ["c0"],
+            "compacted_arg_ids": [],
+        }
+        seen: dict[str, list[BaseMessage]] = {}
+
+        async def handler(request: ModelRequest) -> ModelResponse:
+            seen["messages"] = list(request.messages)
+            return ModelResponse(result=[AIMessage(content="ok")])
+
+        result = await middleware.awrap_model_call(
+            _request(history, state={"_context_trim_event": event}),
+            handler,
+        )
+
+        assert seen["messages"][1].content == "甲" * 4000, "总开关关闭时不应用旧投影"
+        assert isinstance(result, ExtendedModelResponse)
+        assert result.command.update["_context_trim_event"] is None
+
+    async def test_a_large_argument_can_enter_the_event_while_its_result_stays(self):
+        middleware = self._middleware(context_trim_clear_inputs=True)
+        history = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "write",
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/p/a.java",
+                            "content": "x" * 8_000,
+                        },
+                    }
+                ],
+            ),
+            ToolMessage(content="ok", tool_call_id="write", name="write_file"),
+            *_current_step(),
+        ]
+
+        result = await middleware.awrap_model_call(_request(history), _ok_handler)
+
+        assert isinstance(result, ExtendedModelResponse)
+        event = result.command.update["_context_trim_event"]
+        assert event["trimmed_result_ids"] == [], "小结果不裁"
+        assert event["compacted_arg_ids"] == ["write"]
+
+    async def test_no_new_candidates_go_straight_to_summary(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """旧结果全在事件里、当前步骤又不能裁时，没有新增收益，直接摘要。"""
+        middleware = self._middleware()
+        history = _tool_steps(6) + _current_step(chars=4_000)
+        event = {
+            "version": 1,
+            "trimmed_result_ids": [f"c{i}" for i in range(6)],
+            "compacted_arg_ids": [],
+        }
+        seen: dict[str, list[BaseMessage]] = {}
+
+        async def fake(self: Any, request: ModelRequest, handler: Any) -> Any:
+            seen["messages"] = list(request.messages)
+            response = await handler(
+                request.override(
+                    messages=[HumanMessage(content="摘要"), *request.messages[-1:]]
+                )
+            )
+            return ExtendedModelResponse(
+                model_response=response,
+                command=Command(
+                    update={
+                        "_summarization_event": {
+                            "cutoff_index": 1,
+                            "summary_message": HumanMessage(content="摘要"),
+                            "file_path": None,
+                        }
+                    }
+                ),
+            )
+
+        monkeypatch.setattr(SummarizationMiddleware, "awrap_model_call", fake)
+
+        with caplog.at_level(logging.INFO):
+            await middleware.awrap_model_call(
+                _request(history, state={"_context_trim_event": event}),
+                _ok_handler,
+            )
+
+        assert seen["messages"][1].content == "甲" * 4000, (
+            "摘要与 offload 必须看到原始工具结果，不能复用裁剪事件投影"
+        )
+        assert any(
+            "没有新的大工具结果或大入参可裁" in record.getMessage()
+            for record in _pretrim_logs(caplog)
+        )
+        assert _summary_logs(caplog)
+
+    async def test_it_compresses_when_the_trim_stays_above_the_safe_zone(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """只压到安全区外（>70%）不算免压：原历史还在，下一次会原样重剪。
 
         2026-10-20 真机：coder 每次 121~135k 剪到 103~117k，刚好低于 120k 的线，
         于是一轮 38 次原地裁剪、一次摘要都没有。这里用 3000 字当前步骤造同样的形状：
-        低于 2000 的线、但高于 80%（1600）。
+        低于 2000 的线、但高于 70%（1400）。
         """
         middleware = self._middleware()
         history = _tool_steps(1) + _current_step(chars=2_600)
@@ -611,7 +776,7 @@ class TestPreSummaryTrim:
             await middleware.awrap_model_call(_request(history), _ok_handler)
 
         (record,) = _pretrim_logs(caplog)
-        assert "仅勉强低于压缩线（>80%），继续压缩" in record.getMessage()
+        assert "仅勉强低于压缩线（>70%），继续压缩" in record.getMessage()
         assert _summary_logs(caplog), "勉强压到线边时必须真的摘要"
 
     async def test_it_compresses_from_the_untrimmed_baseline_when_the_trim_is_not_enough(
@@ -760,11 +925,14 @@ class TestPreSummaryTrim:
         unflagged = self._middleware(context_trim_clear_inputs=False)
 
         assert on._pretrim is True
-        # 2026-10-20 起默认开：旧 edit/write 的入参不再随每次调用重发
-        assert on._pretrim_clear_inputs is True
+        # 2026-10-22 起默认关：只压超大字段的可选策略，不再整体清空 args。
+        assert on._pretrim_compact_inputs is False
         assert off._pretrim is False
-        assert flagged._pretrim_clear_inputs is True
-        assert unflagged._pretrim_clear_inputs is False
+        assert flagged._pretrim_compact_inputs is True
+        assert unflagged._pretrim_compact_inputs is False
+        assert on._pretrim_min_result_chars == 2_000
+        assert on._pretrim_min_arg_chars == 2_000
+        assert "_context_trim_event" in HarnessSummarizationMiddleware.state_schema.__annotations__
 
 
 class TestDescribeTrigger:
@@ -899,7 +1067,7 @@ class TestTheWorkingNoteNotice:
             _model(window=None),
             _backend(),
             _settings(
-                context_summary_trigger_tokens=4_000,
+                context_summary_trigger_tokens=5_000,
                 context_summary_keep_tokens=100,
                 context_pretrim_notice_ratio=0.0,
             ),

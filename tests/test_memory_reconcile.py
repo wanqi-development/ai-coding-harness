@@ -436,12 +436,12 @@ def test_an_unrecognized_live_state_leaves_the_row_alone():
     assert result.restated == ()
 
 
-def test_a_settled_row_is_not_rewritten_even_when_it_disagrees():
-    """人工已经改成「已合并」的行，线上后来变成「已关闭」也不回改 —— 那是结论，不是缓存。"""
+def test_a_row_is_rewritten_when_live_state_disagrees():
+    """记忆状态与平台不一致时按平台实况改写。"""
     result = reconcile(RECORDS, [pull(30, state="closed")], now=NOW)
 
-    assert "**状态**：已合并" in result.text
-    assert result.restated == ()
+    assert "**状态**：已关闭" in result.text
+    assert result.restated == ("30",)
 
 
 def test_the_status_rewrite_alone_marks_the_memory_as_changed():
@@ -508,10 +508,9 @@ def test_the_template_asks_for_the_unfinished_features():
         encoding="utf-8"
     )
 
-    assert "## 三、当前缺口（按模块，全部列出）" in text
+    assert "## 三、当前缺口（按模块）" in text
     assert "未完成的功能" in text
-    assert "需求列表" in text, "摘表这件事本身要写在模版里（告诉模型别再写）"
-    assert "以 PR 为角度" in text
+    assert 'section="gaps"' in text, "按节增量写的口径要写在模版里"
 
 
 def test_the_template_records_the_pr_status_but_never_a_pr_less_entry():
@@ -525,7 +524,7 @@ def test_the_template_records_the_pr_status_but_never_a_pr_less_entry():
         encoding="utf-8"
     )
 
-    assert "- **PR**：{[#31](链接)}　｜　**状态**：{待合并 | 已合并 | 已关闭}" in text
-    assert "之后由平台按代码平台的实况改" in text
-    assert "这条变更记录**不写**" in text, "PR 没建成时的处置口径要写在模版里"
+    assert "- **PR**：{#31}　｜　**状态**：{待合并 | 已合并 | 已关闭}" in text
+    assert "之后由平台按代码平台实况改" in text
+    assert "这条**不写**" in text, "PR 没建成时的处置口径要写在模版里"
     assert "未提 PR" not in text, "「没有 PR」这一档已经取消，别再回来"

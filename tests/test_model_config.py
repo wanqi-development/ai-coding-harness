@@ -44,18 +44,16 @@ def _settings(**over: Any) -> Settings:
 
 class TestResolution:
     def test_the_role_to_row_map_covers_every_role(self):
-        """八个角色都要登记：五个主控形态 + 三个子智能体。
+        """六个角色都要登记：三个主控形态 + 三个子智能体。
 
         「编码」一主三从的归属（2026-10-14 用户口径）：主控与 coder 各占一行，
-        **planner / reviewer 复用已有的「方案」/「审查」两行** —— 四个角色都有出处，
+        **planner / reviewer 复用已有的「方案」/「评审」两行** —— 四个角色都有出处，
         但只有主控与编码两行要配。
         """
         assert {role: llm_mod.agent_key(role) for role in llm_mod._AGENT_KEY} == {
             "orchestrate": "coding",
             "qa": "qa",
-            "analysis": "analysis",
             "plan": "plan",
-            "review": "review",
             "planner": "plan",
             "coder": "coder",
             "reviewer": "review",
@@ -74,7 +72,7 @@ class TestResolution:
         for role, label in (
             ("qa", "问答"),
             ("plan", "方案"),
-            ("review", "审查"),
+            ("reviewer", "评审"),
             ("coder", "编码"),
         ):
             with pytest.raises(ValueError, match=f"「{label}」这一行还没配置模型"):
@@ -787,8 +785,8 @@ class TestApi:
             "deepseek", "kimi", "glm", "gpt", "qwen", "custom",
         }, "快照要带上厂商目录（界面「先选提供商」用它带出地址）"
         # 行名用中文（用户口径）；「编码」一主三从拆成主控 + 编码两行（2026-10-14）
-        assert [row["label"] for row in body["rows"]][:6] == [
-            "问答", "分析", "方案", "审查", "编码主控", "编码",
+        assert [row["label"] for row in body["rows"]][:5] == [
+            "问答", "方案", "评审", "编码主控", "编码",
         ]
         assert rows["qa"]["source"] == "db" and rows["qa"]["model"] == "row-model"
         assert rows["qa"]["provider"] == "deepseek", "按 base_url 反推提供商（纯界面提示）"

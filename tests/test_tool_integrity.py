@@ -42,7 +42,10 @@ from ai_coding_harness.agent.middleware import (
     ToolCallIdMiddleware,
     ToolErrorGuardMiddleware,
 )
-from ai_coding_harness.agent.middleware.tool_integrity import repair_messages
+from ai_coding_harness.agent.middleware.tool_integrity import (
+    MAX_INVALID_TOOL_RETRIES,
+    repair_messages,
+)
 from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM
 from ai_coding_harness.agent.subagents import build_subagents
 from ai_coding_harness.safety.policy import policy_for
@@ -151,8 +154,8 @@ class TestBlankIds:
 
 
 class TestUnexecutedWording:
-    def test_invalid_call_says_the_arguments_were_bad(self):
-        """参数坏掉的调用与「跑了一半被打断」不是一回事，措辞要分开。"""
+    def test_invalid_call_is_downcast_to_text_without_a_fake_tool_response(self):
+        """invalid call 不能进 provider payload；它只保留一条普通文本说明。"""
         history = [
             AIMessage(
                 content="",
@@ -162,11 +165,16 @@ class TestUnexecutedWording:
         ]
         out = repaired_or_fail(history)
 
-        assert out[1].tool_call_id == "call_x"
-        assert "参数" in out[1].content
+        rebuilt = out[0]
+        assert isinstance(rebuilt, AIMessage)
+        assert rebuilt.invalid_tool_calls == []
+        assert "[工具调用未执行]" in rebuilt.content
+        assert "execute" in rebuilt.content
+        assert "参数" in rebuilt.content
+        assert not responses(out), "invalid call 没有 tool_calls，不能伪造 ToolMessage"
 
-    def test_invalid_call_keeps_its_bucket(self):
-        """重建时两类各归各位：invalid 的不能挪进 ``tool_calls``（挪了就等于声称能执行）。"""
+    def test_invalid_call_is_cleared_while_valid_calls_survive(self):
+        """invalid 字段必须清空；同一条消息里的正常调用仍保持可执行形态。"""
         history = [
             AIMessage(
                 content="",
@@ -181,8 +189,63 @@ class TestUnexecutedWording:
         rebuilt = out[0]
         assert isinstance(rebuilt, AIMessage)
         assert [c["name"] for c in rebuilt.tool_calls] == ["read_file"]
-        assert [c["name"] for c in rebuilt.invalid_tool_calls] == ["execute"]
-        assert rebuilt.invalid_tool_calls[0]["id"].startswith("call_")
+        assert rebuilt.invalid_tool_calls == []
+        assert "execute" in rebuilt.content
+        assert len(responses(out)) == 1
+        assert responses(out)[0].tool_call_id == "call_a"
+
+    def test_invalid_content_block_is_downcast_without_invalid_field(self):
+        """真实坏 checkpoint 形状：invalid 在 content block 里，字段本身是空列表。"""
+        history = [
+            AIMessage(
+                content=[
+                    {
+                        "type": "invalid_tool_call",
+                        "id": "call_bad",
+                        "name": "save_repo_memory",
+                        "args": "{坏的 JSON",
+                        "error": "Failed to parse tool call arguments as JSON",
+                    }
+                ],
+                invalid_tool_calls=[],
+            ),
+            HumanMessage("继续"),
+        ]
+
+        out = repaired_or_fail(history)
+
+        rebuilt = out[0]
+        assert isinstance(rebuilt, AIMessage)
+        assert rebuilt.invalid_tool_calls == []
+        assert isinstance(rebuilt.content, list)
+        assert all(
+            not (
+                isinstance(block, dict)
+                and block.get("type") == "invalid_tool_call"
+            )
+            for block in rebuilt.content
+        )
+        assert "[工具调用未执行]" in str(rebuilt.content)
+        assert "save_repo_memory" in str(rebuilt.content)
+        assert not responses(out)
+
+    def test_old_fake_response_for_an_invalid_call_is_removed(self):
+        """旧修复逻辑生成过伪 ToolMessage；升级后要把这条孤儿一并清掉。"""
+        history = [
+            AIMessage(
+                content="",
+                invalid_tool_calls=[{"name": "execute", "args": "坏的", "id": "call_x"}],
+            ),
+            ToolMessage(content="工具未执行", tool_call_id="call_x", name="execute"),
+            HumanMessage("继续"),
+        ]
+
+        out = repaired_or_fail(history)
+
+        assert isinstance(out[0], AIMessage)
+        assert out[0].invalid_tool_calls == []
+        assert not responses(out)
+        assert isinstance(out[1], HumanMessage)
 
 
 # -- 无事可做 ---------------------------------------------------------------
@@ -309,6 +372,84 @@ class TestToolCallId:
     async def test_none_id_is_normalized(self):
         out = await _through_id_middleware(ai(call(call_id=None)))
         assert ids(out)[0].startswith("call_")
+
+    async def test_invalid_call_is_downcast_at_the_model_exit(self):
+        """坏调用在写入 checkpoint 前就降级，避免下一轮所有 provider 一起 400。"""
+        response = ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    invalid_tool_calls=[
+                        {
+                            "name": "execute",
+                            "args": "这不是 JSON",
+                            "id": "call_bad",
+                            "error": "JSONDecodeError",
+                        }
+                    ],
+                )
+            ]
+        )
+
+        out = await _through_id_middleware(response)
+        message = out.result[0]
+
+        assert isinstance(message, AIMessage)
+        assert message.invalid_tool_calls == []
+        assert message.tool_calls == []
+        assert "[工具调用未执行]" in message.content
+        assert "JSONDecodeError" in message.content
+
+    async def test_invalid_call_retries_until_the_model_recovers(self):
+        invalid = AIMessage(
+            content=[
+                {
+                    "type": "invalid_tool_call",
+                    "name": "save_repo_memory",
+                    "args": '{"payload":',
+                    "error": "Failed to parse tool call arguments as JSON",
+                }
+            ]
+        )
+        valid = AIMessage(content="已重新生成合法调用")
+        responses = iter([ModelResponse(result=[invalid]), ModelResponse(result=[valid])])
+        systems: list[str] = []
+
+        async def handler(request: ModelRequest) -> ModelResponse:
+            systems.append(request.system_message.text if request.system_message else "")
+            return next(responses)
+
+        out = await ToolCallIdMiddleware().awrap_model_call(_model_request(), handler)
+
+        assert len(systems) == 2
+        assert "工具调用修复" in systems[1]
+        assert "save_repo_memory" in systems[1]
+        assert out.result[0].content == "已重新生成合法调用"
+
+    async def test_invalid_retry_is_bounded_to_three_then_downcasts(self):
+        invalid = AIMessage(
+            content=[
+                {
+                    "type": "invalid_tool_call",
+                    "name": "save_repo_memory",
+                    "args": '{"payload":',
+                    "error": "JSON 不完整",
+                }
+            ]
+        )
+        calls = 0
+
+        async def handler(_request: ModelRequest) -> ModelResponse:
+            nonlocal calls
+            calls += 1
+            return ModelResponse(result=[invalid.model_copy(deep=True)])
+
+        out = await ToolCallIdMiddleware().awrap_model_call(_model_request(), handler)
+
+        assert calls == 1 + MAX_INVALID_TOOL_RETRIES
+        message = out.result[0]
+        assert message.invalid_tool_calls == []
+        assert "[工具调用未执行]" in str(message.content)
 
     async def test_real_ids_are_returned_as_is(self):
         """没命中就别造新对象：状态无谓更新会连带下游一堆重算。"""

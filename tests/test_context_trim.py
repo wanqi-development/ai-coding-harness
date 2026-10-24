@@ -12,8 +12,14 @@ from langchain_core.messages.utils import count_tokens_approximately
 
 from ai_coding_harness.agent.middleware import (
     PRETRIM_KEEP_RECENT_TOOL_RESULTS,
+    PRETRIM_MIN_ARG_CHARS,
+    PRETRIM_MIN_RESULT_CHARS,
+    apply_context_trim_event,
     keep_items_from_messages,
+    merge_context_trim_event,
+    plan_context_trim_event,
     pretrim_tool_results,
+    prune_context_trim_event,
 )
 from ai_coding_harness.agent.middleware import context_trim as trim_mod
 
@@ -155,6 +161,25 @@ class TestPreSummaryTrim:
         assert [m.tool_call_id for m in tools] == [f"c{i}" for i in range(6)] + ["now"]
         assert "read_file" in tools[0].content and "/p/0.java" in tools[0].content
 
+    def test_small_tool_results_are_left_alone(self):
+        old = AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "small", "name": "execute", "args": {"command": "git status"}}
+            ],
+        )
+        messages = [
+            old,
+            ToolMessage(content="ok", tool_call_id="small", name="execute"),
+            *_current_step(),
+        ]
+
+        got, cleared = pretrim_tool_results(messages)
+
+        assert cleared == 0
+        assert got[1].content == "ok"
+        assert len("ok") < PRETRIM_MIN_RESULT_CHARS
+
     def test_keep_recent_is_an_escape_hatch(self):
         messages = _steps(6) + _current_step()
 
@@ -193,10 +218,75 @@ class TestPreSummaryTrim:
         assert second == 0
         assert [m.content for m in twice] == [m.content for m in once]
 
-    def test_clearing_inputs_clears_the_originating_call(self):
+    def test_the_event_keeps_only_stable_ids_and_is_idempotent(self):
         messages = _steps(3) + _current_step()
 
-        got, _ = pretrim_tool_results(messages, clear_tool_inputs=True)
+        event, results, args = plan_context_trim_event(messages)
+        again, repeat_results, repeat_args = plan_context_trim_event(
+            messages, existing=event
+        )
+
+        assert results == 3
+        assert args == 0
+        assert event == {
+            "version": 1,
+            "trimmed_result_ids": ["c0", "c1", "c2"],
+            "compacted_arg_ids": [],
+        }
+        assert again == event
+        assert repeat_results == repeat_args == 0
+
+    def test_applying_an_event_does_not_change_the_raw_messages(self):
+        messages = _steps(2) + _current_step()
+        event = {
+            "version": 1,
+            "trimmed_result_ids": ["c0"],
+            "compacted_arg_ids": [],
+        }
+
+        projected = apply_context_trim_event(messages, event)
+
+        assert projected[1].content.startswith("〔已裁剪〕")
+        assert projected[3].content == "甲" * 4000, "未列入事件的结果保持原文"
+        assert messages[1].content == "甲" * 4000, "原始消息对象不被修改"
+
+    def test_merge_and_prune_keep_the_event_bounded(self):
+        event = merge_context_trim_event(
+            None, result_ids=("c0", "c1"), arg_ids=("a0",)
+        )
+        merged = merge_context_trim_event(
+            event, result_ids=("c1", "c2"), arg_ids=("a1",)
+        )
+
+        assert merged == {
+            "version": 1,
+            "trimmed_result_ids": ["c0", "c1", "c2"],
+            "compacted_arg_ids": ["a0", "a1"],
+        }
+        assert prune_context_trim_event(merged, _steps(2), 4) == {
+            "version": 1,
+            "trimmed_result_ids": ["c2"],
+            "compacted_arg_ids": ["a0", "a1"],
+        }, "cutoff 之前的 c0/c1 要清掉，a* 没有对应消息则保留"
+
+    def test_compact_inputs_keep_structure_and_small_fields(self):
+        content = "x" * (PRETRIM_MIN_ARG_CHARS + 500)
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "write",
+                        "name": "write_file",
+                        "args": {"file_path": "/p/a.java", "content": content},
+                    }
+                ],
+            ),
+            ToolMessage(content="写入成功", tool_call_id="write", name="write_file"),
+            *_current_step(),
+        ]
+
+        got, cleared = pretrim_tool_results(messages, clear_tool_inputs=True)
 
         calls = [
             call
@@ -204,10 +294,25 @@ class TestPreSummaryTrim:
             if isinstance(m, AIMessage)
             for call in m.tool_calls or []
         ]
-        assert calls[0]["args"] == {}, "老调用的入参被清空"
+        assert cleared == 0, "写入成功结果很短，结果本身不裁"
+        assert calls[0]["args"]["file_path"] == "/p/a.java", "路径必须保留"
+        assert calls[0]["args"]["content"].startswith("x" * 20)
+        assert "历史入参已压缩" in calls[0]["args"]["content"]
+        assert len(calls[0]["args"]["content"]) < len(content)
         assert calls[-1]["args"] == {"path": "/p/now.java"}, "当前这一步不动"
         first_ai = next(m for m in got if isinstance(m, AIMessage))
-        assert first_ai.response_metadata["context_editing"]["cleared_tool_inputs"] == ["c0"]
+        assert first_ai.response_metadata["context_editing"]["compacted_tool_inputs"] == [
+            "write"
+        ]
+
+    def test_small_inputs_are_left_alone(self):
+        messages = _steps(1) + _current_step()
+
+        got, _ = pretrim_tool_results(messages, clear_tool_inputs=True)
+
+        first_ai = next(m for m in got if isinstance(m, AIMessage))
+        assert first_ai.tool_calls[0]["args"] == {"path": "/p/0.java"}
+        assert len("/p/0.java") < PRETRIM_MIN_ARG_CHARS
 
     def test_a_history_without_an_ai_message_still_keeps_the_tail(self):
         messages = [

@@ -42,6 +42,12 @@ _LINE_HEAD = re.compile(
     r"\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] (?P<logger>[^:]+):"
 )
 
+#: handoff 内层日志带的 run 父子标记，嵌在消息正文里：
+#: ``handoff [run=call_x parent=call_handoff] LLM 调用完成…``。
+_RUN_META = re.compile(
+    r"\[run=(?P<run_id>[^\s\]]+) parent=(?P<parent_run_id>[^\s\]]+)\]"
+)
+
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 
 #: HTTP 请求噪声的 logger：``api.middleware`` 每个请求两行（→ / ←），``uvicorn.access`` 再来一行。
@@ -58,6 +64,8 @@ class LogLine:
     #: 打这行的 logger 名（认不出就是空串）—— 用来认 HTTP 请求噪声。
     logger: str
     text: str
+    run_id: str = ""
+    parent_run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,12 +103,23 @@ def _parse(line: str) -> LogLine:
     found = _LINE_HEAD.match(line)
     if found is None:
         # 认不出开头（续行、第三方库的裸输出）：原样留着，级别留空让前端按普通行画
-        return LogLine(ts="", level="", logger="", text=line)
+        run_meta = _RUN_META.search(line)
+        return LogLine(
+            ts="",
+            level="",
+            logger="",
+            text=line,
+            run_id=run_meta.group("run_id") if run_meta else "",
+            parent_run_id=run_meta.group("parent_run_id") if run_meta else "",
+        )
+    run_meta = _RUN_META.search(line)
     return LogLine(
         ts=found.group("ts"),
         level=found.group("level"),
         logger=found.group("logger").strip(),
         text=line,
+        run_id=run_meta.group("run_id") if run_meta else "",
+        parent_run_id=run_meta.group("parent_run_id") if run_meta else "",
     )
 
 
@@ -142,7 +161,12 @@ def read_session_logs(
                         last_ts = item.ts
                     elif last_ts:
                         item = LogLine(
-                            ts=last_ts, level=item.level, logger=item.logger, text=item.text
+                            ts=last_ts,
+                            level=item.level,
+                            logger=item.logger,
+                            text=item.text,
+                            run_id=item.run_id,
+                            parent_run_id=item.parent_run_id,
                         )
                     if not _matches(line, session_id):
                         continue

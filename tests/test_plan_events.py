@@ -14,6 +14,7 @@ import pytest
 
 from ai_coding_harness.agent.middleware import TurnState
 from ai_coding_harness.config import ModelConfig, Settings
+from ai_coding_harness.core.stream import RUN_EVENT_KIND
 
 #: 假件的模型配置：2026-10-15 起没有 ``.env`` 出厂默认，模型名与窗口都得由「模型配置」
 #: 那几行给出 —— 桩件里也要有行，否则主控的模型名 / 窗口解析出来是空的。
@@ -156,6 +157,22 @@ def _tool_call(name: str, *, output: str = "ok", call_id: str = "t1") -> list[di
     return [tool_start(name, call_id=call_id), tool_finish(call_id=call_id, output=output)]
 
 
+def _run_event(**over: object) -> dict:
+    payload = {
+        "kind": RUN_EVENT_KIND,
+        "node_kind": "handoff",
+        "phase": "start",
+        "run_id": "handoff:call_1",
+        "parent_run_id": "outer",
+        "root_run_id": "handoff:call_1",
+        "name": "handoffTask",
+        "status": "running",
+        "data": {"from": "plan", "to": "coding"},
+    }
+    payload.update(over)
+    return {"method": "custom", "params": {"namespace": [], "data": payload}}
+
+
 @pytest.fixture
 def plan_reads(monkeypatch) -> list[int]:
     """打桩 dao.get_latest_plan，返回调用次数计数（记录每次读库都发生了）。"""
@@ -197,6 +214,75 @@ async def _run(events: list[dict], terms: tuple[str, ...] = ()) -> list[dict]:
 
 
 class TestPlanEventWiring:
+    async def test_custom_handoff_run_events_are_forwarded(self):
+        out = await _run([_run_event()])
+        runs = [e for e in out if e["type"] == "run"]
+
+        assert runs == [
+            {
+                "type": "run",
+                "run": {
+                    "kind": RUN_EVENT_KIND,
+                    "node_kind": "handoff",
+                    "phase": "start",
+                    "run_id": "handoff:call_1",
+                    "parent_run_id": "outer",
+                    "root_run_id": "handoff:call_1",
+                    "name": "handoffTask",
+                    "status": "running",
+                    "data": {"from": "plan", "to": "coding"},
+                },
+            }
+        ]
+
+    async def test_handoff_run_tree_is_saved_for_refresh(
+        self, monkeypatch, plan_reads
+    ):
+        records: list[dict] = []
+
+        async def fake_record(self, session, **kwargs):
+            records.append(kwargs)
+
+        monkeypatch.setattr(HarnessService, "_record", fake_record)
+
+        await _run([_run_event()])
+
+        parts = records[0]["extra"]["parts"]
+        handoff = next(part for part in parts if part["kind"] == "handoff")
+        assert handoff["events"][0]["run_id"] == "handoff:call_1"
+        assert handoff["events"][0]["parent_run_id"] == "outer"
+
+    async def test_handoff_reasoning_is_live_only_and_not_saved(
+        self, monkeypatch, plan_reads
+    ):
+        records: list[dict] = []
+
+        async def fake_record(self, session, **kwargs):
+            records.append(kwargs)
+
+        monkeypatch.setattr(HarnessService, "_record", fake_record)
+        thought = _run_event(
+            node_kind="model",
+            phase="delta",
+            run_id="handoff:call_1:model",
+            parent_run_id="handoff:call_1",
+            content="只在实时显示",
+            data={"part": "reasoning"},
+        )
+
+        out = await _run([_run_event(), thought])
+        live = [event for event in out if event["type"] == "run"]
+        assert any(
+            (event["run"].get("data") or {}).get("part") == "reasoning"
+            for event in live
+        )
+
+        saved = records[0]["extra"]["parts"][0]["events"]
+        assert all(
+            (event.get("data") or {}).get("part") != "reasoning"
+            for event in saved
+        )
+
     async def test_emits_plan_snapshot_after_plan_tool(self, plan_reads):
         out = await _run(_tool_call("updatePlanStep"))
         plans = [e for e in out if e["type"] == "plan"]

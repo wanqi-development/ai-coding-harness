@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 from langchain_core.tools import BaseTool, tool
 
+from ai_coding_harness.agent.turn_state import TurnState
 from ai_coding_harness.config import Settings
 from ai_coding_harness.core.codeplatform import (
     Platform,
@@ -22,6 +24,8 @@ from ai_coding_harness.core.codeplatform import (
     parse_pr_url,
     parse_repo_url,
 )
+from ai_coding_harness.db import Database, dao
+from ai_coding_harness.tools.context import get_configurable
 from ai_coding_harness.tools.gitee_client import GiteeClient
 from ai_coding_harness.tools.github_client import GitHubClient
 from ai_coding_harness.tools.pr_client import (
@@ -30,6 +34,8 @@ from ai_coding_harness.tools.pr_client import (
     _format_pr,
     _format_pr_comments,
     _format_pr_list,
+    pull_state,
+    pull_summary,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,9 +92,60 @@ def _spec_for(
     )
 
 
-def build_pr_tools(settings: Settings, repo: RepoSpec) -> list[BaseTool]:
+def build_pr_tools(
+    settings: Settings,
+    repo: RepoSpec,
+    *,
+    database: Database | None = None,
+    session_id: int | None = None,
+) -> list[BaseTool]:
     """Build the ``create_pr`` / ``comment_pr`` / ``list_pr_comments`` tools bound to a session repo."""
     client = build_git_client(settings, repo)
+
+    async def register_pull(
+        data: dict[str, Any],
+        *,
+        source: str = dao.PR_SOURCE_AGENT,
+        mark_synced: bool = False,
+    ) -> str | None:
+        """把平台事实写进 PR 表；返回给模型看的失败提示。"""
+        if database is None or session_id is None:
+            return None
+        try:
+            number = int(data.get("number") or 0)
+        except (TypeError, ValueError):
+            return "PR 已创建，但登记失败：平台返回的 PR 编号不合法。"
+        if number <= 0:
+            return "PR 已创建，但登记失败：平台没有返回 PR 编号。"
+        summary = pull_summary(data)
+        head = data.get("head") if isinstance(data.get("head"), dict) else {}
+        base = data.get("base") if isinstance(data.get("base"), dict) else {}
+        state = get_configurable("turn_state")
+        plan_id = state.plan_id if isinstance(state, TurnState) else None
+        try:
+            async with database.session() as db:
+                await dao.upsert_pull_request(
+                    db,
+                    platform=repo.platform.value,
+                    owner=repo.owner,
+                    repo=repo.repo,
+                    number=number,
+                    title=summary["title"],
+                    state=pull_state(data),
+                    url=summary["url"],
+                    author=summary["author"],
+                    head_ref=str(head.get("ref") or ""),
+                    head_sha=str(head.get("sha") or ""),
+                    base_ref=str(base.get("ref") or ""),
+                    source=source,
+                    session_id=session_id,
+                    plan_id=plan_id,
+                    mark_synced=mark_synced and bool(head.get("sha")),
+                )
+        except Exception:
+            logger.exception("PR 已创建但登记失败：%s/%s#%s", repo.owner, repo.repo, number)
+            return f"PR 已创建，但登记到归属表失败（#{number}）。请检查数据库。"
+        return None
 
     @tool
     async def create_pr(title: str, head: str, base: str, body: str) -> str:
@@ -112,9 +169,15 @@ def build_pr_tools(settings: Settings, repo: RepoSpec) -> list[BaseTool]:
             )
             existing = None
         if existing is not None:
+            number = int(existing.get("number") or 0)
+            state = get_configurable("turn_state")
+            if number > 0 and isinstance(state, TurnState):
+                state.pr = number
+            warning = await register_pull(existing, mark_synced=True)
             return (
                 f"PR 已存在，直接复用：{existing.get('html_url')}"
-                f"（编号 {existing.get('number')}，未新建）"
+                f"（编号 {number or '?'}，未新建）"
+                + (f"\n{warning}" if warning else "")
             )
 
         try:
@@ -123,7 +186,15 @@ def build_pr_tools(settings: Settings, repo: RepoSpec) -> list[BaseTool]:
             return f"创建 PR 失败：HTTP {exc.response.status_code} {exc.response.text[:500]}"
         if "error" in data:
             return f"创建 PR 失败：{data['error']}"
-        return f"PR 已创建：{data.get('html_url')}（编号 {data.get('number')}）"
+        number = int(data.get("number") or 0)
+        state = get_configurable("turn_state")
+        if number > 0 and isinstance(state, TurnState):
+            state.pr = number
+        warning = await register_pull(data, mark_synced=True)
+        return (
+            f"PR 已创建：{data.get('html_url')}（编号 {number or '?'}）"
+            + (f"\n{warning}" if warning else "")
+        )
 
     @tool
     async def comment_pr(number: int, body: str) -> str:
@@ -234,6 +305,20 @@ def build_pr_tools(settings: Settings, repo: RepoSpec) -> list[BaseTool]:
             return f"关闭 PR 失败：HTTP {exc.response.status_code} {exc.response.text[:500]}"
         if isinstance(data, dict) and "error" in data:
             return f"关闭 PR 失败：{data['error']}"
+        if database is not None and session_id is not None:
+            try:
+                async with database.session() as db:
+                    row = await dao.get_pull_request(
+                        db,
+                        platform=repo.platform.value,
+                        owner=repo.owner,
+                        repo=repo.repo,
+                        number=number,
+                    )
+                    if row is not None:
+                        row.state = "closed"
+            except Exception:
+                logger.exception("PR 已关闭但本地状态更新失败：%s", number)
         return f"PR #{number} 已关闭"
 
     return [create_pr, comment_pr, list_pr_comments, get_pr_info, close_pr]

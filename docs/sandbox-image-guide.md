@@ -98,7 +98,7 @@ git ls-remote https://gitee.com/<owner>/<repo>.git     # 公开仓库无需令�
 
 - **现状**：沙箱内 `execute` 默认以 **root** 运行，任何文件权限都拦不住模型读取令牌。
 - **缓解 1**：**每沙箱只服务一个租户**（不池化）→ 令牌只在本租户沙箱内。
-- **缓解 2**：**OAuth 短时效 + `projects` scope** → 即使泄露，影响有界。
+- **缓解 2**：使用**最小权限、可轮换的 access token** → 即使泄露，影响有界。
 - **缓解 3**：**prompt / skill 明令禁止**读取环境变量与 `.secrets`、禁止打印令牌。
 
 若将来需要「令牌完全不落沙箱」，改用 OpenSandbox 凭据保险库（需服务端 egress sidecar

@@ -8,7 +8,13 @@ from typing import Any
 
 import pytest
 
-from ai_coding_harness.agent.clarification import parse_clarification
+from ai_coding_harness.agent.clarification import (
+    CLARIFY_INVALID_FALLBACK,
+    CLARIFY_SAVE_FALLBACK,
+    clarification_fallback_text,
+    parse_clarification,
+    strip_clarification_block,
+)
 from ai_coding_harness.config import Settings
 from ai_coding_harness.db import dao
 from ai_coding_harness.server.service import HarnessService
@@ -52,6 +58,51 @@ class TestParse:
         assert got is not None
         assert len(got.options) == 2
 
+    def test_accepts_multiple_steps_and_non_intent_business_options(self):
+        got = parse_clarification(
+            _payload(
+                steps=[
+                    {
+                        "id": "intent",
+                        "question": "要做什么？",
+                        "options": [
+                            {"intent": "coding", "label": "实施"},
+                            {"intent": "plan", "label": "出方案"},
+                        ],
+                    },
+                    {
+                        "id": "refund",
+                        "question": "退款怎么触发？",
+                        "options": [
+                            {"value": "sync", "label": "同步 RPC"},
+                            {"value": "mq", "label": "消息队列"},
+                        ],
+                    },
+                ]
+            )
+        )
+
+        assert got is not None
+        assert [step.id for step in got.steps] == ["intent", "refund"]
+        assert got.steps[1].options[0].intent == ""
+        assert got.steps[1].options[0].value == "sync"
+
+    def test_first_step_must_contain_valid_intents(self):
+        assert parse_clarification(
+            _payload(
+                steps=[
+                    {
+                        "id": "scope",
+                        "question": "范围？",
+                        "options": [
+                            {"value": "a", "label": "A"},
+                            {"value": "b", "label": "B"},
+                        ],
+                    }
+                ]
+            )
+        ) is None
+
     def test_rejects_unknown_intent(self):
         assert parse_clarification(
             _payload(
@@ -73,6 +124,7 @@ class TestParse:
                     {"intent": "plan", "label": "2"},
                     {"intent": "coding", "label": "3"},
                     {"intent": "review", "label": "4"},
+                    {"intent": "qa", "label": "5"},
                 ]
             )
         ) is None
@@ -90,6 +142,31 @@ class TestParse:
                 ]
             )
         ) is None
+
+    def test_strip_clarification_removes_closed_or_unclosed_protocol(self):
+        closed = _payload()
+        unclosed = '前置说明\n<CLARIFY>\n{"steps": ['
+
+        assert strip_clarification_block(closed) == "前置说明\n\n后置说明"
+        assert strip_clarification_block(unclosed) == "前置说明"
+
+    def test_save_failure_fallback_keeps_question_without_protocol(self):
+        raw = _payload()
+        parsed = parse_clarification(raw)
+
+        text = clarification_fallback_text(raw, parsed)
+
+        assert text.startswith(CLARIFY_SAVE_FALLBACK)
+        assert "你想让我做哪一类？" in text
+        assert "<CLARIFY>" not in text
+        assert '"options"' not in text
+
+    def test_invalid_protocol_fallback_never_exposes_the_block(self):
+        text = clarification_fallback_text("<CLARIFY>{not json}</CLARIFY>")
+
+        assert text == CLARIFY_INVALID_FALLBACK
+        assert "<CLARIFY>" not in text
+        assert "not json" not in text
 
 
 class _SessionCtx:
@@ -149,6 +226,60 @@ async def test_consume_accepts_an_index_and_deletes_the_pending(
     assert deleted == [1]
 
 
+async def test_consume_accepts_all_steps_and_composes_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = SimpleNamespace(
+        id="clr-2",
+        original_message="补全售后状态机",
+        question="要做什么？",
+        options=[],
+        steps=[
+            {
+                "id": "intent",
+                "question": "要做什么？",
+                "options": [
+                    {"intent": "coding", "label": "直接实施"},
+                    {"intent": "plan", "label": "先出方案"},
+                ],
+            },
+            {
+                "id": "refund",
+                "question": "退款怎么触发？",
+                "options": [
+                    {"value": "sync", "label": "同步 RPC"},
+                    {"value": "mq", "label": "消息队列"},
+                ],
+            },
+        ],
+    )
+
+    async def fake_get(db: Any, *, session_id: int) -> Any:
+        return row
+
+    async def fake_delete(db: Any, *, session_id: int) -> bool:
+        return True
+
+    monkeypatch.setattr(dao, "get_clarification", fake_get)
+    monkeypatch.setattr(dao, "delete_clarification", fake_delete)
+
+    got = await _service()._consume_clarification(
+        _session(),
+        clarification_id="clr-2",
+        answers=[
+            {"step_id": "intent", "choice": 0},
+            {"step_id": "refund", "choice": 1},
+        ],
+    )
+
+    assert got is not None
+    message, intent, labels = got
+    assert intent == "coding"
+    assert labels == "直接实施 / 消息队列"
+    assert "补全售后状态机" in message
+    assert "退款怎么触发？：消息队列" in message
+
+
 async def test_consume_rejects_an_unknown_id_and_clears_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -185,6 +316,7 @@ async def test_pending_clarification_returns_the_frame_shape(
         id="clr-1",
         question="你想做什么？",
         options=[{"intent": "qa", "label": "查"}],
+        steps=[],
     )
 
     async def fake_get(db: Any, *, session_id: int) -> Any:
@@ -196,5 +328,12 @@ async def test_pending_clarification_returns_the_frame_shape(
         "id": "clr-1",
         "question": "你想做什么？",
         "options": [{"intent": "qa", "label": "查"}],
+        "steps": [
+            {
+                "id": "intent",
+                "question": "你想做什么？",
+                "options": [{"intent": "qa", "label": "查"}],
+            }
+        ],
         "allow_other": True,
     }

@@ -62,6 +62,11 @@ async def chat(
             req.message,
             clarification_id=req.clarification_id,
             choice=req.choice,
+            answers=(
+                [answer.model_dump() for answer in req.answers]
+                if req.answers
+                else None
+            ),
         )
     except RunInProgress:
         raise HTTPException(

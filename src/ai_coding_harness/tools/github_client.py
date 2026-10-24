@@ -20,9 +20,10 @@ import httpx
 from ai_coding_harness.core.codeplatform import RepoSpec
 from ai_coding_harness.tools.pr_client import (
     PrClient,
+    all_pages_or_raise,
     find_open_pull,
     missing_token_message,
-    pulls_or_raise,
+    recent_pulls_or_raise,
 )
 
 #: GitHub 的 REST API 版本头（不写会用默认版本，写死是为了行为可预期）
@@ -105,6 +106,23 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def list_pull_commits(
+        self, *, number: int, page: int = 1, limit: int = 100
+    ) -> list[dict] | dict:
+        """列出 PR 的提交，用于首次纳管历史 PR 时核对 Agent git 身份。"""
+        err = self._check_configured()
+        if err:
+            return {"error": err}
+        url = (
+            f"{self._base_url}/repos/{self._repo.owner}/{self._repo.repo}"
+            f"/pulls/{number}/commits"
+        )
+        params = {"page": page, "per_page": limit}
+        async with self._client() as client:
+            resp = await client.get(url, headers=self._auth_headers(), params=params)
+        resp.raise_for_status()
+        return resp.json()
+
     async def get_pull(self, *, owner: str, repo: str, number: int) -> dict:
         """获取指定 PR 的详情（owner/repo 可来自 PR 地址，不限于本会话仓库）。"""
         err = self._check_configured()
@@ -117,7 +135,15 @@ class GitHubClient:
         return resp.json()
 
     async def list_pulls(
-        self, *, owner: str, repo: str, state: str = "all", limit: int = 20
+        self,
+        *,
+        owner: str,
+        repo: str,
+        state: str = "all",
+        limit: int = 20,
+        page: int = 1,
+        sort: str = "created",
+        direction: str = "desc",
     ) -> list[dict] | dict:
         """列出仓库的 PR。
 
@@ -131,7 +157,13 @@ class GitHubClient:
         wanted = (state or "all").strip().lower()
         query_state = "closed" if wanted == "merged" else wanted
         url = f"{self._base_url}/repos/{owner}/{repo}/pulls"
-        params = {"state": query_state, "per_page": limit}
+        params = {
+            "state": query_state,
+            "page": page,
+            "per_page": limit,
+            "sort": sort,
+            "direction": direction,
+        }
         async with self._client() as client:
             resp = await client.get(url, headers=self._auth_headers(), params=params)
         resp.raise_for_status()
@@ -140,13 +172,17 @@ class GitHubClient:
             return pulls
         return [p for p in pulls if p.get("merged_at")]
 
-    async def open_pulls(self) -> list[dict]:
+    async def open_pulls(self, *, limit: int = 100) -> list[dict]:
         """本仓库未关闭的 PR 列表；失败一律抛 ``PrLookupError``（见 ``pr_client``）。"""
-        return await pulls_or_raise(self, self._repo, state="open")
+        return await all_pages_or_raise(self, self._repo, state="open", limit=limit)
 
-    async def all_pulls(self) -> list[dict]:
-        """本仓库全部 PR（含已合入与已关闭未合入）；失败纪律同 ``open_pulls``。"""
-        return await pulls_or_raise(self, self._repo, state="all")
+    async def all_pulls(
+        self, *, limit: int = 10, until_number: int | None = None
+    ) -> list[dict]:
+        """最近创建的一页 PR（含所有状态）；失败纪律同 ``open_pulls``。"""
+        return await recent_pulls_or_raise(
+            self, self._repo, limit=limit, until_number=until_number
+        )
 
     async def find_open_pull(self, *, head: str, base: str) -> dict | None:
         """查找本仓库中 head → base 仍未关闭的 PR；没有则返回 ``None``。"""

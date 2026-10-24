@@ -118,6 +118,58 @@ _INPLACE_VERBS = frozenset({"sed", "perl"})
 # 真正干活的是它后面那个词（``nohup rm x`` / ``xargs rm x``）
 _PREFIX_WORDS = frozenset({"command", "env", "nohup", "time", "xargs"})
 
+#: 会改仓库的 git 指令。只列的这几个是**写**：``log`` / ``diff`` / ``show`` / ``status``
+#: 这些读命令不在其中。``branch`` 单独判（不带 -d/-m 时只是列分支）。
+_GIT_WRITE_VERBS = frozenset(
+    {
+        "add",
+        "am",
+        "apply",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "config",
+        "merge",
+        "mv",
+        "pull",
+        "push",
+        "rebase",
+        "reset",
+        "restore",
+        "rm",
+        "stash",
+        "switch",
+        "tag",
+    }
+)
+#: 会就地改文件的开关（``ruff check --fix`` / ``prettier --write``）
+_WRITE_FLAGS = frozenset({"--fix", "--in-place", "--write"})
+#: 默认就写文件的格式化工具（``--check`` / ``--diff`` 时不写）
+_WRITE_DEFAULT_TOOLS = frozenset({"black", "gofmt", "rustfmt"})
+
+#: 装依赖。**只在 /tmp 的仓库副本里允许**（见 ``AgentPolicy.check_command``）：
+#: 直接往 ``/ai_coding/project`` 里装会把 node_modules / .venv / lockfile 改动留在仓库里，
+#: 而这两个形态没有清理它们的写权限。
+_INSTALL_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+    r"(?:"
+    r"(?:pip3?|python3?(?:\.\d+)?\s+-m\s+pip)\s+install\b"
+    r"|npm\s+(?:install|i|ci|add)\b"
+    r"|pnpm\s+(?:install|add)\b"
+    r"|yarn\s+(?:install|add)\b"
+    r"|poetry\s+(?:install|add)\b"
+    r"|uv\s+(?:pip\s+)?install\b"
+    r"|go\s+mod\s+download\b"
+    r"|mvn\b[^;&|]*\bdependency\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: 允许装依赖的形态（qa 可以跑测试，缺依赖时允许装，
+#: 但必须落在 /tmp 的副本里 —— 项目目录里不留东西，「清理」就变成结构性的而不是靠自觉）。
+_INSTALL_OK = frozenset({"qa"})
+
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # 路径样子的 token：不含引号、``$``、``=``、括号、逗号等「不是路径」的字符。
 # 通配符留着 —— ``build/*`` 是实打实的写目标，取到第一个通配符为止的字面前缀再判。
@@ -138,6 +190,12 @@ class AgentPolicy:
     name: str
     write_roots: tuple[str, ...] = ()
     hidden_tools: frozenset[str] = frozenset()
+    #: 这个角色能不能改**任务仓库**（由 ``write_roots`` 里有没有 project 推出）
+    writes_project: bool = False
+    #: 项目目录的绝对路径（拒绝文案里要说清「不要写进哪」）
+    project_root: str = ""
+    #: 缺依赖时允不允许装（装的位置由 ``check_command`` 限制在 /tmp）
+    allow_install: bool = False
 
     def check_tool(self, tool_name: str, args: Mapping[str, Any]) -> str | None:
         """返回拒绝原因；``None`` 表示放行。"""
@@ -147,9 +205,40 @@ class AgentPolicy:
             value = args.get(key)
             if isinstance(value, str) and _under_any(_norm(value), PROTECTED_READ):
                 return f"{self.name} 不允许访问 {value}"
+        if tool_name == "execute":
+            command = args.get("command")
+            return self.check_command(command) if isinstance(command, str) else None
         targets = write_targets(tool_name, args)
         if targets is None:
             return None
+        return self._check_targets(targets)
+
+    def check_command(self, command: str) -> str | None:
+        """``execute`` 的命令文本要过的那几道（写目录之外的部分）。
+
+        顺序：git 写 → 就地改文件 → 装依赖（位置）→ 普通写目标。
+        """
+        if not self.writes_project:
+            verb = _git_write_verb(command)
+            if verb:
+                return f"{self.name} 不改仓库：{verb} 是写操作（本轮只读）"
+            flag = _write_flag(command)
+            if flag:
+                return f"{self.name} 不改仓库：{flag} 会就地改文件（本轮只读）"
+        for cwd, segment in _install_segments(command):
+            if self.writes_project:
+                continue
+            if not self.allow_install:
+                return f"{self.name} 不装依赖：{brief_command(segment)}"
+            if cwd is None or not _under_any(cwd, ("/tmp",)):
+                return (
+                    f"{self.name} 装依赖要落在 /tmp 的仓库副本里（先 `cd /tmp/…`）；"
+                    f"不要写进 {self.project_root or '/ai_coding/project'}"
+                )
+        return self._check_targets(command_write_targets(command))
+
+    def _check_targets(self, targets: list[str]) -> str | None:
+        """写目标逐个判：平台资产谁都不许写，其余按各自的写根。"""
         for target in targets:
             if _under_any(target, PROTECTED_WRITE):
                 return f"{self.name} 不允许写入 {target}"
@@ -175,12 +264,17 @@ def policy_for(name: str, settings: Settings | None = None) -> AgentPolicy:
     在工具返回里看到理由 —— 比默默拿到全目录写权限小得多。
     """
     entry = _ROOTS.get(name)
+    project_root = _root("project", settings)
     if entry is None:
-        return AgentPolicy(name=name)
+        return AgentPolicy(name=name, project_root=project_root)
+    roots = tuple(_root(key, settings) for key in entry[0])
     return AgentPolicy(
         name=name,
-        write_roots=tuple(_root(key, settings) for key in entry[0]),
+        write_roots=roots,
         hidden_tools=entry[1],
+        writes_project=project_root in roots,
+        project_root=project_root,
+        allow_install=name in _INSTALL_OK,
     )
 
 
@@ -196,22 +290,14 @@ _ROOTS: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
     # 「产出：方案写入 DB，不落文件」、`_PLAN_RULES` 的「不落文件」），只有「可写范围」那段
     # 还留着 output —— 三处两说，这次统一到不落文件。
     "plan": ((), frozenset({"edit_file", "write_file"})),
-    # 主控（单智能体审查）：审查原文要给 ``prompts.py`` 读回来当兜底来源
-    "review": (("review",), frozenset()),
     # 问答：产出只进回复，**一个文件都不落**（与 planner 同形：写根置空 + 撤掉写工具）。
     # 曾经留着 output 的写根，附一句提示词例外「只有用户明确要文件时才写入」—— 2026-09-22
     # 那轮就是照例外走的：用户说「给我一份仓库记忆文件」，它把记忆整篇复制进 output，再回一句
     # 「已写入 + 路径」。「这一轮没有交付物，只有回答」只靠劝，会被一行例外吃掉，所以这里撤选项。
     # `write_todos` 也撤掉 —— 一轮问答没有多步进度可报，清单只会多出一份「查一下、答一下」的
     # 空转（提示词里对应那一段也摘了，见 `prompts.TODO_PROMPT`）。
-    "qa": ((), frozenset({"write_todos", "write_file", "edit_file"})),
-    # 分析：结论进回复，只有中间文件落 tmp。曾经连 output 一起可写（技能里也是那么写的），
-    # 但那个目录**没有回传通路** —— API / 前端一处都不读它，卷也只挂 project，写进去的
-    # 文件随沙箱销毁，用户根本取不到。留着它等于留一条「把答案藏进文件」的路，
-    # 与只读形态「交付物就是回复」这条口径直接冲突，所以撤掉 output、只留 tmp。
-    # 现在 output 是**所有形态都不写**（plan 与 orchestrate 也一并撤了），这条通路只剩
-    # 目录本身（`sandbox_output_dir` 与 provider 的 mkdir），留给未来有回传通路时再用。
-    "analysis": (("tmp",), frozenset({"write_todos"})),
+    # 合并原 analysis 后，允许在 tmp 落取证台账；任务代码与 output 仍不可写。
+    "qa": (("tmp",), frozenset({"write_todos", "write_file", "edit_file"})),
     # 子智能体 planner：方案写库，不再落文件（写文件等于同一件事记两遍）
     "planner": ((), frozenset({"write_file", "edit_file"})),
     # 子智能体 coder：只动工程目录与临时区
@@ -351,6 +437,79 @@ def _verb_tokens(tokens: list[str]) -> list[str]:
     return tokens[index:]
 
 
+def brief_command(text: str, limit: int = 60) -> str:
+    """把命令压成一行给拒绝文案用（太长的整段贴回去没人看）。"""
+    one = " ".join(text.split())
+    return one[:limit] + ("…" if len(one) > limit else "")
+
+
+def _git_write_verb(command: str) -> str | None:
+    """命令里有没有**会改仓库**的 git 指令；有就返回 ``git <verb>``。
+
+    只看每段命令的动词位置（跳过 ``-C <path>`` / ``-c k=v``），所以
+    ``git log --grep "git commit"`` 不会误命中引号里的字样。
+    """
+    for segment in _segments(command):
+        tokens = _verb_tokens(segment.split())
+        if not tokens or tokens[0] != "git":
+            continue
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            index += 2 if tokens[index] in ("-C", "-c") else 1
+        if index >= len(tokens):
+            continue
+        verb = tokens[index]
+        if verb == "branch":
+            # 光 ``git branch`` 是列分支；带 -d / -D / -m / -M 才是写
+            if not any(t.startswith(("-d", "-D", "-m", "-M")) for t in tokens[index + 1 :]):
+                continue
+            return "git branch"
+        if verb in _GIT_WRITE_VERBS:
+            return f"git {verb}"
+    return None
+
+
+def _write_flag(command: str) -> str | None:
+    """命令里有没有「就地改文件」的开关或默认写文件的格式化工具。"""
+    for segment in _segments(command):
+        tokens = _verb_tokens(segment.split())
+        if not tokens:
+            continue
+        verb, rest = tokens[0], tokens[1:]
+        for token in rest:
+            if token in _WRITE_FLAGS:
+                return token
+        if verb in _WRITE_DEFAULT_TOOLS:
+            if verb == "gofmt":
+                if "-w" in rest:
+                    return "gofmt -w"
+                continue
+            # black / rustfmt：--check / --diff 只检查，不写
+            if "--check" in rest or "--diff" in rest:
+                continue
+            return verb
+    return None
+
+
+def _install_segments(command: str) -> list[tuple[str | None, str]]:
+    """命令里的装依赖段落，带上**它执行时所在的目录**（只认绝对 ``cd``，与写目标同口径）。"""
+    cwd: str | None = None
+    found: list[tuple[str | None, str]] = []
+    for segment in _segments(command):
+        tokens = segment.split()
+        if not tokens:
+            continue
+        head = _verb_tokens(tokens)
+        if head and head[0] == "cd":
+            target = next((t for t in head[1:] if not t.startswith("-")), None)
+            if target is not None and target.startswith("/"):
+                cwd = _norm(target)
+            continue
+        if _INSTALL_RE.match(segment.strip()):
+            found.append((cwd, segment.strip()))
+    return found
+
+
 def _segment_targets(tokens: list[str]) -> list[str]:
     """一段命令（``;`` / ``&&`` / ``|`` 之间）会写到哪些路径。"""
     args = _verb_tokens(tokens)
@@ -366,6 +525,14 @@ def _segment_targets(tokens: list[str]) -> list[str]:
         return [last] if last else []
     if verb not in _WRITE_VERBS:
         return []
+    if verb in {"cp", "ln", "rsync"}:
+        # 只有**目标**是写；源是只读的。把源也当写目标会让「复制到 /tmp 再跑测试」
+        # 这种正当命令被拒（``cp -a /ai_coding/project /tmp/v``）。
+        if "-t" in rest:
+            index = rest.index("-t")
+            return [rest[index + 1]] if index + 1 < len(rest) else []
+        candidates = [t for t in rest if _path_like(t)]
+        return candidates[-1:]
     if verb == "dd":
         return [target[3:] for target in rest if target.startswith("of=")]
     return [target for target in rest if _path_like(target)]

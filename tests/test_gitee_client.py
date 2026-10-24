@@ -47,8 +47,27 @@ def make_client(pulls):
     client = GiteeClient("https://gitee.com/api/v5", REPO)
     calls: list[dict] = []
 
-    async def fake_list_pulls(*, owner, repo, state="all", limit=20):
-        calls.append({"owner": owner, "repo": repo, "state": state, "limit": limit})
+    async def fake_list_pulls(
+        *,
+        owner,
+        repo,
+        state="all",
+        limit=20,
+        page=1,
+        sort="created",
+        direction="desc",
+    ):
+        calls.append(
+            {
+                "owner": owner,
+                "repo": repo,
+                "state": state,
+                "limit": limit,
+                "page": page,
+                "sort": sort,
+                "direction": direction,
+            }
+        )
         if isinstance(pulls, Exception):
             raise pulls
         return pulls
@@ -66,7 +85,15 @@ async def test_finds_open_pull_matching_head_and_base() -> None:
     assert found is target
     # 只查未关闭的、且一次拉够本地过滤的量
     assert calls == [
-        {"owner": "acme", "repo": "demo", "state": "open", "limit": 100}
+        {
+            "owner": "acme",
+            "repo": "demo",
+            "state": "open",
+            "limit": 100,
+            "page": 1,
+            "sort": "created",
+            "direction": "desc",
+        }
     ]
 
 
@@ -114,7 +141,17 @@ async def test_open_pulls_asks_for_the_open_state_and_returns_the_list() -> None
     client, calls = make_client([target])
 
     assert await client.open_pulls() == [target]
-    assert calls == [{"owner": "acme", "repo": "demo", "state": "open", "limit": 100}]
+    assert calls == [
+        {
+            "owner": "acme",
+            "repo": "demo",
+            "state": "open",
+            "limit": 100,
+            "page": 1,
+            "sort": "created",
+            "direction": "desc",
+        }
+    ]
 
 
 async def test_all_pulls_asks_for_every_state() -> None:
@@ -123,7 +160,53 @@ async def test_all_pulls_asks_for_every_state() -> None:
     client, calls = make_client([merged])
 
     assert await client.all_pulls() == [merged]
-    assert calls == [{"owner": "acme", "repo": "demo", "state": "all", "limit": 100}]
+    assert calls == [
+        {
+            "owner": "acme",
+            "repo": "demo",
+            "state": "all",
+            "limit": 10,
+            "page": 1,
+            "sort": "created",
+            "direction": "desc",
+        }
+    ]
+
+
+async def test_open_pulls_reads_more_than_one_page() -> None:
+    first = [pull(number=number, head=f"feature/{number}", base="master") for number in range(1, 101)]
+    client, calls = make_client(first)
+
+    class _PagedClient(type(client)):
+        async def list_pulls(self, **kwargs):
+            calls.append(kwargs)
+            return first if kwargs["page"] == 1 else [first[0]]
+
+    paged = _PagedClient("https://gitee.com/api/v5", REPO)
+
+    assert len(await paged.open_pulls()) == 101
+    assert [call["page"] for call in calls] == [1, 2]
+
+
+async def test_recent_all_pulls_pages_until_it_overlaps_the_internal_watermark() -> None:
+    client = GiteeClient("https://gitee.com/api/v5", REPO)
+    pages = {
+        1: [pull(number=n, head=f"feature/{n}", base="master") for n in range(21, 31)],
+        2: [pull(number=n, head=f"feature/{n}", base="master") for n in range(11, 21)],
+    }
+    seen: list[int] = []
+
+    async def fake_list_pulls(*, page, **kwargs):
+        seen.append(page)
+        return pages[page]
+
+    client.list_pulls = fake_list_pulls
+
+    rows = await client.all_pulls(limit=10, until_number=12)
+
+    assert seen == [1, 2]
+    assert next(row["number"] for row in rows) == 21
+    assert [row["number"] for row in rows][-1] == 20
 
 
 @pytest.mark.parametrize("entry", ["open_pulls", "all_pulls"])
@@ -231,6 +314,12 @@ CALLS = [
         lambda c: c.list_pull_comments(number=6),
         "GET",
         "/api/v5/repos/acme/demo/pulls/6/comments",
+    ),
+    (
+        "list_pull_commits",
+        lambda c: c.list_pull_commits(number=6),
+        "GET",
+        "/api/v5/repos/acme/demo/pulls/6/commits",
     ),
     (
         "get_pull",

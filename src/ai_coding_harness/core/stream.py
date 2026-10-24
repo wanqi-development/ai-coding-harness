@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 # deepagents 内置的待办工具
@@ -31,6 +32,9 @@ CREATE_PR_TOOL = "create_pr"
 # 自己那条声明没有，于是没人丢：摘要正文顺着根层的 text-delta 流成了助手正文
 # （2026-09-21 实见，前 5293 字是 ``## SESSION INTENT`` 那一整段）。
 INTERNAL_CALL_KEY = "lc_internal_call"
+
+#: 自定义 run trace 的通道与 kind。handoff 内层用 ``stream_writer`` 发它。
+RUN_EVENT_KIND = "harness-run"
 
 # 子智能体的事件 namespace：``("tools:<task 的 tool_call_id>",)``
 _NS_PREFIX = "tools:"
@@ -89,6 +93,72 @@ def metadata_of(event: dict) -> dict:
     if isinstance(data, tuple) and len(data) > 1 and isinstance(data[1], dict):
         return data[1]
     return {}
+
+
+def run_id_of(event: dict) -> str:
+    """取事件自身的稳定 run id；不同的 v3 路径可能放在三处。"""
+    for value in (
+        event.get("run_id"),
+        metadata_of(event).get("run_id"),
+        (payload_of(event) or {}).get("run_id")
+        if isinstance(payload_of(event), dict)
+        else None,
+        event.get("event_id"),
+    ):
+        if value:
+            return str(value)
+    return ""
+
+
+def parent_run_id_of(event: dict) -> str:
+    """取事件声明的直接父 run；没有就返回空串。"""
+    metadata = metadata_of(event)
+    for value in (event.get("parent_run_id"), metadata.get("parent_run_id")):
+        if value:
+            return str(value)
+    for key in ("parent_ids", "parent_run_ids"):
+        parents = metadata.get(key) or event.get(key)
+        if isinstance(parents, (list, tuple)) and parents:
+            return str(parents[-1])
+    return ""
+
+
+def text_of_content(content: Any) -> str:
+    """取普通正文，忽略 reasoning / tool call 等非正文块。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
+def last_ai_text(messages: Sequence[Any]) -> str:
+    """取最后一条带正文的 AI 消息；没有就返回空串。"""
+    for message in reversed(messages):
+        message_type = (
+            message.get("type")
+            if isinstance(message, Mapping)
+            else getattr(message, "type", "")
+        )
+        if message_type != "ai":
+            continue
+        content = (
+            message.get("content")
+            if isinstance(message, Mapping)
+            else getattr(message, "content", None)
+        )
+        text = text_of_content(content)
+        if text.strip():
+            return text
+    return ""
 
 
 def is_internal_call(event: dict) -> bool:
@@ -355,8 +425,11 @@ class V3Translator:
     免得同一份文本被过滤两遍、口径还不一致。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_todos: bool = True) -> None:
         self.parts = StreamParts()
+        #: qa 没有 write_todos 工具。模型偶尔仍会伪造这个 tool-call，若照常翻译，
+        #: 就会出现「查一下、答一下」的幽灵清单；不可用的工具事件必须在这里丢掉。
+        self._allow_todos = allow_todos
         # 主清单（顶层；子项在 tree() 里现挂）
         self._main: list[dict[str, str]] = []
         # (namespace, block 下标) → 这个块是不是 write_todos。下标按消息编号，所以必须
@@ -382,6 +455,11 @@ class V3Translator:
         """吃一条 v3 事件，吐出要下发的 SSE 事件（可能为空）。"""
         if method_of(event) != "messages":
             return []
+        trace: dict[str, str] = {}
+        if run_id := run_id_of(event):
+            trace["run_id"] = run_id
+        if parent_run_id := parent_run_id_of(event):
+            trace["parent_run_id"] = parent_run_id
         # 中间件内部的模型调用（摘要等）整条丢掉：它不是助手在对用户说话。丢在这里而
         # 不是 service 里，是因为「哪些事件算正文」是事件形状的知识，归这个模块；也顺带
         # 免了它那条 message-start 把主智能体的待办块登记清掉。
@@ -404,9 +482,15 @@ class V3Translator:
             self._on_block_start(namespace, payload)
             return []
         if name == "content-block-delta":
-            return self._on_block_delta(namespace, payload)
+            parts = self._on_block_delta(namespace, payload)
+            for part in parts:
+                part.update(trace)
+            return parts
         if name == "content-block-finish":
-            return self._on_block_finish(namespace, payload)
+            parts = self._on_block_finish(namespace, payload)
+            for part in parts:
+                part.update(trace)
+            return parts
         return []
 
     def note_delegation(self, event: dict) -> None:
@@ -607,6 +691,8 @@ class V3Translator:
         return None
 
     def _on_block_start(self, namespace: tuple[str, ...], payload: dict) -> None:
+        if not self._allow_todos:
+            return
         block = payload.get("content")
         if not isinstance(block, dict):
             return
@@ -650,7 +736,11 @@ class V3Translator:
 
             return [{"type": "ai", "content": text}]
         index = payload.get("index")
-        if delta.get("type") != "block-delta" or (namespace, index) not in self._todo_blocks:
+        if (
+            not self._allow_todos
+            or delta.get("type") != "block-delta"
+            or (namespace, index) not in self._todo_blocks
+        ):
             return []
         args = (delta.get("fields") or {}).get("args")
         if not isinstance(args, str):
@@ -673,7 +763,10 @@ class V3Translator:
         return self._names.get(call_id) or "subagent"
 
     def _on_block_finish(self, namespace: tuple[str, ...], payload: dict) -> list[dict]:
-        if (namespace, payload.get("index")) not in self._todo_blocks:
+        if (
+            not self._allow_todos
+            or (namespace, payload.get("index")) not in self._todo_blocks
+        ):
             return []
         items = finished_items(payload.get("content"))
         if items is None:

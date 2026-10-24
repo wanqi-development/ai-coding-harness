@@ -27,11 +27,9 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from ai_coding_harness.agent.middleware import BoundaryMiddleware
 from ai_coding_harness.agent.profiles import (
-    ANALYSIS_FORM,
     ORCHESTRATE_FORM,
     PLAN_FORM,
     QA_FORM,
-    REVIEW_FORM,
 )
 from ai_coding_harness.config import Settings
 from ai_coding_harness.safety.permissions import CommandSafety
@@ -63,12 +61,8 @@ class TestPolicyTable:
             ),
             # 出方案：与子智能体 planner 同形 —— 方案 storePlan 落库、结论进回复，一个文件都不落
             (PLAN_FORM, (), ("edit_file", "write_file")),
-            # 问答：一个文件都不落（与 planner 同形），清单工具也一并撤掉（提示词里那段也摘了）
-            (QA_FORM, (), ("write_todos", "write_file", "edit_file")),
-            # 分析：与 qa 同形，结论进回复，只留 tmp 放取证的中间产物；进度靠取证台账，
-            # 清单工具一并撤掉
-            (ANALYSIS_FORM, ("/ai_coding/tmp",), ("write_todos",)),
-            (REVIEW_FORM, ("/ai_coding/review",), ()),
+            # qa 合并原 analysis：结论进回复，只留 tmp 放取证台账。
+            (QA_FORM, ("/ai_coding/tmp",), ("write_todos", "write_file", "edit_file")),
             # 子智能体 planner 不写文件，写工具一并撤掉
             ("planner", (), ("edit_file", "write_file")),
             ("coder", ("/ai_coding/project", "/ai_coding/tmp"), ()),
@@ -154,6 +148,69 @@ class TestDirectoryRange:
         assert write_targets("write_file", {"file_path": ""}) is None
 
 
+class TestVerificationCommands:
+    """2026-10-20 用户口径：qa 允许跑测试与构建，但不改任务代码。
+
+    装依赖允许，但只能落在 ``/tmp`` 的仓库副本里 —— 项目目录里不留 node_modules /
+    lockfile 改动，「清理」是结构性的，不靠模型自觉。
+    """
+
+    @pytest.mark.parametrize("name", [QA_FORM])
+    def test_tests_and_builds_are_allowed(self, name):
+        policy = policy_for(name)
+        for command in ("pytest -q", "npm test", "npm run build", "mvn test", "python -c 'print(1)'"):
+            assert policy.check_tool("execute", {"command": command}) is None, command
+
+    @pytest.mark.parametrize("name", [QA_FORM])
+    def test_installing_is_only_allowed_inside_tmp(self, name):
+        policy = policy_for(name)
+        assert policy.check_tool("execute", {"command": "cd /tmp/verify && npm ci"}) is None
+        assert policy.check_tool("execute", {"command": "cd /tmp/verify && pip install -r req.txt"}) is None
+        # 没 cd：不知道落在哪，按项目目录算
+        assert policy.check_tool("execute", {"command": "npm ci"}) is not None
+        # 直接在仓库里装：留在项目里的依赖没人清理
+        assert (
+            policy.check_tool(
+                "execute", {"command": "cd /ai_coding/project/repo && npm install"}
+            )
+            is not None
+        )
+
+    @pytest.mark.parametrize("name", [QA_FORM])
+    def test_git_writes_and_in_place_fixes_are_blocked(self, name):
+        policy = policy_for(name)
+        for command in (
+            "git add -A",
+            "git commit -m x",
+            "git push origin main",
+            "git checkout -b x",
+            "git merge main",
+            "ruff check --fix .",
+            "npm run lint -- --fix",
+            "black .",
+        ):
+            assert policy.check_tool("execute", {"command": command}) is not None, command
+
+    def test_read_only_commands_still_pass(self):
+        policy = policy_for(QA_FORM)
+        for command in ("git log --oneline -5", "git diff", "black --check .", "ls -la"):
+            assert policy.check_tool("execute", {"command": command}) is None, command
+
+    def test_copying_the_repo_to_tmp_is_not_a_write_to_the_source(self):
+        """``cp`` 的源是只读的：只有目标是写。否则「先拷到 /tmp 再跑」会被自己挡住。"""
+        assert (
+            policy_for(QA_FORM).check_tool(
+                "execute", {"command": "cp -a /ai_coding/project/repo /tmp/verify"}
+            )
+            is None
+        )
+
+    def test_the_coder_keeps_its_write_powers(self):
+        policy = policy_for("coder")
+        assert policy.check_tool("execute", {"command": "git commit -m x"}) is None
+        assert policy.check_tool("execute", {"command": "npm install"}) is None
+
+
 class TestProtectedPaths:
     """凭据与平台资产：跟角色无关，谁都不许碰。"""
 
@@ -163,8 +220,6 @@ class TestProtectedPaths:
             ORCHESTRATE_FORM,
             PLAN_FORM,
             QA_FORM,
-            ANALYSIS_FORM,
-            REVIEW_FORM,
             "coder",
             "reviewer",
         ],
@@ -181,8 +236,6 @@ class TestProtectedPaths:
             ORCHESTRATE_FORM,
             PLAN_FORM,
             QA_FORM,
-            ANALYSIS_FORM,
-            REVIEW_FORM,
             "coder",
             "reviewer",
         ],

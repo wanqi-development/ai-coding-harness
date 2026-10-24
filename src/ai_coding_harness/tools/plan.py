@@ -20,7 +20,9 @@ from dataclasses import dataclass
 
 from langchain_core.tools import BaseTool, tool
 
+from ai_coding_harness.agent.turn_state import TurnState
 from ai_coding_harness.db import Database, dao
+from ai_coding_harness.tools.context import get_configurable
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,9 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
                 title=title,
             )
             plan_id = row.id
+        state = get_configurable("turn_state")
+        if isinstance(state, TurnState):
+            state.plan_id = plan_id
         return f"方案已写入（plan_id={plan_id}，共 {len(normalized)} 步）。"
 
     @tool
@@ -322,6 +327,9 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
             plan = await dao.get_unexecuted_plan(db, session_id=ctx.session_db_id)
             if plan is None:
                 return "没有未执行的方案。"
+            state = get_configurable("turn_state")
+            if isinstance(state, TurnState):
+                state.plan_id = plan.id
             return _format_plan(plan)
 
     @tool

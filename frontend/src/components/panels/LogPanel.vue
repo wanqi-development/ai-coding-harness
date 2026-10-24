@@ -14,7 +14,7 @@
  * - **下载给全**：面板里的按钮是指向接口的普通链接（服务端 `Content-Disposition` 管附件名），
  *   要看更早的那些行就从这儿拿走 —— 面板不追日志的 `.1`/`.2` 备份文件。
  */
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { getLogs, logsDownloadUrl, type LogPage } from '../../lib/api'
 
 const props = defineProps<{ sessionId: string }>()
@@ -34,9 +34,47 @@ const level = ref('')
 const keyword = ref('')
 /** 把 HTTP 请求行也算进来（默认不算：那是浏览器的轮询噪声，不是这个会话干的事） */
 const withHttp = ref(false)
+const treeMode = ref(true)
 const error = ref('')
 const loading = ref(false)
 const box = ref<HTMLElement | null>(null)
+
+type LogGroup = {
+  id: string
+  parent: string
+  lines: LogPage['lines']
+  children: LogGroup[]
+}
+
+const groupedLines = computed(() => {
+  const groups = new Map<string, LogGroup>()
+  const roots: LogGroup[] = []
+  for (const line of data.value?.lines ?? []) {
+    const id = line.run_id || ''
+    if (!id) {
+      roots.push({ id: '', parent: '', lines: [line], children: [] })
+      continue
+    }
+    let group = groups.get(id)
+    if (!group) {
+      group = { id, parent: line.parent_run_id || '', lines: [], children: [] }
+      groups.set(id, group)
+    }
+    group.lines.push(line)
+  }
+  for (const group of groups.values()) {
+    const parent = group.parent ? groups.get(group.parent) : undefined
+    if (parent) parent.children.push(group)
+    else roots.push(group)
+  }
+  const flat: Array<{ group: LogGroup; depth: number }> = []
+  const walk = (group: LogGroup, depth: number) => {
+    flat.push({ group, depth })
+    group.children.forEach((child) => walk(child, depth + 1))
+  }
+  roots.forEach((root) => walk(root, 0))
+  return flat
+})
 
 function rowClass(line: { level: string }): string {
   return line.level ? line.level.toLowerCase() : 'plain'
@@ -82,6 +120,7 @@ watch(
     keyword.value = ''
     level.value = ''
     withHttp.value = false
+    treeMode.value = true
     void load()
   },
   { immediate: true },
@@ -119,6 +158,11 @@ watch(
       含 HTTP 请求行
       <span class="log-toggle-hint">（默认不显示：那是浏览器轮询的噪声）</span>
     </label>
+    <label class="log-toggle">
+      <input v-model="treeMode" type="checkbox" />
+      按 run 父子层级展示
+      <span class="log-toggle-hint">（旧日志没有 run_id 时作为根节点）</span>
+    </label>
 
     <p v-if="error" class="repo-error">{{ error }}</p>
 
@@ -133,9 +177,32 @@ watch(
       </p>
       <!-- 只读展示：不选中、不换行截断，一行就是一行 -->
       <div v-else ref="box" class="log-body">
-        <div v-for="(line, i) in data.lines" :key="i" class="log-row" :class="rowClass(line)">
-          {{ line.text }}
-        </div>
+        <template v-if="treeMode">
+          <div
+            v-for="(item, i) in groupedLines"
+            :key="`${item.group.id}:${i}`"
+            class="log-run-group"
+            :style="{ paddingLeft: `${item.depth * 16}px` }"
+          >
+            <div v-if="item.group.id" class="log-run-head">
+              run {{ item.group.id }}
+              <span v-if="item.group.parent"> ← {{ item.group.parent }}</span>
+            </div>
+            <div
+              v-for="(line, j) in item.group.lines"
+              :key="j"
+              class="log-row"
+              :class="rowClass(line)"
+            >
+              {{ line.text }}
+            </div>
+          </div>
+        </template>
+        <template v-else>
+          <div v-for="(line, i) in data.lines" :key="i" class="log-row" :class="rowClass(line)">
+            {{ line.text }}
+          </div>
+        </template>
       </div>
     </template>
 
@@ -145,3 +212,14 @@ watch(
     </p>
   </div>
 </template>
+
+<style scoped>
+.log-run-group + .log-run-group { margin-top: 8px; }
+.log-run-head {
+  margin: 6px 0 3px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+</style>

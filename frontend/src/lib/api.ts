@@ -182,6 +182,9 @@ export interface LogLineItem {
   /** 打这行的 logger 名（认不出就是空串） */
   logger: string
   text: string
+  /** handoff 内层日志的 run 父子关系；根层日志为空串 */
+  run_id?: string
+  parent_run_id?: string
 }
 
 export interface LogPage {
@@ -198,18 +201,48 @@ export interface TodoItem {
   children?: TodoItem[]
 }
 
+/** handoff 内层通过 stream_writer 发上来的一个 run 事件。 */
+export interface RunTrace {
+  kind: string
+  node_kind: string
+  phase: 'start' | 'delta' | 'finish'
+  run_id: string
+  parent_run_id: string
+  root_run_id: string
+  agent?: string
+  name?: string
+  content?: string
+  status?: string
+  data?: any
+}
+
 /** 意图澄清弹窗里的一个候选；`intent` 由后端固定，label/description 是 qa 自由写的。 */
 export interface ClarificationOption {
-  intent: string
+  intent?: string
   label: string
   description?: string
+  value?: string
+}
+
+/** 多步澄清中的一页。第一步负责确定 intent，后续步骤补充业务口径。 */
+export interface ClarificationStep {
+  id: string
+  question: string
+  options: ClarificationOption[]
+}
+
+export interface ClarificationAnswer {
+  step_id: string
+  choice: number
 }
 
 /** SSE `clarification` 帧 / GET 待澄清接口的同一份载荷。 */
 export interface ClarificationInfo {
   id: string
-  question: string
-  options: ClarificationOption[]
+  /** 兼容旧后端的单题字段。 */
+  question?: string
+  options?: ClarificationOption[]
+  steps?: ClarificationStep[]
   allow_other?: boolean
 }
 
@@ -223,6 +256,7 @@ export interface ChatEvent {
     | 'usage'
     | 'changes'
     | 'clarification'
+    | 'run'
     | 'done'
     | 'error'
   content?: string
@@ -249,6 +283,8 @@ export interface ChatEvent {
    * 与 `usage` 一样贴在回复末尾：一条消息的**属性**，不是一段内容。
    */
   changes?: ChangesInfo
+  /** `run` 帧：handoff 内层事件，用 run_id / parent_run_id 挂在 run 树上。 */
+  run?: RunTrace
 }
 
 export async function listSessions(): Promise<SessionItem[]> {
@@ -753,11 +789,16 @@ export async function postChat(
   id: string,
   message: string,
   signal?: AbortSignal,
-  options?: { clarificationId?: string; choice?: number | string },
+  options?: {
+    clarificationId?: string
+    choice?: number | string
+    answers?: ClarificationAnswer[]
+  },
 ): Promise<Response> {
   const body: Record<string, unknown> = { message }
   if (options?.clarificationId) body.clarification_id = options.clarificationId
   if (options?.choice !== undefined) body.choice = options.choice
+  if (options?.answers?.length) body.answers = options.answers
   const resp = await fetch(`/chat/${id}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -879,10 +920,11 @@ async function readStream(
   resp: Response,
   onEvent: (ev: ChatEvent) => void,
   cursor: { last: number },
-): Promise<void> {
+): Promise<boolean> {
   const reader = resp.body!.getReader()
   const decoder = new TextDecoder()
   let buf = ''
+  let sawDone = false
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -911,32 +953,45 @@ async function readStream(
           continue
         }
         if (eventName === 'error') onEvent({ type: 'error', error: obj.error ?? 'unknown' })
-        else onEvent(obj as ChatEvent)
+        else {
+          const ev = obj as ChatEvent
+          if (ev.type === 'done') sawDone = true
+          onEvent(ev)
+        }
       }
     }
   } finally {
     reader.releaseLock()
   }
+  return sawDone
 }
 
-/** 读一条流；传输中断就带着游标重连一次（本轮跑完了也能接，服务端会把尾巴补完）。 */
+/**
+ * 读一条流；只有收到 `done` 才算成功结束。
+ *
+ * 长任务可能被代理或连接层以**正常 EOF** 截断。此时 `reader.read()` 不会抛错，
+ * 但本轮并没有完成；必须带着游标再接一次。两次都拿不到 `done` 时返回 false，
+ * 由调用方用持久化记录兜底，不能把半截流当完成。
+ */
 export async function consumeStream(
   id: string,
   first: Response,
   onEvent: (ev: ChatEvent) => void,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<boolean> {
   const cursor = { last: 0 }
   let resp = first
   for (let attempt = 0; ; attempt++) {
     try {
-      await readStream(resp, onEvent, cursor)
-      return
+      if (await readStream(resp, onEvent, cursor)) return true
     } catch (e) {
       // 用户自己点的终止：本地主动断的，不是传输故障 —— 再重连一次就白跑一个请求
       if (signal?.aborted) throw e
       if (attempt >= 1) throw e
       resp = await resumeChat(id, cursor.last, signal)
+      continue
     }
+    if (attempt >= 1) return false
+    resp = await resumeChat(id, cursor.last, signal)
   }
 }

@@ -13,6 +13,7 @@ import {
   postChat,
   resumeChat,
   type ChatEvent,
+  type ClarificationAnswer,
   type ClarificationInfo,
   type PlanInfo,
   type PlanStep,
@@ -22,8 +23,6 @@ import {
   type UsageContext,
   type UsageDetail,
   type ChangesInfo,
-  type FileChange,
-  getRepoDiff,
   type WorkspaceStatus,
 } from './lib/api'
 import { renderMarkdown } from './lib/markdown'
@@ -32,11 +31,15 @@ import LogPanel from './components/panels/LogPanel.vue'
 import PrPanel from './components/panels/PrPanel.vue'
 import UsagePanel from './components/panels/UsagePanel.vue'
 import RepoPanel from './components/panels/RepoPanel.vue'
+import ChangesPanel from './components/panels/ChangesPanel.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
 import ClarificationDialog from './components/ClarificationDialog.vue'
+import HandoffRun from './components/HandoffRun.vue'
 import { defaultPanelTab } from './lib/prefs'
 import { usePanelWidth } from './lib/splitter'
 import { splitLongText } from './lib/streamblocks'
+import { clarificationAnswerLabels, clarificationSteps } from './lib/clarification'
+import { applyRunTrace, createRunTree, type RunTree } from './lib/runs'
 import { shouldShowTodos } from './lib/todos'
 import { readView, watchView, writeView, type AppView, type SettingsPanel } from './lib/viewState'
 
@@ -54,6 +57,7 @@ type Part =
    * SSE 的 `plan` 事件，刷新后那条来自落库的 `type='plan'` 记录，两边形状一样。
    */
   | { kind: 'plan'; plan: PlanInfo }
+  | { kind: 'handoff'; tree: RunTree }
 
 interface Message {
   role: 'user' | 'assistant'
@@ -116,11 +120,19 @@ function toggleUsage(index: number) {
   usageOpen.value[index] = !usageOpen.value[index]
 }
 
-/** 「这一轮改了什么」的展开状态，同样按**绝对**下标记（与 token 明细一个口径）。 */
-const changesOpen = ref<Record<number, boolean>>({})
+/**
+ * 右栏里的「本轮改动」内嵌页：`null` ＝ 没开；有值 ＝ 盖在当前标签页上。
+ * 再点同一个角标会关掉它（返回原来的标签）。
+ */
+const changesPage = ref<ChangesInfo | null>(null)
 
-function toggleChanges(index: number) {
-  changesOpen.value[index] = !changesOpen.value[index]
+function openChanges(info: ChangesInfo) {
+  if (changesPage.value === info && !panelCollapsed.value) {
+    changesPage.value = null
+    return
+  }
+  changesPage.value = info
+  panelCollapsed.value = false
 }
 
 const REASONING_AGENT_LABEL: Record<string, string> = {
@@ -166,44 +178,6 @@ function changesSummary(info: ChangesInfo): string {
   return `改动 ${files} 个文件 · +${added} −${deleted}`
 }
 
-/** 状态码 → 一个字母（界面上那一位要窄）：新增 / 改 / 删 / 改名 / 其它。 */
-function changeMark(status: string): string {
-  const head = status.charAt(0).toUpperCase()
-  return { A: 'A', M: 'M', D: 'D', R: 'R' }[head] ?? head
-}
-
-/** 点一个文件：没加载过就现拉一次（服务端在本地缓存里算 + 脱敏 + 截断）。 */
-async function loadDiff(msg: Message, file: FileChange) {
-  if (file.diff !== undefined || file.diffState === '加载中…') return
-  const info = msg.changes
-  if (!info || !currentId.value) return
-  file.diffState = '加载中…'
-  try {
-    const result = await getRepoDiff(currentId.value, info.base, info.head, file.path)
-    file.diff = result.text
-    file.diffTruncated = result.truncated
-    file.diffState = ''
-  } catch (e: any) {
-    file.diffState = `读不到：${e?.message ?? e}`
-  }
-}
-
-/**
- * diff 正文按行拆开，好给 +/- 上色。
- *
- * 只做「加/删/位置/元信息」四类，不做行号也不做语法高亮 —— 这一块是**看改动**，
- * 不是编辑器；真要看代码上下文的去看右栏的代码面板。
- */
-function diffLines(text: string): { text: string; kind: string }[] {
-  return text.split('\n').map((line) => {
-    if (line.startsWith('+++') || line.startsWith('---')) return { text: line, kind: 'meta' }
-    if (line.startsWith('+')) return { text: line, kind: 'add' }
-    if (line.startsWith('-')) return { text: line, kind: 'del' }
-    if (line.startsWith('@@')) return { text: line, kind: 'hunk' }
-    if (line.startsWith('diff ') || line.startsWith('index ')) return { text: line, kind: 'meta' }
-    return { text: line, kind: 'ctx' }
-  })
-}
 
 /**
  * 这一轮跑了多久：`working… 12s` 的依据。
@@ -355,6 +329,26 @@ function pushPlan(parts: Part[], info: PlanInfo | null) {
   }
   if (at >= 0) (parts[at] as { kind: 'plan'; plan: PlanInfo }).plan = info
   else parts.push({ kind: 'plan', plan: info })
+}
+
+function pushRun(parts: Part[], trace: import('./lib/api').RunTrace) {
+  let part = parts.find(
+    (p): p is Extract<Part, { kind: 'handoff' }> =>
+      p.kind === 'handoff' && p.tree.root_id === (trace.root_run_id || trace.run_id),
+  )
+  if (!part) {
+    if (trace.node_kind !== 'handoff' || trace.phase !== 'start') return
+    part = { kind: 'handoff', tree: createRunTree(trace) }
+    parts.push(part)
+    return
+  }
+  applyRunTrace(part.tree, trace)
+}
+
+function handoffParts(m: Message): RunTree[] {
+  return m.parts
+    .filter((p): p is Extract<Part, { kind: 'handoff' }> => p.kind === 'handoff')
+    .map((p) => p.tree)
 }
 
 /** 落库那条方案记录 → 方案块。字段来自后端 `plan_payload`（extra 里带 plan_id/status/steps）。 */
@@ -545,11 +539,21 @@ function statusClass(status: string): string {
 
 /** 历史记录 → 块序列：有落库的 parts 就按它回放，没有（纯正文回合）退回 content。 */
 function partsOf(r: { content: string | null; summary: string | null; extra: any }): Part[] {
+  // 澄清轮的最终产物是结构化弹窗 + 一句问题。旧记录曾把原始 <CLARIFY> 和
+  // 伪待办塞进 parts；这里以 content 为准，不能让历史脏数据重新覆盖正文。
+  if (r.extra?.clarification) {
+    return [{ kind: 'text', content: r.content || r.extra.clarification.question || '' }]
+  }
   const saved = r.extra?.parts
   if (Array.isArray(saved) && saved.length) {
-    return saved.map((p: any): Part => {
-      if (p?.kind === 'todos') return { kind: 'todos', items: todoItems(p.items) }
-      return { kind: 'text', content: String(p?.content ?? '') }
+    return saved.flatMap((p: any): Part[] => {
+      if (p?.kind === 'todos') return [{ kind: 'todos', items: todoItems(p.items) }]
+      if (p?.kind === 'handoff' && Array.isArray(p.events) && p.events.length) {
+        const tree = createRunTree(p.events[0])
+        for (const event of p.events.slice(1)) applyRunTrace(tree, event)
+        return [{ kind: 'handoff', tree }]
+      }
+      return [{ kind: 'text', content: String(p?.content ?? '') }]
     })
   }
   return [{ kind: 'text', content: r.content || r.summary || '' }]
@@ -1154,8 +1158,21 @@ const panelTabs = computed<
   { key: 'usage', label: 'Token' },
 ])
 
-/** 点竖标签：切过去并展开（收起状态下点一下就展开到那个标签）。 */
+/**
+ * 点竖标签：切过去并展开；**再点当前标签＝收起**（2026-10-21 用户口径）。
+ * 「本轮改动」内嵌页开着时，点任意标签先关掉那一页、再切过去。
+ */
 function selectTab(tab: 'code' | 'memory' | 'pulls' | 'logs' | 'usage') {
+  if (changesPage.value) {
+    changesPage.value = null
+    rightTab.value = tab
+    panelCollapsed.value = false
+    return
+  }
+  if (tab === rightTab.value && !panelCollapsed.value) {
+    panelCollapsed.value = true
+    return
+  }
   rightTab.value = tab
   panelCollapsed.value = false
 }
@@ -1349,6 +1366,8 @@ function attachStream(msg: Message) {
     } else if (ev.type === 'plan') {
       // 后端每次推的都是全量快照：同一份方案只占一块，就地替换（`plan: null` = 方案被删）
       pushPlan(msg.parts, ev.plan ?? null)
+    } else if (ev.type === 'run' && ev.run) {
+      pushRun(msg.parts, ev.run)
     } else if (ev.type === 'usage') {
       // 本轮的账：后端落在正文之后发，所以它天然贴在回复末尾。不参与「正文/待办」的块序列
       // —— 它是这条消息的**属性**，不是一段内容（渲染在时间那一行上面）。
@@ -1374,8 +1393,14 @@ function attachStream(msg: Message) {
  */
 async function runStream(id: string, resp: Response, msg: Message, signal?: AbortSignal) {
   const { onEvent, flush, append } = attachStream(msg)
+  const previousAssistantId =
+    [...messages.value]
+      .reverse()
+      .find((item) => item !== msg && item.role === 'assistant' && item.recordId)?.recordId ?? 0
+  let completed = false
+  let persisted: Message | null = null
   try {
-    await consumeStream(
+    completed = await consumeStream(
       id,
       resp,
       (ev) => {
@@ -1391,10 +1416,31 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
     if (stopping.value && currentId.value === id) append(`\n\n${TERMINATED}`)
     // 收尾必须刷一次，否则最后一批会卡在定时器里
     flush()
+    // 数据库是这一轮的最终事实来源：正常拿完 done 后回填持久化记录；没拿到 done
+    // 时也先查一次，能查到说明后端其实已经完成，只是最后几帧没送达。
+    try {
+      const page = await getRecords(id)
+      persisted =
+        [...page.items]
+          .reverse()
+          .filter((item) => item.type === 'assistant' && item.id > previousAssistantId)
+          .map(recordToMessage)
+          .find((item): item is Message => item !== null) ?? null
+    } catch {
+      persisted = null
+    }
+    if (persisted) {
+      const at = messages.value.indexOf(msg)
+      if (at >= 0) messages.value[at] = persisted
+    } else if (!completed && !stopping.value && currentId.value === id) {
+      append('\n\n[连接在完成帧前中断，本轮可能仍在后台运行。请刷新页面接回。]')
+    }
     // AI 那条的时间＝流结束时刻（失败/中断也补上，否则这条会一直没有时间）
-    msg.at = new Date().toISOString()
-    // 计时收尾：从开跑那一刻算起，冻结下来（之后刷新回放也照实显示这个数）
-    if (msg.startedAt) msg.elapsedMs = Date.now() - msg.startedAt
+    if (!persisted) {
+      msg.at = new Date().toISOString()
+      // 计时收尾：从开跑那一刻算起，冻结下来（之后刷新回放也照实显示这个数）
+      if (msg.startedAt) msg.elapsedMs = Date.now() - msg.startedAt
+    }
     if (currentId.value === id) {
       loading.value = false
       scrollToBottom()
@@ -1438,10 +1484,14 @@ function quickAct(text: string) {
   void send()
 }
 
-async function sendTurn(choice?: { info: ClarificationInfo; index: number }) {
-  const picked = choice ? choice.info.options[choice.index] : null
+async function sendTurn(choice?: { info: ClarificationInfo; answers: ClarificationAnswer[] }) {
+  const pickedLabels = choice
+    ? clarificationAnswerLabels(choice.info, choice.answers)
+    : []
   const text = choice ? '' : input.value.trim()
-  const displayText = choice ? `选择：${picked?.label ?? '澄清选项'}` : text
+  const displayText = choice
+    ? `选择：${pickedLabels.join('；') || '澄清选项'}`
+    : text
   if ((!choice && !text) || !currentId.value || loading.value) return
   // 工作区没好就不发（输入框此时也是禁用的，这里兜住其它触发路径）
   if (!workspaceReady.value) return
@@ -1470,7 +1520,12 @@ async function sendTurn(choice?: { info: ClarificationInfo; index: number }) {
       id,
       text,
       controller.signal,
-      choice ? { clarificationId: choice.info.id, choice: choice.index } : undefined,
+      choice
+        ? {
+            clarificationId: choice.info.id,
+            answers: choice.answers,
+          }
+        : undefined,
     )
   } catch (e: any) {
     if (streamAbort === controller) streamAbort = null
@@ -1508,12 +1563,14 @@ async function send() {
   await sendTurn()
 }
 
-function chooseClarification(index: number) {
+function submitClarification(answers: ClarificationAnswer[]) {
   const info = clarification.value
   if (!info || clarificationBusy.value) return
+  const expected = clarificationSteps(info).length
+  if (!expected || answers.length !== expected) return
   clarification.value = null
   clarificationBusy.value = true
-  void sendTurn({ info, index }).finally(() => {
+  void sendTurn({ info, answers }).finally(() => {
     clarificationBusy.value = false
   })
 }
@@ -1743,6 +1800,12 @@ onUnmounted(() => {
               <template v-if="m.elapsedMs">用时 {{ elapsedLabel(m) }}</template>
               <template v-else>working<span class="working-dots">…</span> {{ elapsedLabel(m) }}</template>
             </p>
+            <HandoffRun
+              v-for="(run, ri) in handoffParts(m)"
+              :key="`${ri}:${run.root_id}`"
+              :node="run.root"
+              :tree="run"
+            />
             <!-- 运行中思考与正文按到达顺序交错：连续的正文块仍合成一个气泡（分组规则见
                  flowEntries），思考块浅色、始终展开；跑完隐藏思考、只留正文。
                  流式期间正文按纯文本显示（不解析 Markdown），任务结束后整组一次性渲染。 -->
@@ -1874,38 +1937,16 @@ onUnmounted(() => {
           <div
             v-if="m.changes"
             class="msg-changes"
-            :class="{ open: changesOpen[hiddenCount + i] }"
+            :class="{ open: changesPage === m.changes }"
           >
             <button
               class="msg-changes-badge"
-              :title="changesOpen[hiddenCount + i] ? '收起改动' : '展开改动'"
-              @click="toggleChanges(hiddenCount + i)"
+              :title="changesPage === m.changes ? '收起改动' : '在右侧查看本轮改动'"
+              @click="openChanges(m.changes)"
             >
               <span class="msg-changes-dot"></span>
               {{ changesSummary(m.changes) }}
             </button>
-            <ul v-if="changesOpen[hiddenCount + i]" class="msg-changes-list">
-              <li v-for="file in m.changes.files" :key="file.path" class="msg-change">
-                <button class="msg-change-head" @click="loadDiff(m, file)">
-                  <span class="msg-change-mark" :data-status="changeMark(file.status)">
-                    {{ changeMark(file.status) }}
-                  </span>
-                  <span class="msg-change-path">{{ file.path }}</span>
-                  <span class="msg-change-count">+{{ file.added }} −{{ file.deleted }}</span>
-                </button>
-                <p v-if="file.diffState" class="msg-change-note">{{ file.diffState }}</p>
-                <template v-else-if="file.diff !== undefined">
-                  <pre class="msg-change-diff"><span
-                    v-for="(line, li) in diffLines(file.diff)"
-                    :key="li"
-                    :class="`d-${line.kind}`"
-                  >{{ line.text + '\n' }}</span></pre>
-                  <p v-if="file.diffTruncated" class="msg-change-note">
-                    改动太长，只显示前一段
-                  </p>
-                </template>
-              </li>
-            </ul>
           </div>
           <div
             v-if="showUsage && m.role === 'assistant' && m.usage"
@@ -2146,9 +2187,19 @@ onUnmounted(() => {
 
       <div v-if="!panelCollapsed" class="panel-body">
 
-        <!-- 计划：有方案才渲染 -->
+        <!-- 本轮改动：从聊天流的角标点进来的内嵌页（盖在当前标签上，不占竖标签） -->
+        <ChangesPanel
+          v-if="changesPage"
+          :session-id="currentId"
+          :changes="changesPage"
+          @close="changesPage = null"
+        />
         <!-- 代码：本机那份只读缓存（与沙箱无关）。方案不再是标签 —— 它进了聊天流 -->
-        <RepoPanel v-if="activeTab === 'code'" :session-id="currentId" :target="codeTarget" />
+        <RepoPanel
+          v-else-if="activeTab === 'code'"
+          :session-id="currentId"
+          :target="codeTarget"
+        />
         <!-- 记忆：StoreBackend 上那份仓库记忆（只读；正文由 coding / review 收尾写） -->
         <MemoryPanel v-else-if="activeTab === 'memory'" :session-id="currentId" />
         <!-- PR：本仓库的 PR 列表（查不到会显示成错误，不是空列表） -->
@@ -2178,7 +2229,7 @@ onUnmounted(() => {
       v-if="clarification"
       :info="clarification"
       :busy="clarificationBusy"
-      @choose="chooseClarification"
+      @submit="submitClarification"
       @other="otherClarification"
       @close="clarification = null"
     />

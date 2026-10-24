@@ -28,6 +28,7 @@ from ai_coding_harness.agent.middleware import (
     LoopGuardMiddleware,
     MemoryMiddleware,
     ModelRedactionMiddleware,
+    PlanRecoveryMiddleware,
     ReadGuardMiddleware,
     RedactionMiddleware,
     StreamUsageMiddleware,
@@ -72,6 +73,7 @@ def build_agent(
     safety: CommandSafety | None = None,
     fallback: FallbackMiddleware | None = None,
     memory: MemoryMiddleware | None = None,
+    plan_recovery: PlanRecoveryMiddleware | None = None,
     summarization: AgentMiddleware | None = None,
     subagents: list[SubAgent] | None = None,
     skills: list[str] | None = None,
@@ -109,6 +111,8 @@ def build_agent(
         middleware=[
             # 放在我们这批的最外侧：越界的调用要在别的中间件动手之前就被拒掉
             BoundaryMiddleware(policy, safety),
+            # 进入编码主控时先回收上一轮遗留的 executing 方案；正常退出时再兜底收口。
+            *([plan_recovery] if plan_recovery is not None else []),
             # 紧接着的这块答的是「本轮看不看得到仓库记忆」：闸门那条路在 before_agent
             # 就抛 TurnStop 结束本轮，它一响，下面这些中间件与模型都不会被碰到
             *([memory] if memory is not None else []),

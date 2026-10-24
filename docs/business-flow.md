@@ -35,27 +35,19 @@ flowchart TD
 
     C0["③ ensure_runtime：重连或新建沙箱 + 按需续期"] --> C1{"工作区可用？"}
     C1 -->|"不可用"| C2["error 帧：代码工作区不可用<br/>(前端可点重试)"]
-    C1 -->|"可用"| C3{"本轮意图是直接执行？"}
+    C1 -->|"可用"| C3["本轮意图已判定并通过状态闸门"]
     C2 --> Z2["结束：done"]
-    C3 -->|"是（sync）"| D0["④ sandbox：没有 .git 就 git clone，<br/>有就 git pull"]
-    C3 -->|"否"| E0
-
-    D0 --> D1["记 assistant 记录（extra.direct = true）"]
-    D1 --> Z3["结束：done"]
-
-    E0["⑤ profile_for(intent) → 形态<br/>取（或按形态建）本会话的智能体"] --> E1["每轮中间件：记忆注入 + 记忆闸门（见 §三）"]
-    E1 --> E2{"闸门放行？"}
-    E2 -->|"拦下"| E3["TurnStop：写中断标记与提示<br/>(这一轮不跑模型)"]
-    E2 -->|"放行"| E4["边界中间件按形态裁工具<br/>越界调用直接拒"]
-    E3 --> Z4["结束：done（带提示）"]
+    C3 --> E0["⑤ profile_for(intent) → 形态<br/>加载仓库记忆并注入"]
+    E0 --> E4
+    E4["边界中间件按形态裁工具<br/>越界调用直接拒"]
     E4 --> E5["astream_events：模型 ↔ 工具 循环<br/>(循环守卫 / 错误兜底 / 脱敏)"]
     E5 --> F1{"本轮形态挂子智能体？<br/>(coding / rework)"}
     F1 -->|"挂：派子智能体"| F2["planner → coder → reviewer（见 §四）"]
-    F1 -->|"不挂"| F3["主控自己干：<br/>qa 作答 / analysis 分析 / plan 出方案 / review 审 PR"]
+    F1 -->|"不挂"| F3["主控自己干：<br/>qa 问答 / 解释 / 排查，或 plan 出方案"]
 
     F2 --> G0
     F3 --> G0
-    G0["⑥ 把正文与待办落库（assistant 记录）"] --> G1{"本轮形态要沉淀记忆？<br/>(coding / rework / review / analysis)"}
+    G0["⑥ 把正文与待办落库（assistant 记录）"] --> G1{"本轮形态要沉淀记忆？<br/>(coding / rework)"}
     G1 -->|"要"| G2["轮末打底：按 Gitee 实况刷新记忆<br/>(文件头 / PR 状态 / 摘老表)"]
     G1 -->|"不要"| G3["不动记忆"]
     G2 --> Z5["结束：done（前端渲染这一轮）"]
@@ -73,42 +65,37 @@ flowchart TD
 
 ## 二、分叉：意图怎么定
 
-四关顺序不可颠倒（`server/intent.py`），因为「这轮该给谁干」直接决定工具子集与角色提示词：
+先按仓库状态收口候选，再走四关（`server/intent.py`）：
 
 | 关 | 判据 | 说明 |
 | --- | --- | --- |
-| 1. 口令直通 | 强关键字命中即定，**不调任何模型** | 「出方案」「实施」「按评审意见修改」「同步仓库」「刷新仓库记忆」…`sync` **只能**从这一关产出（它是直接执行路径，误判后果不是少条指令） |
-| 2. JEV（SystemOne） | 口令没命中时问它：一个 `Choice` 问题、6 个候选意图（**不含 sync**） | 2026-09-27 起的主判定器；拿回选项 + 置信度 + 各候选概率，都进日志（`source=jev`）。自然措辞（「就按这个改吧」）与泛词歧义（「实现」「分析」）在这一关解决 |
+| 0. 状态候选 | 查最近 10 条 PR + 完整 open PR；先同步 PR 表 / 记忆再分类 | 外部或归属未知的 open PR 直接停止；无 open PR：`qa / plan / coding`；有 Agent open PR：`qa / rework`；查询失败：`qa` |
+| 1. 口令直通 | 强关键字命中且属于候选集，**不调任何模型** | 「出方案」「实施」「按评审意见修改」等；候选外强口令交给函数闸门拦截 |
+| 2. JEV（SystemOne） | 口令没命中时问它，`Choice` 只列本轮候选 | 拿回选项 + 置信度 + 各候选概率，都进日志（`source=jev`） |
 | 3. 大模型判定 | JEV 没配 / 超时 / 报错 / 回了认不出的标签 | 退回原来那套「让对话模型回一个词 + 一句理由」的判定（`source=llm`） |
-| 4. 回落关键字 | 两个模型都判不出来 | 退回纯关键字口径（强 + 弱 + 排除词）；**关键字也没命中就是 `coding`**（2026-09-27 起，此前是 `qa`） |
+| 4. 回落关键字 | 模型都判不出来 | 仍受候选集限制；无 PR 时优先 coding，有 PR 时默认 qa |
 
 形状与工具子集（`agent/profiles.py` + `tools/register.py`）：
 
 | 意图 | 形态 | 子智能体 | 主控特有的工具 |
 | --- | --- | --- | --- |
-| `qa` | `qa` | —— | `get_pr_info`、`list_pr_comments` |
-| `analysis`（也接「刷新 / 更新仓库记忆」） | `analysis` | —— | `get_pr_info`、`list_pr_comments`、`save_repo_memory` |
+| `qa` | `qa` | —— | `get_pr_info`、`list_pr_comments`；可写 tmp 取证台账 |
 | `plan` | `plan` | —— | `get_pr_info`、`storePlan`、`getPlan`、`updatePlan`、`updatePlanSteps`、`deletePlan` |
-| `review` | `review` | —— | `get_pr_info`、`list_pr_comments`、`comment_pr`、`save_repo_memory` |
 | `coding` | `orchestrate` | planner / coder / reviewer | `get_pr_info`、`list_pr_comments`、`comment_pr`、`close_pr`、`save_repo_memory` |
-| `rework`（按评审意见改） | `orchestrate`（与 `coding` 共用装配） | 同上 | 同上 |
-| `sync` | —— | —— | **不经智能体**，直接执行 |
+| `rework`（PR 跟进） | `orchestrate`（与 `coding` 共用装配） | 同上 | 同上 |
 
 ---
 
-## 三、分叉：记忆闸门（开工前）
+## 三、PR 同步与函数闸门
 
-挂在 `plan` / `orchestrate` 两个主控形态上（`agent/middleware/memory.py`），**拦不拦按本轮意图判**：
+轮首查最近 10 条全部状态 PR 与完整 open PR：前者用于记忆，新于记忆水印的 PR 用一次模型调用
+批量摘要；后者用于 `pull_requests` 归属、方案关联、评论状态和工作区同步。已有 PR 按平台状态
+对账，有变化就真实写回 StoreBackend。coding / rework 轮末再走同一套同步。
 
-| 本轮意图 | 有未合入 PR | 没有未合入 PR |
-| --- | --- | --- |
-| `plan` / `coding` | **拦**：写清待合并清单，等人工合并后再来 | 放行 |
-| `rework` | 放行（要改的就是那份开着的 PR） | **拦**：没有可修的对象 |
-| `review` | 放行（要审的那个 PR 本身就是 open 的） | 放行 |
-
-两个前提：① **查不到（Gitee 失败）= 拦下且一个字不写**（「查不到」既不能当成「有」，也不能当成「没有」）；
-② **记忆里没有要核对的 PR 就不查**（省一次 Gitee 往返，判据先看记忆里记着的待合并 PR）——
-唯一例外是从没写过记忆的仓库，那一档仍查一次。
+外部 / 归属未知的 open PR 在意图分类前直接停下，并提示用户先处理。其余情况在意图判定后由
+`gate_intent_for_state` 放行或停下：待合并 PR 拦 `coding / plan`，放行 `qa / rework`。
+rework 有唯一目标或用户明确写 `#N` 时，平台先把工作区安全同步到 PR 最新 `head_sha`。
+`MemoryMiddleware` 只负责加载同步后的记忆并注入。
 
 ---
 
@@ -127,8 +114,9 @@ flowchart LR
     C --> R["reviewer：读 diff → 分级问题清单 → comment_pr 回评"]
     R --> S["主控：把审查结论原样呈给用户"]
     S --> T{"用户决定"}
-    T -->|"点名要修的问题"| K["rework：派 coder 在同一分支改<br/>→ push 更新 PR → 逐条回评"]
-    K --> S
+    T -->|"点名要修的问题"| K["rework：派 coder 在同一分支改<br/>→ push 更新 PR"]
+    K --> K2["再派 reviewer 复查一次"]
+    K2 --> S
     T -->|"不动了"| E["结束：等人工在 Gitee 合并"]
 ```
 
@@ -271,10 +259,9 @@ sequenceDiagram
 
 | 时机 | 谁做 | 动什么 |
 | --- | --- | --- |
-| 每个主控轮**开工前** | 平台（`MemoryMiddleware`） | 文件头（最后更新 / 最近 PR）、按 Gitee 实况把「待合并」改成「已合并 / 已关闭」、摘掉老模板的两张表；**没要核对的 PR 就不查** |
-| coding / review / analysis **收尾** | 模型（`save_repo_memory`） | 「仓库基本信息」（变了才改）、「变更记录」（本轮 PR）、「当前缺口」（按模块） |
-| coding / review / rework / analysis **轮末** | 平台（`_refresh_repo_memory` 打底） | 再按 Gitee 实况刷一遍文件头与 PR 状态 |
-| 用户点名「刷新 / 更新仓库记忆」 | 模型（走 `analysis` 意图） | 先 `get_pr_info(state="all")` 拉全量 → 把记忆里**没有的 PR 补进「变更记录」** → 整篇写回 |
+| 每轮**开工前** | 平台（`repo_state` / `repo_memory_sync`） | 查最近 10 条全部 PR 与完整 open PR；同步 PR 归属 / head 水位，新增 PR 批量摘要，已有 PR 修正状态 |
+| coding / rework **收尾** | 模型（`save_repo_memory`） | 「仓库基本信息」（变了才改）、「变更记录」（本轮 PR）、「当前缺口」（按模块） |
+| coding / rework **轮末** | 平台（`_refresh_repo_memory`） | 再走同一套最近 10 条 + open 全量同步，并更新 PR 表与记忆 |
 
 「当前缺口」是下一轮「该做什么」的唯一出处；「变更记录」以 PR 为角度（一次改动一定带着一个 PR，
 PR 没建成就不写这条）。

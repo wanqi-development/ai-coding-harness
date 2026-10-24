@@ -472,22 +472,38 @@ class ChatRequest(BaseModel):
     message: str = ""
     #: 前端点候选时回传；为空表示普通消息（普通消息会立刻让旧澄清失效）。
     clarification_id: str | None = None
-    #: 候选下标（0 开始）或 ``"other"``。
+    #: 旧版单题候选下标（0 开始）或 ``"other"``；新前端使用 ``answers``。
     choice: int | str | None = None
+    #: 多步澄清的全部答案；每一步都必须给一个 choice。
+    answers: list[ClarificationAnswer] | None = None
 
 
 class ClarificationOption(BaseModel):
-    intent: str
+    intent: str = ""
     label: str
     description: str = ""
+    value: str = ""
+
+
+class ClarificationStep(BaseModel):
+    id: str
+    question: str
+    options: list[ClarificationOption] = Field(default_factory=list)
+
+
+class ClarificationAnswer(BaseModel):
+    step_id: str
+    choice: int
 
 
 class ClarificationInfo(BaseModel):
     """SSE ``clarification`` 帧 / GET 待澄清接口的同一份结构。"""
 
     id: str
-    question: str
+    #: 兼容旧前端：第一页的问题与候选。
+    question: str = ""
     options: list[ClarificationOption] = Field(default_factory=list)
+    steps: list[ClarificationStep] = Field(default_factory=list)
     allow_other: bool = True
 
 

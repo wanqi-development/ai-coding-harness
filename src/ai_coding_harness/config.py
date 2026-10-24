@@ -44,12 +44,11 @@ class ModelConfig:
 #: 「模型配置」界面上的行：稳定键 → 中文名（2026-10-13 用户口径：按**智能体**配，名字用中文）。
 #: 接口按这张表下发，前端不自己映射 —— 免得两处各写一份中文、漂了还看不出来。
 #: 三个子智能体（planner / coder / reviewer）不各占一行：planner 复用「方案」、
-#: reviewer 复用「审查」、coder 单占「编码」（见 ``agent/llm._AGENT_KEY``）。
+#: reviewer 复用「评审」、coder 单占「编码」（见 ``agent/llm._AGENT_KEY``）。
 MODEL_AGENT_ROWS: tuple[tuple[str, str], ...] = (
     ("qa", "问答"),
-    ("analysis", "分析"),
     ("plan", "方案"),
-    ("review", "审查"),
+    ("review", "评审"),
     # 「编码」是一主三从：主控与 coder 各占一行（2026-10-14 用户口径），
     # 另外两个角色**复用已有的两行** —— planner 用「方案」、reviewer 用「审查」
     # （见 ``agent/llm._AGENT_KEY``），所以这里不再为它们各开一行。
@@ -73,7 +72,6 @@ MODEL_SECTIONS: tuple[tuple[str, str], ...] = (
 )
 MODEL_AGENT_SECTION: dict[str, str] = {
     "qa": "agents",
-    "analysis": "agents",
     "plan": "agents",
     "review": "agents",
     "coding": "agents",
@@ -87,9 +85,8 @@ MODEL_AGENT_SECTION: dict[str, str] = {
 #: 每一行**服务哪些角色**（口径与 ``agent/llm._AGENT_KEY`` 同一份事实，反着写一遍给界面用）
 MODEL_AGENT_ROLES: dict[str, tuple[str, ...]] = {
     "qa": ("qa",),
-    "analysis": ("analysis",),
     "plan": ("plan", "planner"),
-    "review": ("review", "reviewer"),
+    "review": ("reviewer",),
     "coding": ("orchestrate",),
     "coder": ("coder",),
     "unified": ("*",),
@@ -121,9 +118,8 @@ MODEL_AGENT_PROVIDER_LOCK: dict[str, str] = {"jev": "typesafe"}
 #: ``fallback`` / ``jev`` 不在表里：它们不是主模型，没有「生效值」这一说。
 MODEL_AGENT_EFFECTIVE_ROLE: dict[str, str] = {
     "qa": "qa",
-    "analysis": "analysis",
     "plan": "plan",
-    "review": "review",
+    "review": "reviewer",
     "coding": "orchestrate",
     "coder": "coder",
     # 「统一模型」那一行看的是**它自己**：拿 orchestrate 去算会让它显示成「编码主控」的模型
@@ -480,19 +476,25 @@ class Settings(BaseSettings):
     # 2026-10-14 起可以在设置页改（常量仍留着当默认值与它的出处）。
     fallback_context_window: int = FALLBACK_CONTEXT_WINDOW
 
-    # 工具裁剪（2026-10-17 用户口径：**不要常规剪裁**）：只在**压缩线**做一次应急裁剪，
-    # 保留「当前这一步」和模型工作笔记 KEEP 点名的工具返回，其余换成带身份占位符；
-    # 剪完低于压缩线就不摘要，仍高于才压。只改这一次请求（见 middleware/context_trim.py）。
+    # 工具裁剪（2026-10-22）：只在**压缩线**生成持久化投影事件。事件只存 tool_call_id，
+    # 原始消息仍在 checkpoint；每次模型调用动态应用。没有新增可裁项时直接摘要。
     context_trim_enabled: bool = os.getenv("CONTEXT_TRIM_TOOL_RESULTS", "true").strip().lower() in (
         "1",
         "true",
         "yes",
     )
-    # 应急裁剪时连工具**入参**一起清（edit_file 的 old/new、write_file 的整份文件）：
-    # 2026-10-20 起**默认开** —— 真机上 54 次 edit 的正文一直留在历史里，每次调用都重发；
-    # 被裁掉的都是「旧步骤」，当前步骤与 KEEP 点名的结果不在清理范围。
+    # 历史工具入参的选择性压缩：只压超大字符串字段、保留路径与调用参数结构。
+    # 2026-10-22 起默认关：旧实现把整个 args 清成 {}，真机上出现了 `read_file 参数={}`。
     context_trim_clear_inputs: bool = (
-        os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "true").strip().lower() in ("1", "true", "yes")
+        os.getenv("CONTEXT_TRIM_CLEAR_INPUTS", "false").strip().lower() in ("1", "true", "yes")
+    )
+    # 工具结果低于这个字符数不裁：普通命令输出／短状态值留着，避免占位符比原文还长。
+    context_pretrim_min_result_chars: int = int(
+        os.getenv("CONTEXT_PRETRIM_MIN_RESULT_CHARS", "2000")
+    )
+    # 历史工具入参中的单个字符串低于这个字符数不压；只对大文件正文 / patch / 长命令生效。
+    context_pretrim_min_arg_chars: int = int(
+        os.getenv("CONTEXT_PRETRIM_MIN_ARG_CHARS", "2000")
     )
 
     # 压缩（摘要）：什么时候压 / 压完留多少 / 摘要那次调用最多吃多少。三件都在这组里，
@@ -606,17 +608,7 @@ class Settings(BaseSettings):
     #: 追问量约 10%”的折中。
     intent_clarify_confidence: float = 0.55
     # 分类时附带的历史用户消息条数（指代要靠它，如「就按你说的弄」）
-    intent_history_turns: int = 4
-    # 影子路由器（2026-10-17 原型）：把一句话拆成正交维度并记 ``INTENT_ROUTER``，
-    # **不采用它的建议、不改变本轮形态**。默认关；打开后每轮多一次分类模型调用，
-    # 但跑在独立 task 里，不影响本轮返回。
-    intent_router_shadow: bool = (
-        os.getenv("INTENT_ROUTER_SHADOW", "false").strip().lower()
-        in ("1", "true", "yes")
-    )
-    intent_router_timeout_seconds: float = float(
-        os.getenv("INTENT_ROUTER_TIMEOUT_SECONDS", "5")
-    )
+    intent_history_turns: int = 3
 
     # JEV（SystemOne，决策型模型）做意图判定 —— 二选一里的另一侧（见 server/intent.py）：
     # 口令 → **JEV** → 关键字口径。凭据来自界面上的「意图识别（JEV）」那一行
@@ -739,8 +731,8 @@ class Settings(BaseSettings):
     # 与平台**无关**：一个会话只装一个令牌，沙箱侧不必知道它来自 Gitee 还是 GitHub ——
     # 平台差异留在工具层（见 tools/git.py 的 build_git_client）。
     sandbox_git_token_env: str = "GIT_TOKEN"
-    # 注入沙箱的 git 认证用户名变量名（Gitee OAuth 用 oauth2、GitHub 用 x-access-token、
-    # PAT 场景用真实用户名；默认值由 codeplatform.Platform.default_git_username 给）
+    # 注入沙箱的 git 认证用户名变量名（默认 oauth2 / x-access-token，PAT 也可填真实用户名；
+    # 默认值由 codeplatform.Platform.default_git_username 给）
     sandbox_git_username_env: str = "GIT_USERNAME"
     # 沙箱创建后由应用经 `execute` 执行的初始化脚本（由 sandbox/deploy/sandbox/setup.sh
     # 推入，读沙箱内 `$GIT_TOKEN` 写 `.secrets`；必须不阻塞，勿含 `exec tail`）
@@ -807,7 +799,7 @@ class Settings(BaseSettings):
         )
 
     def username_for(self, platform: Platform) -> str:
-        """该平台配置里的 git 用户名（PAT 场景用真实用户名，OAuth 场景留空走默认）。"""
+        """该平台配置里的 git 用户名；留空走平台默认值。"""
         return (
             self.github_username if platform is Platform.GITHUB else self.gitee_username
         )

@@ -538,7 +538,7 @@ class TestBuildFallback:
         rows["fallback"] = ModelConfig(model="deepseek-v4-pro", api_key="", base_url="")
 
         with caplog.at_level(logging.WARNING):
-            assert build_fallback(_settings(agent_models=rows), role="review") is None
+            assert build_fallback(_settings(agent_models=rows), role="reviewer") is None
 
         assert [r for r in caplog.records if "兜底模型" in r.getMessage()]
 
