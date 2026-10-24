@@ -69,7 +69,7 @@ flowchart TD
 
 | 关 | 判据 | 说明 |
 | --- | --- | --- |
-| 0. 状态候选 | 每轮查一次全量 PR；先同步记忆再分类 | 无 open PR：`qa / plan / coding`；有 open PR：`qa / rework`；查询失败：`qa` |
+| 0. 状态候选 | 查最近 10 条 PR + 完整 open PR；先同步 PR 表 / 记忆再分类 | 外部或归属未知的 open PR 直接停止；无 open PR：`qa / plan / coding`；有 Agent open PR：`qa / rework`；查询失败：`qa` |
 | 1. 口令直通 | 强关键字命中且属于候选集，**不调任何模型** | 「出方案」「实施」「按评审意见修改」等；候选外强口令交给函数闸门拦截 |
 | 2. JEV（SystemOne） | 口令没命中时问它，`Choice` 只列本轮候选 | 拿回选项 + 置信度 + 各候选概率，都进日志（`source=jev`） |
 | 3. 大模型判定 | JEV 没配 / 超时 / 报错 / 回了认不出的标签 | 退回原来那套「让对话模型回一个词 + 一句理由」的判定（`source=llm`） |
@@ -88,11 +88,14 @@ flowchart TD
 
 ## 三、PR 同步与函数闸门
 
-轮首查一次全量 PR：新于记忆水印的 PR 用一次模型调用批量摘要，已有 PR 按平台状态对账，
-有变化就真实写回 StoreBackend。coding / rework 轮末再走同一套同步。
+轮首查最近 10 条全部状态 PR 与完整 open PR：前者用于记忆，新于记忆水印的 PR 用一次模型调用
+批量摘要；后者用于 `pull_requests` 归属、方案关联、评论状态和工作区同步。已有 PR 按平台状态
+对账，有变化就真实写回 StoreBackend。coding / rework 轮末再走同一套同步。
 
-意图判定完由 `gate_intent_for_state` 放行或停下：待合并 PR 拦 `coding / plan`，放行
-`qa / rework`。`MemoryMiddleware` 只负责加载同步后的记忆并注入。
+外部 / 归属未知的 open PR 在意图分类前直接停下，并提示用户先处理。其余情况在意图判定后由
+`gate_intent_for_state` 放行或停下：待合并 PR 拦 `coding / plan`，放行 `qa / rework`。
+rework 有唯一目标或用户明确写 `#N` 时，平台先把工作区安全同步到 PR 最新 `head_sha`。
+`MemoryMiddleware` 只负责加载同步后的记忆并注入。
 
 ---
 
@@ -256,9 +259,9 @@ sequenceDiagram
 
 | 时机 | 谁做 | 动什么 |
 | --- | --- | --- |
-| 每轮**开工前** | 平台（`repo_memory_sync`） | 查一次全量 PR；新增 PR 批量摘要，已有 PR 修正状态，有差异就落盘 |
+| 每轮**开工前** | 平台（`repo_state` / `repo_memory_sync`） | 查最近 10 条全部 PR 与完整 open PR；同步 PR 归属 / head 水位，新增 PR 批量摘要，已有 PR 修正状态 |
 | coding / rework **收尾** | 模型（`save_repo_memory`） | 「仓库基本信息」（变了才改）、「变更记录」（本轮 PR）、「当前缺口」（按模块） |
-| coding / rework **轮末** | 平台（`_refresh_repo_memory`） | 再查一次全量 PR，走同一套新增 / 状态同步 |
+| coding / rework **轮末** | 平台（`_refresh_repo_memory`） | 再走同一套最近 10 条 + open 全量同步，并更新 PR 表与记忆 |
 
 「当前缺口」是下一轮「该做什么」的唯一出处；「变更记录」以 PR 为角度（一次改动一定带着一个 PR，
 PR 没建成就不写这条）。

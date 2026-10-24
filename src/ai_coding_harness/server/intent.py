@@ -38,17 +38,14 @@ logger = logging.getLogger(__name__)
 # 任务类型：`review` 主控形态已删除，PR 审查并入 rework 的子智能体流程；
 # `analysis` 与 qa 合并；`sync` 删除，本地仓库由用户手动刷新。
 TASK_TYPES: tuple[str, ...] = (
-    "coding",    # 编码：写/改/重构/修复
-    "rework",    # PR 跟进：审查 open PR，或按意见 / 用户新要求继续修改
-    "plan",      # 计划 / 方案 / 设计
-    "qa",        # 提问（默认兜底）
+    "coding",  # 编码：写/改/重构/修复
+    "rework",  # PR 跟进：审查 open PR，或按意见 / 用户新要求继续修改
+    "plan",  # 计划 / 方案 / 设计
+    "qa",  # 提问（默认兜底）
 )
 
 #: 「PR 跟进」。它要处理的就是那份**还开着**的 PR；装配上与 coding 共用 profile。
 REWORK_INTENT = "rework"
-
-#: 会形成“未完成任务”的意图；qa 是解释/查看，不覆盖它。
-EXECUTION_INTENTS: frozenset[str] = frozenset({"coding", "rework", "plan"})
 
 #: 明确的“未完成轮次”标记：出现这些词时沿用上一轮/未完成任务。
 CONTINUE_MARKERS: tuple[str, ...] = (
@@ -92,7 +89,9 @@ _RULES: tuple[IntentRule, ...] = (
             "审查意见修改", "审查意见修复", "审查意见改", "审查意见修",
             "评审结论修改", "评审结论改", "审查结论修改", "审查结论改",
             "按 review 意见", "按review意见", "review 意见修改", "review意见修改",
-            "修复评审意见", "修复审查意见",
+            "修复评审意见", "修复审查意见", "修复P1", "修复P2", "修复P3",
+            "修复p1", "修复p2", "修复p3",
+            "修复全部", "修改所有PR问题", "修改所有问题",
             "代码审查", "代码评审", "审查一下", "评审一下",
             "审查 pr", "审查pr", "评审 pr", "评审pr",
             "返工",
@@ -198,9 +197,9 @@ SOURCE_KEYWORD = "keyword"
 SOURCE_JEV = "jev"
 SOURCE_LLM = "llm"
 SOURCE_FALLBACK = "fallback"
-SOURCE_ACTIVE = "active"
 SOURCE_CLARIFY = "clarify"
 SOURCE_CLARIFY_CHOICE = "clarification_choice"
+SOURCE_PR_OWNERSHIP = "pr_ownership"
 SOURCE_STATE = "state"
 
 
@@ -229,11 +228,11 @@ class StateGateResult:
 
 
 def gate_intent_for_state(
-    intent: str, allowed_intents: Sequence[str]
+        intent: str, allowed_intents: Sequence[str]
 ) -> StateGateResult:
     """判定后的最后一道状态闸门。
 
-    分类器已经只看到候选，但强关键字、旧 active task 与 handoff 重判仍可能给出过时意图。
+    分类器已经只看到候选，但强关键字、上一轮判定与 handoff 重判仍可能给出过时意图。
     这里统一收口，不把“能不能执行”留给提示词。
     """
     allowed = set(allowed_intents)
@@ -248,8 +247,8 @@ def gate_intent_for_state(
     if intent == "rework" and "coding" in allowed:
         return StateGateResult(
             None,
-            "当前仓库没有还开着的 PR，不能走 PR 跟进；如果要新开一个改动，"
-            "请明确说要开始实施。",
+            "当前没有可返工的 PR：可能没有 open PR，或 open PR 还没有评论、reviewer "
+            "尚未产出问题。请继续 coding 收尾，或明确说明要开始新的改动。",
         )
     if intent == "plan" and "plan" not in allowed:
         return StateGateResult(
@@ -265,14 +264,14 @@ def gate_intent_for_state(
 
 
 def should_clarify(decision: IntentDecision, threshold: float) -> bool:
-    """低置信度是否转 qa 澄清；口令/关键字/active 没有可信置信度，不进这条。"""
+    """低置信度是否转 qa 澄清；口令/关键字没有可信置信度，不进这条。"""
     if threshold <= 0 or decision.confidence is None:
         return False
     return decision.source in {SOURCE_JEV, SOURCE_LLM} and decision.confidence < threshold
 
 
 def clarification_decision(
-    decision: IntentDecision, threshold: float
+        decision: IntentDecision, threshold: float
 ) -> IntentDecision | None:
     """低置信度 → qa 澄清决策；不需要澄清返回 ``None``。"""
     if not should_clarify(decision, threshold):
@@ -296,35 +295,6 @@ def has_continue_marker(message: str) -> bool:
     )
 
 
-def active_task_override(
-    message: str, intent: str, active_intent: str | None
-) -> str | None:
-    """短追问的兜底：当前判成 analysis/qa，但用户明确在继续一个未完成任务。
-
-    只在显式 continuation/correction 标记出现时生效；正常问句不碰。上一轮是 plan 而
-    用户说“修复/实施/执行”时，落到 coding（实施/修复代码，不是改方案文本）。
-    """
-    if active_intent not in EXECUTION_INTENTS:
-        return None
-    if intent in EXECUTION_INTENTS:
-        return None
-    if (
-        active_intent == "plan"
-        and "方案" not in message
-        and len(message.strip()) <= 8
-        and any(word in message for word in SHORT_IMPERATIVES)
-    ):
-        return "coding"
-    if has_continue_marker(message):
-        return active_intent
-    short = message.strip()
-    if len(short) <= 5 and not any(
-        word in short for word in ("为什么", "怎么", "吗", "呢", "是不是")
-    ):
-        return active_intent
-    return None
-
-
 # 否定语境：口令被否定就不算口令 ——「先不要动手改代码」不是在让你动手改。
 _NEGATORS: tuple[str, ...] = ("不", "无", "别", "勿", "甭", "毋", "莫", "免")
 _NEGATION_WINDOW = 4
@@ -338,14 +308,14 @@ def _hit(text: str, word: str) -> bool:
     """
     start = 0
     while (at := text.find(word, start)) != -1:
-        if not any(n in text[max(0, at - _NEGATION_WINDOW) : at] for n in _NEGATORS):
+        if not any(n in text[max(0, at - _NEGATION_WINDOW): at] for n in _NEGATORS):
             return True
         start = at + 1
     return False
 
 
 def match_strong(
-    message: str, *, allowed_intents: Sequence[str] | None = None
+        message: str, *, allowed_intents: Sequence[str] | None = None
 ) -> str | None:
     """口令级命中 → 意图；没命中 → None。
 
@@ -378,7 +348,7 @@ def weak_hints(message: str) -> list[str]:
 
 
 def classify(
-    message: str, *, allowed_intents: Sequence[str] | None = None
+        message: str, *, allowed_intents: Sequence[str] | None = None
 ) -> str:
     """纯关键字判定（强 + 弱 + 排除词）→ 任务类型。
 
@@ -461,7 +431,6 @@ _BOUNDARY: tuple[str, ...] = (
     ),
 )
 
-
 #: 助手上一轮回复的**末尾节选**长度（字符）：判定要的是「上一轮问了你什么」，
 #: 那句反问几乎总在末尾，所以取尾部而不是开头（记录的 summary 是前 200 字，正好会切掉它）。
 PREVIOUS_REPLY_CHARS = 300
@@ -483,19 +452,19 @@ def tail_excerpt(text: str, *, chars: int = PREVIOUS_REPLY_CHARS) -> str:
     text = text.strip()
     if len(text) <= chars:
         return text
-    window = text[-(chars + PREVIOUS_REPLY_SLACK) :]
+    window = text[-(chars + PREVIOUS_REPLY_SLACK):]
     cut = -1
     for index, char in enumerate(window[:PREVIOUS_REPLY_SLACK]):
         if char in "。！？!?\n":
             cut = index
-    return window[cut + 1 :].strip() if cut >= 0 else window[-chars:]
+    return window[cut + 1:].strip() if cut >= 0 else window[-chars:]
 
 
 def head_tail_excerpt(
-    text: str,
-    *,
-    head: int = DIALOGUE_HEAD_CHARS,
-    tail: int = DIALOGUE_TAIL_CHARS,
+        text: str,
+        *,
+        head: int = DIALOGUE_HEAD_CHARS,
+        tail: int = DIALOGUE_TAIL_CHARS,
 ) -> str:
     """助手消息截断：前留 ``head`` 字、后留 ``tail`` 字，中间用省略号。
 
@@ -517,9 +486,9 @@ def _normalise_allowed(allowed_intents: Sequence[str] | None) -> tuple[str, ...]
 
 
 def _system_prompt(
-    allowed_intents: Sequence[str] | None = None,
-    *,
-    repo_state: str | None = None,
+        allowed_intents: Sequence[str] | None = None,
+        *,
+        repo_state: str | None = None,
 ) -> str:
     allowed = set(_normalise_allowed(allowed_intents))
     specs = tuple(spec for spec in _INTENT_SPECS if spec.intent in allowed)
@@ -551,23 +520,17 @@ def _system_prompt(
 
 
 def _user_prompt(
-    message: str,
-    history: Sequence[str],
-    hints: Sequence[str],
-    previous_reply: str | None = None,
-    previous_intent: str | None = None,
-    active_intent: str | None = None,
-    dialogue: Sequence[Mapping[str, str]] = (),
-    repo_state: str | None = None,
+        message: str,
+        history: Sequence[str],
+        hints: Sequence[str],
+        previous_reply: str | None = None,
+        previous_intent: str | None = None,
+        dialogue: Sequence[Mapping[str, str]] = (),
+        repo_state: str | None = None,
 ) -> str:
     parts: list[str] = []
     if repo_state:
         parts.append(f"当前仓库状态：{repo_state}")
-    if active_intent:
-        parts.append(
-            f"当前未完成任务：{active_intent}（最近一次可执行意图；之后的 analysis/qa 不覆盖它）。"
-            "如果本轮是继续 / 修正 / 短追问，优先沿用这个任务。"
-        )
     if previous_intent:
         parts.append(
             f"上一轮判定：{previous_intent}\n"
@@ -575,9 +538,13 @@ def _user_prompt(
             "不要仅因为出现「为什么」就判 analysis。"
         )
     if dialogue:
-        lines = ["最近两轮对话（由远及近；用户消息全文，助手消息首尾截断）："]
+        lines = ["最近三个用户轮次内的完整会话记录（由远及近，以下正文未截断）："]
         for turn in dialogue:
-            role = "用户" if turn.get("role") == "user" else "助手"
+            role = {
+                "user": "用户",
+                "assistant": "助手",
+                "plan": "方案",
+            }.get(str(turn.get("role") or ""), "记录")
             lines.append(f"[{role}] {turn.get('content', '')}")
         parts.append("\n".join(lines))
     else:
@@ -636,7 +603,7 @@ def _parse_confidence(text: str) -> float | None:
 
 
 def _parse_candidates(
-    text: str, *, allowed_intents: Sequence[str] | None = None
+        text: str, *, allowed_intents: Sequence[str] | None = None
 ) -> tuple[tuple[str, float], ...]:
     """解析 ``plan 0.42, coding 0.31``；只认词表里的意图，去重后取前 3。"""
     allowed = set(_normalise_allowed(allowed_intents))
@@ -651,7 +618,7 @@ def _parse_candidates(
 
 
 def parse_reply(
-    text: str, *, allowed_intents: Sequence[str] | None = None
+        text: str, *, allowed_intents: Sequence[str] | None = None
 ) -> ParsedReply | None:
     """解析大模型分类回复；首词不在清单里则返回 None。
 
@@ -688,8 +655,8 @@ def parse_reply(
 
 #: 兼容三种返回：旧的 ``(意图, 理由, 置信度)`` 与新的「再带候选」四元组。
 JevDecision = (
-    tuple[str, str, float | None]
-    | tuple[str, str, float | None, tuple[tuple[str, float], ...]]
+        tuple[str, str, float | None]
+        | tuple[str, str, float | None, tuple[tuple[str, float], ...]]
 )
 
 
@@ -697,18 +664,17 @@ class IntentDecider(Protocol):
     """判定器：判得出来给 ``(意图, 理由, 置信度)``，判不出来给 ``None``（交给下一关）。"""
 
     async def decide(
-        self,
-        message: str,
-        *,
-        history: Sequence[str] = (),
-        hints: Sequence[str] = (),
-        usage: dict[str, int] | None = None,
-        previous_reply: str | None = None,
-        previous_intent: str | None = None,
-        active_intent: str | None = None,
-        dialogue: Sequence[Mapping[str, str]] = (),
-        allowed_intents: Sequence[str] | None = None,
-        repo_state: str | None = None,
+            self,
+            message: str,
+            *,
+            history: Sequence[str] = (),
+            hints: Sequence[str] = (),
+            usage: dict[str, int] | None = None,
+            previous_reply: str | None = None,
+            previous_intent: str | None = None,
+            dialogue: Sequence[Mapping[str, str]] = (),
+            allowed_intents: Sequence[str] | None = None,
+            repo_state: str | None = None,
     ) -> JevDecision | None: ...
 
 
@@ -729,12 +695,12 @@ class JevDecider:
     """
 
     def __init__(
-        self,
-        *,
-        api_key: str,
-        base_url: str = "",
-        model: str = "",
-        timeout: float = 10.0,
+            self,
+            *,
+            api_key: str,
+            base_url: str = "",
+            model: str = "",
+            timeout: float = 10.0,
     ) -> None:
         from typesafe_sdk import AsyncTypeSafeClient, Choice, RetryPolicy
 
@@ -750,18 +716,17 @@ class JevDecider:
         )
 
     async def decide(
-        self,
-        message: str,
-        *,
-        history: Sequence[str] = (),
-        hints: Sequence[str] = (),
-        usage: dict[str, int] | None = None,
-        previous_reply: str | None = None,
-        previous_intent: str | None = None,
-        active_intent: str | None = None,
-        dialogue: Sequence[Mapping[str, str]] = (),
-        allowed_intents: Sequence[str] | None = None,
-        repo_state: str | None = None,
+            self,
+            message: str,
+            *,
+            history: Sequence[str] = (),
+            hints: Sequence[str] = (),
+            usage: dict[str, int] | None = None,
+            previous_reply: str | None = None,
+            previous_intent: str | None = None,
+            dialogue: Sequence[Mapping[str, str]] = (),
+            allowed_intents: Sequence[str] | None = None,
+            repo_state: str | None = None,
     ) -> tuple[str, str, float | None, tuple[tuple[str, float], ...]] | None:
         allowed = set(_normalise_allowed(allowed_intents))
         question = self._choice_cls(
@@ -779,7 +744,6 @@ class JevDecider:
                 hints,
                 previous_reply,
                 previous_intent,
-                active_intent,
                 dialogue,
                 repo_state,
             ),
@@ -886,21 +850,20 @@ def _record_usage(usage: dict[str, int] | None, raw: Any) -> None:
 
 
 async def detect_intent(
-    message: str,
-    *,
-    history: Sequence[str] = (),
-    jev: IntentDecider | None = None,
-    model: BaseChatModel | None = None,
-    timeout: float = 5.0,
-    force_llm: bool = False,
-    usage: dict[str, int] | None = None,
-    previous_reply: str | None = None,
-    previous_intent: str | None = None,
-    active_intent: str | None = None,
-    dialogue: Sequence[Mapping[str, str]] = (),
-    mode: str = "jev",
-    allowed_intents: Sequence[str] | None = None,
-    repo_state: str | None = None,
+        message: str,
+        *,
+        history: Sequence[str] = (),
+        jev: IntentDecider | None = None,
+        model: BaseChatModel | None = None,
+        timeout: float = 5.0,
+        force_llm: bool = False,
+        usage: dict[str, int] | None = None,
+        previous_reply: str | None = None,
+        previous_intent: str | None = None,
+        dialogue: Sequence[Mapping[str, str]] = (),
+        mode: str = "jev",
+        allowed_intents: Sequence[str] | None = None,
+        repo_state: str | None = None,
 ) -> IntentDecision:
     """判定本轮意图。**两道瀑布按 ``mode`` 二选一**（2026-10-13 用户口径，2026-10-15 收紧为
     **严格二选一**）：
@@ -931,11 +894,7 @@ async def detect_intent(
     ``previous_intent`` 是上一轮的判定结果：对「你为什么不派 coder」「上一轮不是 rework
     吗」这类**追问**，它比字面里的「为什么」可靠得多。两条判定路径同样共用。
 
-    ``dialogue`` 是最近两轮的完整对话（用户消息全文、助手消息首尾截断）：只给用户消息
-    往往看不出“上一轮 AI 为什么这么说”，给两轮才够判断“继续 / 修正 / 解释”的指代。
-
-    ``active_intent`` 是会话里最近一次**可执行**意图（coding/rework/plan/review）；
-    analysis/qa 不覆盖它。短追问的指代优先看它。
+    ``dialogue`` 是最近三个用户轮次的完整对话：用户消息、助手消息和方案记录均保留全文。
     """
     candidates_allowed = _normalise_allowed(allowed_intents)
     if not force_llm:
@@ -963,7 +922,6 @@ async def detect_intent(
                     usage=usage,
                     previous_reply=previous_reply,
                     previous_intent=previous_intent,
-                    active_intent=active_intent,
                     dialogue=dialogue,
                     allowed_intents=candidates_allowed,
                     repo_state=repo_state,
@@ -1010,7 +968,6 @@ async def detect_intent(
                                 hints,
                                 previous_reply,
                                 previous_intent,
-                                active_intent,
                                 dialogue,
                                 repo_state,
                             )

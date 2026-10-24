@@ -89,26 +89,42 @@ async def recent_user_summaries(
 
 
 async def recent_dialogue(
-    db: AsyncSession, *, session_id: int, limit: int = 4
+    db: AsyncSession, *, session_id: int, rounds: int = 3
 ) -> list[tuple[str, str]]:
-    """最近几条用户/助手消息（按时间正序返回），供意图判定带“两轮对话”。
+    """最近 ``rounds`` 个用户轮次内的完整会话记录（按时间正序）。
 
-    ``limit=4`` 是两轮（user + assistant × 2）。用户消息由调用方保留全文，
-    助手消息由调用方做首尾截断；这里只负责按时间线取原文。
+    轮次以 ``user`` 记录为边界；返回期间的全部 user / assistant / **plan** 记录。
+    plan 是会话时间线里的独立记录，不是 assistant 详情附件，必须一起带上。
+    正文不在这里截断，调用方按自己的预算处理。
     """
+    user_ids = list(
+        (
+            await db.scalars(
+                select(SessionRecord.id)
+                .where(
+                    SessionRecord.session_id == session_id,
+                    SessionRecord.type == "user",
+                )
+                .order_by(SessionRecord.id.desc())
+                .limit(max(1, rounds))
+            )
+        ).all()
+    )
+    if not user_ids:
+        return []
     rows = await db.execute(
         select(SessionRecord.type, SessionRecordDetail.content)
         .join(SessionRecordDetail, SessionRecordDetail.record_id == SessionRecord.id)
         .where(
             SessionRecord.session_id == session_id,
-            SessionRecord.type.in_(("user", "assistant")),
+            SessionRecord.id >= min(user_ids),
+            SessionRecord.type.in_(("user", "assistant", "plan")),
         )
-        .order_by(SessionRecord.id.desc())
-        .limit(limit)
+        .order_by(SessionRecord.id.asc())
     )
     return [
         (str(kind), str(content))
-        for kind, content in reversed(list(rows.all()))
+        for kind, content in rows.all()
         if isinstance(content, str) and content.strip()
     ]
 

@@ -41,8 +41,8 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
 from langchain_core.tools import BaseTool, tool
 
-from ai_coding_harness.agent.middleware import TurnState
 from ai_coding_harness.agent.profiles import profile_for
+from ai_coding_harness.agent.turn_state import TurnState
 from ai_coding_harness.core.stream import (
     RUN_EVENT_KIND,
     ToolNames,

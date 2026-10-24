@@ -9,12 +9,15 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from ai_coding_harness.agent.clarification import parse_clarification
-from ai_coding_harness.agent.middleware import TurnState, TurnStop
+from ai_coding_harness.agent.clarification import (
+    clarification_fallback_text,
+    parse_clarification,
+)
 from ai_coding_harness.agent.profiles import (
     QA_FORM,
     profile_for,
 )
+from ai_coding_harness.agent.turn_state import TurnState, TurnStop
 from ai_coding_harness.core.stream import (
     CREATE_PR_TOOL,
     RUN_EVENT_KIND,
@@ -30,6 +33,7 @@ from ai_coding_harness.core.stream import (
     run_id_of,
     subagent_name,
 )
+from ai_coding_harness.db import dao
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.observability.run_log import AgentRunLog
 from ai_coding_harness.safety.redact import (
@@ -38,13 +42,13 @@ from ai_coding_harness.safety.redact import (
     secret_terms,
 )
 from ai_coding_harness.server.intent import (
-    SOURCE_ACTIVE,
     SOURCE_CLARIFY_CHOICE,
+    SOURCE_PR_OWNERSHIP,
     IntentDecision,
-    active_task_override,
     clarification_decision,
     gate_intent_for_state,
 )
+from ai_coding_harness.server.pr_workspace import sync_pull_workspace, target_pull
 from ai_coding_harness.server.repo_state import describe_snapshot, intent_candidates
 from ai_coding_harness.session.manager import (
     Session,
@@ -150,10 +154,8 @@ class TurnRunnerMixin:
         previous_reply = await self._last_reply(session)
         # 上一轮是什么意图：追问「为什么不派 coder」时，比字面里的「为什么」可靠
         previous_intent = await self._last_intent(session)
-        # 最近两轮对话：用户全文 + 助手首尾截断，判断“继续/修正/解释上一轮”要看它
+        # 最近三个用户轮次的完整会话：判断“继续/修正/解释上一轮”要看它
         dialogue = await self._dialogue(session)
-        # 最近一次可执行任务：analysis/qa 不覆盖它，短追问优先沿用它
-        active_intent = await self._active_task(session)
         # 每轮实时查一次全量 PR；同一份列表用于记忆同步与意图候选。
         snapshot = await self._repo_snapshot(session)
         if snapshot is not None:
@@ -167,7 +169,13 @@ class TurnRunnerMixin:
         # 不清就会把上一轮的判定开销带到这一轮的账上。
         self._intent_usage = {}
         self._last_usage_frame = 0.0
-        if chosen is not None:
+        if snapshot is not None and snapshot.blocked_reason:
+            decision = IntentDecision(
+                "qa",
+                SOURCE_PR_OWNERSHIP,
+                snapshot.blocked_reason,
+            )
+        elif chosen is not None:
             message, chosen_intent, chosen_label = chosen
             decision = IntentDecision(
                 chosen_intent,
@@ -180,28 +188,19 @@ class TurnRunnerMixin:
                 history,
                 previous_reply,
                 previous_intent,
-                active_intent,
                 dialogue,
                 allowed_intents=allowed_intents,
                 repo_state=repo_status,
             )
-        override = (
-            active_task_override(message, decision.intent, active_intent)
-            if chosen is None
-            else None
-        )
-        if override:
-            decision = IntentDecision(
-                override, SOURCE_ACTIVE, f"沿用未完成任务 {active_intent}"
-            )
         state_block: str | None = None
         gate = gate_intent_for_state(decision.intent, allowed_intents)
-        if gate.intent is None:
+        if snapshot is not None and snapshot.blocked_reason:
+            state_block = snapshot.blocked_reason
+        elif gate.intent is None:
             state_block = gate.reason
         # 低置信度：先转 qa 向用户确认，避免拿一个猜出来的形态直接干活。
-        # active_task_override 命中时不动 —— 用户明确在继续未完成任务，那是更强的信号。
         clarification: dict[str, Any] | None = None
-        if not override and state_block is None and (
+        if state_block is None and (
             clarified := clarification_decision(
                 decision, self._settings.intent_clarify_confidence
             )
@@ -212,23 +211,6 @@ class TurnRunnerMixin:
                 "candidates": list(clarified.candidates),
             }
         intent = decision.intent
-        self._remember_active_task(session, intent, message)
-        # 影子路由（默认关）：只记轴，不采用建议、不改变 intent。独立 task 不占本轮首字节。
-        if self._settings.intent_router_shadow:
-            shadow = asyncio.create_task(
-                self._shadow_route(
-                    message,
-                    history,
-                    previous_reply,
-                    previous_intent,
-                    active_intent,
-                    dialogue,
-                    decision,
-                    str(session.public_id),
-                )
-            )
-            self._shadow_tasks.add(shadow)
-            shadow.add_done_callback(self._shadow_tasks.discard)
         logger.info(
             "意图分析：intent=%s source=%s 理由=%s pr_state=%s public_id=%s",
             intent,
@@ -277,7 +259,9 @@ class TurnRunnerMixin:
             message=message,
             history=history,
             repeats=self._settings.loop_guard_repeats,
-            open_prs=tuple(snapshot.open_prs) if snapshot is not None else (),
+            open_prs=(
+                tuple(snapshot.owned_open_prs) if snapshot is not None else ()
+            ),
             pr_state_known=snapshot is not None,
             allowed_intents=allowed_intents,
             # 回调契约是 (message, history)：把 session 与「助手上一轮末尾」先绑进去，
@@ -304,6 +288,50 @@ class TurnRunnerMixin:
             yield {"type": "error", "error": WORKSPACE_ERROR_MESSAGE}
             yield {"type": "done"}
             return
+
+        if intent == "rework" and snapshot is not None:
+            target = target_pull(message, snapshot.owned_open_prs)
+            if target is not None:
+                synced = await sync_pull_workspace(
+                    runtime,
+                    repo_url=session.repo_url,
+                    repo_dir=(
+                        f"{self._settings.sandbox_project_dir.rstrip('/')}/"
+                        f"{session.repo.repo}"
+                    ),
+                    pull=target,
+                )
+                if not synced.ok:
+                    await self._record(
+                        session,
+                        type="assistant",
+                        summary=synced.message,
+                        content=synced.message,
+                        extra={"intent": intent, "aborted": "rework_sync"},
+                    )
+                    yield {"type": "ai", "content": synced.message}
+                    yield {"type": "done"}
+                    return
+                pull_id = target.get("_pull_id")
+                head_sha = str((target.get("head") or {}).get("sha") or "")
+                if isinstance(pull_id, int) and head_sha:
+                    try:
+                        async with self._db.session() as db:
+                            await dao.mark_pull_synced(
+                                db, pull_id=pull_id, head_sha=head_sha
+                            )
+                    except Exception:
+                        logger.exception(
+                            "PR 工作区已同步但更新同步水位失败：public_id=%s pr=%s",
+                            session.public_id,
+                            target.get("number"),
+                        )
+                logger.info(
+                    "rework 工作区已同步：public_id=%s pr=%s head=%s",
+                    session.public_id,
+                    target.get("number"),
+                    head_sha[:8],
+                )
 
         try:
             async for event in self._run_agent(
@@ -591,8 +619,9 @@ class TurnRunnerMixin:
                 )
                 if clarification_frame is not None:
                     text = parsed.question
-            # 模型没按协议输出 / 落库失败：把攒着的文本补发，用户至少能看到回答。
+            # 模型没按协议输出 / 落库失败：退回可读文本，绝不把协议 JSON 发给用户。
             if clarification_frame is None and text:
+                text = clarification_fallback_text(text, parsed)
                 yield {"type": "ai", "content": text}
 
         if not text and clarification_frame is None:

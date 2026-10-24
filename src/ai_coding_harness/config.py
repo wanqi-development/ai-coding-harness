@@ -586,17 +586,7 @@ class Settings(BaseSettings):
     #: 追问量约 10%”的折中。
     intent_clarify_confidence: float = 0.55
     # 分类时附带的历史用户消息条数（指代要靠它，如「就按你说的弄」）
-    intent_history_turns: int = 4
-    # 影子路由器（2026-10-17 原型）：把一句话拆成正交维度并记 ``INTENT_ROUTER``，
-    # **不采用它的建议、不改变本轮形态**。默认关；打开后每轮多一次分类模型调用，
-    # 但跑在独立 task 里，不影响本轮返回。
-    intent_router_shadow: bool = (
-        os.getenv("INTENT_ROUTER_SHADOW", "false").strip().lower()
-        in ("1", "true", "yes")
-    )
-    intent_router_timeout_seconds: float = float(
-        os.getenv("INTENT_ROUTER_TIMEOUT_SECONDS", "5")
-    )
+    intent_history_turns: int = 3
 
     # JEV（SystemOne，决策型模型）做意图判定 —— 二选一里的另一侧（见 server/intent.py）：
     # 口令 → **JEV** → 关键字口径。凭据来自界面上的「意图识别（JEV）」那一行

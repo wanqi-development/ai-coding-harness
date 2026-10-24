@@ -214,8 +214,11 @@
   - 形态从「分类结果」改成「状态 + 能力需求」的推导结果；分类器只填状态机覆盖不到的空档。
   - 这套落地后可以删掉：`active_task_override`、`CONTINUE_MARKERS` / `SHORT_IMPERATIVES`、
     部分关键字规则、margin 候选 —— 每删一条都要用 `docs/intent-eval.jsonl` 证明准确率不降。
-  - 评测：`scripts/eval_intent.py` 增加「状态优先路由」影子模式，对比**形态准确率 /
-    澄清率 / 误执行率**（澄清轮却执行了工具的次数）；先影子跑，不改变线上形态。
+    **2026-10-23 已先删除 active task 整条链**（`_active_tasks`、override/continuation、
+    service / runner / 评测中的 `active_intent`）；之后只使用上一轮判定和
+    最近三轮完整对话。
+  - 评测：后续继续用 `scripts/eval_intent.py` 对比 keyword 与 normal 的**形态准确率 /
+    澄清率 / 误执行率**（澄清轮却执行了工具的次数）。
 
 ---
 

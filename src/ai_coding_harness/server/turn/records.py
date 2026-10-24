@@ -23,11 +23,12 @@ from ai_coding_harness.server.repo_memory_sync import (
     PrMemorySummary,
     sync_repo_memory,
 )
+from ai_coding_harness.server.repo_state import load_pull_snapshot
 from ai_coding_harness.session.manager import (
     Session,
     SessionRuntime,
 )
-from ai_coding_harness.tools.git import PrLookupError, build_git_client
+from ai_coding_harness.tools.git import PrLookupError
 from ai_coding_harness.tools.pr_client import pull_summary
 
 logger = logging.getLogger(__name__)
@@ -284,11 +285,14 @@ class TurnRecordsMixin:
             session.repo.owner, session.repo.repo, self._settings.memories_prefix
         )
         try:
-            pulls = await build_git_client(
-                self._settings, session.repo
-            ).all_pulls()
+            snapshot = await load_pull_snapshot(
+                self._settings,
+                session.repo,
+                database=self._db,
+                session_id=session.db_id,
+            )
             result = await self._sync_memory(
-                session, runtime.backend, path, tuple(pulls)
+                session, runtime.backend, path, snapshot.pulls
             )
             logger.info(
                 "仓库记忆轮末同步：new=%s restated=%s pending=%s changed=%s",

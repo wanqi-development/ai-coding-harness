@@ -24,12 +24,39 @@ CLARIFY_INTENTS: tuple[str, ...] = (
 
 CLARIFY_OPEN = "<CLARIFY>"
 CLARIFY_CLOSE = "</CLARIFY>"
+CLARIFY_SAVE_FALLBACK = "澄清选项暂时无法显示，请直接回复补充说明。"
+CLARIFY_INVALID_FALLBACK = "澄清问题生成格式异常，请重新描述你的需求。"
 
 _BLOCK_RE = re.compile(
     rf"{re.escape(CLARIFY_OPEN)}\s*(.*?)\s*{re.escape(CLARIFY_CLOSE)}",
     re.IGNORECASE | re.DOTALL,
 )
 _STEP_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+
+
+def strip_clarification_block(text: str) -> str:
+    """去掉协议块与残留标签，避免解析失败时把内部 JSON 当正文展示。"""
+    cleaned = _BLOCK_RE.sub("", text)
+    # 没闭合的块也要整段丢掉，不能只摘标签把 JSON 留在用户面前。
+    cleaned = re.split(
+        re.escape(CLARIFY_OPEN), cleaned, maxsplit=1, flags=re.IGNORECASE
+    )[0]
+    cleaned = re.sub(
+        rf"{re.escape(CLARIFY_OPEN)}|{re.escape(CLARIFY_CLOSE)}",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
+def clarification_fallback_text(
+    text: str, parsed: ClarificationRequest | None = None
+) -> str:
+    """澄清不能弹窗时的用户可读回退，不暴露 ``<CLARIFY>`` 协议。"""
+    if parsed is not None:
+        return f"{CLARIFY_SAVE_FALLBACK}\n\n{parsed.question}"
+    return strip_clarification_block(text) or CLARIFY_INVALID_FALLBACK
 
 
 @dataclass(frozen=True)
