@@ -48,8 +48,9 @@
   **模型配置存后端库**（改完要保存，且重启后端才生效）。主题只改 `<html data-theme>`，
   颜色全在 `style.css` 的两组令牌里 —— 组件里不判断主题，**新增颜色必须走令牌**，
   否则深色下会出「白块 / 看不见的字」。
-- **配置**：模型 / Gitee / GitHub / OpenSandbox / PostgreSQL 的凭据都在 `.env`（不进版本库），
-  键的说明看 `.env.example`。
+- **配置**：模型 / OpenSandbox / PostgreSQL 的凭据在 `.env`（不进版本库），键的说明看
+  `.env.example`；**Gitee / GitHub 的令牌与 git 用户名在设置页「代码平台」那一栏**（表
+  `app_settings`，`.env` 只是初始值）。OAuth 登录 2026-10-20 已整块删除，别再往回加。
 - **生效时机**：提示词与沙箱资产是**建会话时**读 / 推的，后端配置与装配改动要**重启后端**；
   前端是 vite 热更新，改完刷新即可。
 
@@ -123,8 +124,9 @@
   时，平台在 Agent 启动前 `fetch`，确认工作区干净且本地分支是远端祖先，再切到 PR 的
   `head_sha`。脏工作区、force-push 后分叉、fetch 失败一律停止，不 reset / rebase / 强推。
   成功后更新 `synced_head_sha`；下次 `head_sha` 不同即说明用户或其他协作者追加了提交。
-- **运行期配置是表 `app_settings`**（迁移 `e3f4a5b6c7d8`）：代码缓存路径 / 默认分支 / 上下文告警线
-  与各家窗口。**键与类型只认 `config.RUNTIME_SETTINGS` 那一张表**，接口 `GET/PUT /app-settings`，
+- **运行期配置是表 `app_settings`**（迁移 `e3f4a5b6c7d8`）：代码缓存路径 / 默认分支 /
+  **Gitee・GitHub 的令牌与 git 用户名**（`kind="secret"`：GET 回掩码、PUT 不回显）/
+  上下文告警线与各家窗口。**键与类型只认 `config.RUNTIME_SETTINGS` 那一张表**，接口 `GET/PUT /app-settings`，
   写入后赋回 `Settings` 实例 → **改完立刻生效**（配合「agent 不缓存」）。新增可配项就在那张表里加一行，
   并在设置页「基本设置」里出现（分组名由它带出来）。直接改库也能用：GET 时会重新落一遍。
 - **「这一轮改了什么」在本地代码缓存里算，不碰沙箱**：`infra/repo_cache.compare/file_diff` +

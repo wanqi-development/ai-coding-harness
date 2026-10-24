@@ -22,10 +22,15 @@
 - **模型路由**：按智能体角色选择设置页里的模型行。主智能体不缓存，每轮现建，因此模型配置下一轮生效。
 - **意图判定**：轮首先取 PR 快照和仓库记忆状态，再按候选集、口令、JEV 或大模型、关键字兜底依次判定。外部 / 归属未知的 open PR 在分类前直接停止；PR 状态不一致时再由纯函数闸门拦截写操作。
 - **装配轴**：`agent/profiles.py` 决定主形态挂哪些工具、子智能体和提示词，避免多套分支漂移。
-- **执行环境**：每会话一个 OpenSandbox 容器，项目位于 `/ai_coding/project`；policies、skills、Maven 与初始化脚本建会话时从仓库推入。
+- **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
+- **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机自己 `git clone --bare` 一份只读缓存（按 `owner/repo`，`REPO_VIEW_DIR` 默认 **`~/.ai-coding-harness/repo_cache`**，即用户个人目录，不写进项目目录），切分支只是换个 ref，读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
+- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流。令牌与 git 用户名在设置页「代码平台」那一栏配（`.env` 的同名键只是初始值），**建会话时快照进库**，之后改配置不影响已有会话。OAuth 登录已删（2026-10-20）。
+- **安全**：危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
+- **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（到压缩线后的应急裁剪：剪了几条、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。
+- **思考展示**：模型思考以 `reasoning` 帧单独下发，主控与子智能体按角色分段显示；它只存在于前端与 RunHub 的临时帧缓冲，**不落业务库**。流式期间正文按纯文本显示，任务结束后一次性 Markdown 化。
 - **文件后端**：CompositeBackend 将普通文件、`/memories/`、`/conversation_history/`、`/large_tool_results/` 路由到沙箱或持久 StoreBackend。
-- **持久化**：PostgreSQL 保存会话、仓库、方案、记录、澄清、模型配置和运行配置；LangGraph checkpoint 保存会话状态。
-- **Redis（可选）**：多 worker 时保存运行帧缓冲、会话运行权和模型熔断状态。未配置时自动使用进程内实现。
+- **持久化**：PostgreSQL 保存会话、仓库、方案、PR 映射、记录、澄清、模型配置和运行配置；LangGraph checkpoint 保存会话状态。
+- **Redis（可选）**：多 worker 时保存运行帧缓冲、会话运行权与模型熔断状态；未配置或连接失败时退回进程内实现。
 
 ## 意图与形态
 

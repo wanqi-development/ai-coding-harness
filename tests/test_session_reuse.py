@@ -230,8 +230,6 @@ class FakeManager:
     async def create_session(
         self,
         repo_url: str,
-        gitee_token: str | None = None,
-        github_token: str | None = None,
     ) -> CreatedSession:
         self.repo_url = repo_url
         return self._created

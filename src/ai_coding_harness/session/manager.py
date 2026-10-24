@@ -191,9 +191,10 @@ class SessionManager:
         **一个仓库一个活跃会话**：该仓库若已有活跃会话，直接复用它（不写库、不建工作区），
         免得同一个仓库开出两个沙箱各改一份代码。用户删掉的会话不再占位，删完可以重新建。
 
-        **平台由仓库地址判定**（gitee.com / github.com）：令牌统一取该平台配置的
-        access token。
-        复用走库里记的那份凭据（见 ``session_from_row``）。
+        **平台由仓库地址判定**（gitee.com / github.com），令牌取该平台在设置页
+        「代码平台」那一栏配的那份（``Settings.token_for``，``.env`` 只是初始值）。
+        令牌与 git 用户名在**建会话这一刻**写进库里，之后改配置不影响已有会话 ——
+        跑着的会话不会中途换凭据。复用走库里记的那份（见 ``session_from_row``）。
         """
         platform, owner, repo = parse_repo_url(repo_url)
 
@@ -226,6 +227,8 @@ class SessionManager:
                 owner=owner,
                 repo=repo,
                 token=self._settings.token_for(platform),
+                # 用户名留空由 RepoSpec 填平台默认值（Gitee ``oauth2`` / GitHub
+                # ``x-access-token``）；PAT 场景应在设置页填真实用户名
                 git_username=self._settings.username_for(platform),
             )
             public_id = uuid4()

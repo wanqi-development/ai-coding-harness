@@ -15,7 +15,6 @@ export default defineConfig({
       '/sessions': BACKEND,
       '/chat': BACKEND,
       '/health': BACKEND,
-      '/auth': BACKEND,
       '/model-config': BACKEND,
       '/app-settings': BACKEND,
     },

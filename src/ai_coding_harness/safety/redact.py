@@ -105,6 +105,19 @@ def secret_terms(
     return tuple(terms)
 
 
+def mask_secret(value: str | None) -> str:
+    """凭据打码：``sk-…e2b7``。太短就整段星号 —— 界面只用来「知道填没填」，不回明文。
+
+    界面侧的**唯一**用途是「回显告诉用户这里配过一个值」；保存之后的响应不再带它
+    （见 ``api/routes/app_settings.py``）。
+    """
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:3]}…{value[-4:]}"
+
+
 def detect_credential(text: str, terms: Iterable[str] = ()) -> str | None:
     """这段文本里是否含凭据：含则返回类别名，不含返回 None。
 

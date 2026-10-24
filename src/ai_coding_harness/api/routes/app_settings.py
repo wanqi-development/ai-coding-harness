@@ -29,26 +29,51 @@ from ai_coding_harness.config import (
     coerce_runtime_setting,
 )
 from ai_coding_harness.db import dao
+from ai_coding_harness.safety.redact import mask_secret
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/app-settings", tags=["app-settings"])
 
 
-def snapshot(settings: Settings, stored: dict[str, object]) -> RuntimeSettingsSnapshot:
-    """当前生效值的全貌：每格都带上「现在这个值是哪来的」——db（界面改过）还是 default。"""
-    return RuntimeSettingsSnapshot(
-        items=[
+def snapshot(
+    settings: Settings, stored: dict[str, object], *, echo_secrets: bool
+) -> RuntimeSettingsSnapshot:
+    """当前生效值的全貌：每格都带上「现在这个值是哪来的」——db（界面改过）还是 default。
+
+    ``secret`` 那几格两种口径（2026-10-20 用户口径）：
+
+    * 打开设置页（GET）：回**掩码**，让用户看得出「这里配过一个值」；
+    * 保存之后的响应（PUT）：回**空串**，只带 ``has_value`` —— 保存完不再回显。
+    """
+    items: list[RuntimeSettingItem] = []
+    for item in RUNTIME_SETTINGS:
+        raw = getattr(settings, item.field, None)
+        if item.kind == "secret":
+            items.append(
+                RuntimeSettingItem(
+                    key=item.key,
+                    label=item.label,
+                    group=item.group,
+                    kind=item.kind,
+                    value=mask_secret(raw) if echo_secrets else "",
+                    has_value=bool(raw),
+                    source="db" if item.key in stored else "default",
+                )
+            )
+            continue
+        items.append(
             RuntimeSettingItem(
                 key=item.key,
                 label=item.label,
                 group=item.group,
                 kind=item.kind,
-                value=getattr(settings, item.field, None),
+                value=raw,
                 source="db" if item.key in stored else "default",
             )
-            for item in RUNTIME_SETTINGS
-        ]
+        )
+    return RuntimeSettingsSnapshot(
+        items=items
     )
 
 
@@ -59,7 +84,7 @@ async def get_app_settings(request: Request) -> RuntimeSettingsSnapshot:
     async with request.app.state.database.session() as db:
         stored = await dao.list_app_settings(db)
     apply_runtime_settings(settings, stored)
-    return snapshot(settings, stored)
+    return snapshot(settings, stored, echo_secrets=True)
 
 
 @router.put("", response_model=RuntimeSettingsSnapshot)
@@ -74,13 +99,24 @@ async def put_app_settings(
         if item is None:
             raise HTTPException(status_code=400, detail=f"unknown setting key: {key}")
         try:
-            cleaned[key] = coerce_runtime_setting(item, raw)
+            value = coerce_runtime_setting(item, raw)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=f"{key} 的值不合法：{raw!r}") from exc
+        # 「把掩码原样提交回来」＝没改（界面上的掩码只是个提示，不是真值）。
+        # 空串照常落库＝清空 —— 用户要清掉时把那一格删空即可。
+        if item.kind == "secret" and value and value == mask_secret(
+            getattr(settings, item.field, "")
+        ):
+            continue
+        cleaned[key] = value
+    if not cleaned:
+        async with request.app.state.database.session() as db:
+            stored = await dao.list_app_settings(db)
+        return snapshot(settings, stored, echo_secrets=False)
     async with request.app.state.database.session() as db:
         for key, value in cleaned.items():
             await dao.upsert_app_setting(db, key=key, value=value)
         stored = await dao.list_app_settings(db)
     apply_runtime_settings(settings, stored)
     logger.info("运行期配置已更新：%s", "、".join(sorted(cleaned)) or "（空）")
-    return snapshot(settings, stored)
+    return snapshot(settings, stored, echo_secrets=False)

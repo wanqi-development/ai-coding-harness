@@ -14,6 +14,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_coding_harness.core.codeplatform import Platform
+from ai_coding_harness.safety.redact import secret_terms
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,9 @@ class RuntimeSetting:
     key: str
     label: str
     group: str
-    kind: str  # "str" | "int" | "float"
+    #: 值的类型。``secret`` 与 ``str`` 同型，只是**接口层**要按凭据对待：
+    #: 读的时候只回掩码、保存之后不再回显（见 ``api/routes/app_settings.py``）。
+    kind: str  # "str" | "int" | "float" | "secret"
     field: str
 
 
@@ -153,6 +156,25 @@ RUNTIME_SETTINGS: tuple[RuntimeSetting, ...] = (
     RuntimeSetting("repo_view_dir", "代码缓存路径", "代码缓存配置", "str", "repo_view_dir"),
     RuntimeSetting("gitee_base_branch", "默认分支（Gitee）", "代码缓存配置", "str", "gitee_base_branch"),
     RuntimeSetting("github_base_branch", "默认分支（GitHub）", "代码缓存配置", "str", "github_base_branch"),
+    # -- 代码平台凭据（2026-10-20 用户口径：OAuth 登录整块删掉，令牌改成配置项）--
+    # 这两格是**新建会话时**才读的快照：建会话那一刻把令牌写进库里，跑着的会话不会中途
+    # 换凭据（见 ``session/manager.create_session``）。
+    # 用户名是 PAT 场景的 git 认证用户名：OAuth 没了以后没有「自动 oauth2」那条路，
+    # 留空就退回平台默认值（Gitee ``oauth2`` / GitHub ``x-access-token``）。
+    RuntimeSetting(
+        "gitee_access_token", "访问令牌（Gitee）", "代码平台", "secret", "gitee_access_token"
+    ),
+    RuntimeSetting("gitee_username", "git 用户名（Gitee）", "代码平台", "str", "gitee_username"),
+    RuntimeSetting(
+        "github_access_token",
+        "访问令牌（GitHub）",
+        "代码平台",
+        "secret",
+        "github_access_token",
+    ),
+    RuntimeSetting(
+        "github_username", "git 用户名（GitHub）", "代码平台", "str", "github_username"
+    ),
     # -- 上下文窗口配置：**只留两条阈值**（2026-10-14 用户口径）--
     # 窗口本身是**模型**的属性，界面上不再逐家/逐个配：按模型查（表 provider_models）→
     # 行内手填覆盖 → 兜底值。阈值是**提醒**的口径（环图变色），留在这儿。
@@ -188,7 +210,7 @@ def coerce_runtime_setting(item: RuntimeSetting, value: Any) -> Any:
 
     空串对字符串是合法值（比如把默认分支清空＝回到「用远程探测的默认分支」）。
     """
-    if item.kind == "str":
+    if item.kind in ("str", "secret"):
         return str(value).strip()
     if item.kind == "int":
         return int(value)
@@ -717,7 +739,8 @@ class Settings(BaseSettings):
     sandbox_setup_command: str = "/usr/local/sbin/setup.sh"
 
     # 代码平台（Gitee / GitHub，PR 创建/评论/查询）。owner/repo 与**平台**都由请求的仓库
-    # 地址解析（见 codeplatform.Platform.of_url），token 请求优先、此处兜底。
+    # 地址解析（见 codeplatform.Platform.of_url）。令牌**只有这一处来源**：既可以从
+    # ``.env`` 起手，也可以在设置页「代码平台」那一栏改（2026-10-20 起 OAuth 登录已删）。
     gitee_access_token: str = ""
     gitee_username: str = ""
     gitee_base_url: str = "https://gitee.com/api/v5"
@@ -780,6 +803,14 @@ class Settings(BaseSettings):
         return (
             self.github_username if platform is Platform.GITHUB else self.gitee_username
         )
+
+    def code_platform_secret_values(self) -> tuple[str, ...]:
+        """两家的访问令牌 —— 给脱敏词表用。
+
+        它们可能在设置页里配（2026-10-20 起），也就可能被模型复述进日志 / 记录里；
+        与会话里那份（``session.repo.token``）一起进词表，见 ``server/turn/runner.py``。
+        """
+        return secret_terms(self.gitee_access_token, self.github_access_token)
 
     def model_secret_values(self) -> tuple[str, ...]:
         """所有**模型凭据**（界面配的那些行 + ``.env`` 里几家 + JEV / 分类）—— 给脱敏词表用。
