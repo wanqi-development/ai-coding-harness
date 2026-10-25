@@ -193,7 +193,7 @@ const nowTick = ref(Date.now())
 
 function elapsedLabel(m: Message): string {
   const total = m.elapsedMs ?? (m.startedAt ? nowTick.value - m.startedAt : 0)
-  if (!total || total < 0) return ''
+  if (!Number.isFinite(total) || total < 0) return ''
   const seconds = Math.round(total / 1000)
   if (seconds < 60) return `${seconds}s`
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`
@@ -603,7 +603,10 @@ async function loadOlder() {
     const older = page.items
       .map(recordToMessage)
       .filter((m): m is Message => m !== null && m.parts.length > 0)
-    if (older.length) messages.value = [...older, ...messages.value]
+    if (older.length) {
+      messages.value = [...older, ...messages.value]
+      fillElapsedFromUser(messages.value)
+    }
     hasMoreHistory.value = page.has_more
     nextBeforeId.value = page.next_before_id
     visibleTail.value = VISIBLE_TAIL
@@ -977,7 +980,34 @@ function recordToMessage(r: RecordItem): Message | null {
     at: r.created_at,
     usage: r.usage ?? undefined,
     changes: (r.extra?.changes as ChangesInfo | undefined) ?? undefined,
+    elapsedMs:
+      typeof r.extra?.elapsed_ms === 'number' && r.extra.elapsed_ms >= 0
+        ? r.extra.elapsed_ms
+        : undefined,
     recordId: r.id,
+  }
+}
+
+/** 老记录没有持久化耗时：用相邻 user / assistant 时间补齐，仍以已有 elapsedMs 为准。 */
+function fillElapsedFromUser(items: Message[]): void {
+  let userAt = ''
+  for (const item of items) {
+    if (item.role === 'user') {
+      userAt = item.at
+      continue
+    }
+    if (
+      !userAt ||
+      item.elapsedMs !== undefined ||
+      !item.parts.some((part) => part.kind === 'text')
+    ) {
+      continue
+    }
+    const started = Date.parse(userAt)
+    const ended = Date.parse(item.at)
+    if (Number.isFinite(started) && Number.isFinite(ended)) {
+      item.elapsedMs = Math.max(0, ended - started)
+    }
   }
 }
 
@@ -1029,6 +1059,7 @@ async function openSession(id: string) {
     })
     // 方案记录万一缺 plan_id（老数据）会映射成空块：丢掉它，别留一条空消息
     .filter((m) => m.parts.length)
+  fillElapsedFromUser(messages.value)
   visibleTail.value = VISIBLE_TAIL
   scrollToBottom()
   try {
@@ -1430,6 +1461,12 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
       persisted = null
     }
     if (persisted) {
+      if (persisted.elapsedMs === undefined && msg.startedAt) {
+        const endedAt = Date.parse(persisted.at)
+        if (Number.isFinite(endedAt)) {
+          persisted.elapsedMs = Math.max(0, endedAt - msg.startedAt)
+        }
+      }
       const at = messages.value.indexOf(msg)
       if (at >= 0) messages.value[at] = persisted
     } else if (!completed && !stopping.value && currentId.value === id) {
@@ -1796,8 +1833,8 @@ onUnmounted(() => {
           <div v-else class="bubble">
             <!-- 执行时间（用户口径：放在 AI 回复的最上面，就叫 working…）。
                  跑着显示 `working… 12s`，跑完冻结成「用时 12s」。 -->
-            <p v-if="m.startedAt || m.elapsedMs" class="working">
-              <template v-if="m.elapsedMs">用时 {{ elapsedLabel(m) }}</template>
+            <p v-if="m.startedAt || m.elapsedMs !== undefined" class="working">
+              <template v-if="m.elapsedMs !== undefined">用时 {{ elapsedLabel(m) }}</template>
               <template v-else>working<span class="working-dots">…</span> {{ elapsedLabel(m) }}</template>
             </p>
             <HandoffRun

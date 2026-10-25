@@ -140,6 +140,7 @@ class TurnRecordsMixin:
         extra: Mapping[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
         changes: Mapping[str, Any] | None = None,
+        elapsed_ms: int | None = None,
     ) -> None:
         """一轮跑到一半断了：把已产出的部分补一条记录，别让它在历史里凭空消失。
 
@@ -172,6 +173,8 @@ class TurnRecordsMixin:
         if usage is not None:
             # 中断的轮次同样入账（钱真花了），``usage.interrupted`` 已标成真
             fields["usage"] = usage
+        if elapsed_ms is not None:
+            fields["elapsed_ms"] = max(0, int(elapsed_ms))
         if changes is not None:
             # 中止前已经建成的 PR 仍要展示改动（2026-10-20：reviewer 触发循环守卫后
             # 整块「本轮改动」消失，用户以为功能没了）

@@ -196,7 +196,13 @@ def plan_reads(monkeypatch) -> list[int]:
     return reads
 
 
-async def _run(events: list[dict], terms: tuple[str, ...] = ()) -> list[dict]:
+async def _run(
+    events: list[dict],
+    terms: tuple[str, ...] = (),
+    *,
+    intent: str = "coding",
+    initial_pr_refs: dict[str, str] | None = None,
+) -> list[dict]:
     svc = HarnessService(
         settings=FAKE_SETTINGS, manager=_FakeManager(events), database=_FakeDb()
     )
@@ -207,8 +213,9 @@ async def _run(events: list[dict], terms: tuple[str, ...] = ()) -> list[dict]:
     return [
         e
         async for e in svc._run_agent(
-            session, runtime, "做点事", "coding", terms,
+            session, runtime, "做点事", intent, terms,
             state=TurnState(message="做点事"),
+            initial_pr_refs=initial_pr_refs,
         )
     ]
 
@@ -645,7 +652,9 @@ class TestUserVisibleStream:
         assert record["summary"] == "已拿到方案。"
         # 假事件里没有 ``message-finish`` 的用量 → 账是空的（不是没有 usage 这一项：
         # 每一轮都要在记录上留下「这一轮花了多少」的位置，界面据此区分「没花」与「没记」）
-        assert record["extra"] == {"intent": "coding", "usage": EMPTY_USAGE}
+        extra = record["extra"]
+        assert isinstance(extra.pop("elapsed_ms"), int)
+        assert extra == {"intent": "coding", "usage": EMPTY_USAGE}
 
     async def test_subagent_narration_is_not_persisted(self, recorded):
         """子智能体的文本也不进落库内容，否则重新打开会话又冒出来。"""
@@ -669,7 +678,9 @@ class TestUserVisibleStream:
             ]
         )
 
-        assert recorded[-1]["extra"] == {
+        extra = recorded[-1]["extra"]
+        assert isinstance(extra.pop("elapsed_ms"), int)
+        assert extra == {
             "intent": "coding",
             "parts": [
                 {"kind": "text", "content": "先列清单。开始动手。"},

@@ -140,6 +140,7 @@ class TestInterruptedRecord:
         assert "模型侧炸了" in rec["content"]
         assert rec["summary"] == "前半段正文"
         assert rec["extra"]["partial"] is True
+        assert isinstance(rec["extra"]["elapsed_ms"], int)
         assert rec["extra"]["error"]["type"] == "RuntimeError"
         assert rec["extra"]["intent"] == "coding"
         # 故障路径不带终止标记：两个分支共用一个 extra 拼装，别串味
@@ -198,6 +199,7 @@ class TestInterruptedRecord:
         assert len(records) == 1
         assert records[0]["content"] == "整段正文"
         assert "partial" not in records[0]["extra"]
+        assert isinstance(records[0]["extra"]["elapsed_ms"], int)
         assert INTERRUPTED_PARTIAL not in records[0]["content"]
 
 
@@ -218,6 +220,7 @@ class TestCancelledRecord:
         assert rec["content"] == f"前半段正文\n\n{CANCELLED_BY_USER}"
         assert rec["summary"] == "前半段正文"
         assert rec["extra"]["partial"] is True
+        assert isinstance(rec["extra"]["elapsed_ms"], int)
         assert rec["extra"]["cancelled"] is True
         assert rec["extra"]["intent"] == "coding"
         # 「错误：CancelledError」对用户毫无意义，异常信息一律不进这条记录
@@ -285,6 +288,7 @@ class TestLoopAbortRecord:
         assert rec["content"] == f"前半段正文\n\n{LOOP_ABORT_MARKER}"
         assert rec["summary"] == "前半段正文"
         assert rec["extra"]["partial"] is True
+        assert isinstance(rec["extra"]["elapsed_ms"], int)
         assert rec["extra"]["aborted"] == ABORT_REASON
         assert rec["extra"]["tool"] == "execute"
         assert rec["extra"]["intent"] == "coding"

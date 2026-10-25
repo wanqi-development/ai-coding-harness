@@ -44,6 +44,17 @@ def pull_head(pull: dict[str, Any]) -> tuple[str, str]:
     return str(head.get("ref") or "").strip(), str(head.get("sha") or "").strip()
 
 
+def pull_refs(pull: dict[str, Any]) -> dict[str, str] | None:
+    """取 PR 的 base / head diff 参照；分支名优先，缺失时回落到 SHA。"""
+    base = pull.get("base")
+    head = pull.get("head")
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        return None
+    base_ref = str(base.get("ref") or base.get("sha") or "").strip()
+    head_ref = str(head.get("ref") or head.get("sha") or "").strip()
+    return {"base": base_ref, "head": head_ref} if base_ref and head_ref else None
+
+
 def sync_command(*, repo_url: str, repo_dir: str, head_ref: str, head_sha: str) -> str:
     """生成只允许快进的安全同步脚本；脏工作区或分叉时主动失败。"""
     return f"""set -eu
