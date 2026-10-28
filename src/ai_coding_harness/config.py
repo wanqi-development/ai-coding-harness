@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_coding_harness.core.codeplatform import Platform
 from ai_coding_harness.safety.redact import secret_terms
+from ai_coding_harness.utils.path_util import ROOT_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -152,29 +153,6 @@ class RuntimeSetting:
 
 
 RUNTIME_SETTINGS: tuple[RuntimeSetting, ...] = (
-    # -- 代码缓存配置（代码面板那份本地裸仓）--
-    RuntimeSetting("repo_view_dir", "代码缓存路径", "代码缓存配置", "str", "repo_view_dir"),
-    RuntimeSetting("gitee_base_branch", "默认分支（Gitee）", "代码缓存配置", "str", "gitee_base_branch"),
-    RuntimeSetting("github_base_branch", "默认分支（GitHub）", "代码缓存配置", "str", "github_base_branch"),
-    # -- 代码平台凭据（2026-10-20 用户口径：OAuth 登录整块删掉，令牌改成配置项）--
-    # 这两格是**新建会话时**才读的快照：建会话那一刻把令牌写进库里，跑着的会话不会中途
-    # 换凭据（见 ``session/manager.create_session``）。
-    # 用户名是 PAT 场景的 git 认证用户名：OAuth 没了以后没有「自动 oauth2」那条路，
-    # 留空就退回平台默认值（Gitee ``oauth2`` / GitHub ``x-access-token``）。
-    RuntimeSetting(
-        "gitee_access_token", "访问令牌（Gitee）", "代码平台", "secret", "gitee_access_token"
-    ),
-    RuntimeSetting("gitee_username", "git 用户名（Gitee）", "代码平台", "str", "gitee_username"),
-    RuntimeSetting(
-        "github_access_token",
-        "访问令牌（GitHub）",
-        "代码平台",
-        "secret",
-        "github_access_token",
-    ),
-    RuntimeSetting(
-        "github_username", "git 用户名（GitHub）", "代码平台", "str", "github_username"
-    ),
     # -- 上下文窗口配置：**只留两条阈值**（2026-10-14 用户口径）--
     # 窗口本身是**模型**的属性，界面上不再逐家/逐个配：按模型查（表 provider_models）→
     # 行内手填覆盖 → 兜底值。阈值是**提醒**的口径（环图变色），留在这儿。
@@ -418,7 +396,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ROOT_DIR / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -429,7 +407,11 @@ class Settings(BaseSettings):
     # **没有出厂默认**（2026-10-15 用户口径：干掉 .env 那套回落）：空 = 这一行没有模型可用，
     # 用到它的角色会当场报错（报错文案见 ``agent/llm._config_for``）；下面那些
     # ``<供应商>_*`` 字段只剩 **web 搜索**（GLM）在用，不再参与模型解析。
+    #: 仅保留给无用户的单元测试 / 旧调用；生产请求按 ``user_agent_models`` 取自己的配置，
+    #: 不存在跨用户回落。
     agent_models: dict[str, ModelConfig] = {}
+    user_agent_models: dict[int, dict[str, ModelConfig]] = {}
+    user_intent_modes: dict[int, str] = {}
     #: 意图识别走哪一关：``jev``（优先，默认）/ ``llm``。库里 ``intent_mode`` 那一行覆盖它。
     intent_mode: str = "jev"
     #: 提供商目录（表 ``model_providers`` 的当前内容；启动时读进来）。空 = 用内置那份
@@ -583,6 +565,17 @@ class Settings(BaseSettings):
     # （PING 中位 62ms、p95 92ms，服务端慢日志是空的），1 秒只给 16 倍余量，隧道抖一下
     # （TCP 重传通常 ≥200ms、连丢可到 1s 以上）就把进程打到降级。默认给 5 秒。
     redis_timeout_seconds: float = float(os.getenv("REDIS_TIMEOUT_SECONDS", "5.0"))
+    # 版本化 Session 快照缓存；token 在 Redis 里始终加密，TTL 只是兜底。
+    redis_session_cache_ttl_seconds: int = int(
+        os.getenv("REDIS_SESSION_CACHE_TTL_SECONDS", "300")
+    )
+    session_cache_encryption_key: str = os.getenv("SESSION_CACHE_ENCRYPTION_KEY", "")
+    session_cache_key_version: int = int(os.getenv("SESSION_CACHE_KEY_VERSION", "1"))
+    verify_repo_access: bool = os.getenv("VERIFY_REPO_ACCESS", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     # 降级窗口：一次失败后退回进程内这么多秒，**过了就再试一次**（不是永久降级 ——
     # 理由与实测见 infra/redis_cache.py 的 ``RedisBacked.run``）。设 0 ＝ 永不重试（旧行为）。
     redis_degrade_cooldown_seconds: float = float(
@@ -632,6 +625,18 @@ class Settings(BaseSettings):
     # 注：子智能体各自持有自己的步数预算（同样是 9999），不计入本值。
     agent_recursion_limit: int = int(os.getenv("AGENT_RECURSION_LIMIT", "200"))
 
+    # 多用户认证：浏览器只持有不透明 token，会话事实存 PostgreSQL，因此多 worker 可共享。
+    auth_session_cookie: str = os.getenv("AUTH_SESSION_COOKIE", "harness_session")
+    auth_csrf_cookie: str = os.getenv("AUTH_CSRF_COOKIE", "harness_csrf")
+    auth_cookie_secure: bool = (
+        os.getenv("AUTH_COOKIE_SECURE", "false").strip().lower()
+        in ("1", "true", "yes")
+    )
+    auth_session_ttl_hours: int = int(os.getenv("AUTH_SESSION_TTL_HOURS", "168"))
+    auth_idle_timeout_hours: int = int(os.getenv("AUTH_IDLE_TIMEOUT_HOURS", "24"))
+    auth_login_max_failures: int = int(os.getenv("AUTH_LOGIN_MAX_FAILURES", "5"))
+    auth_login_lock_seconds: int = int(os.getenv("AUTH_LOGIN_LOCK_SECONDS", "60"))
+
     # 空转刹车：同一工具、同一参数在本轮出现到第 N 次就不再执行（回一条警告 ToolMessage），
     # 第 N+1 次直接中止本轮并补一条中断记录。计的是**本轮出现次数**、不要求相邻 ——
     # 2026-09-21 那次 686 秒的打转里 `git status` 与 `git log` 是交错的。0 = 关掉。
@@ -665,6 +670,9 @@ class Settings(BaseSettings):
     postgres_db: str = "ai_coding_harness"
     postgres_user: str = "postgres"
     postgres_password: str = ""
+    postgres_connect_timeout_seconds: int = int(
+        os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "5")
+    )
 
     # OpenSandbox
     opensandbox_domain: str = "192.168.72.128:8080"
@@ -738,9 +746,9 @@ class Settings(BaseSettings):
     # 推入，读沙箱内 `$GIT_TOKEN` 写 `.secrets`；必须不阻塞，勿含 `exec tail`）
     sandbox_setup_command: str = "/usr/local/sbin/setup.sh"
 
-    # 代码平台（Gitee / GitHub，PR 创建/评论/查询）。owner/repo 与**平台**都由请求的仓库
-    # 地址解析（见 codeplatform.Platform.of_url）。令牌**只有这一处来源**：既可以从
-    # ``.env`` 起手，也可以在设置页「代码平台」那一栏改（2026-10-20 起 OAuth 登录已删）。
+    # 代码平台 base URL 在部署级配置；token / git 用户名是用户级配置
+    # （``user_settings`` → ``settings_for_user``）。下面两格只留给无用户的旧测试夹具，
+    # 生产用户绝不回落到这里。
     gitee_access_token: str = ""
     gitee_username: str = ""
     gitee_base_url: str = "https://gitee.com/api/v5"
@@ -791,7 +799,11 @@ class Settings(BaseSettings):
         return f"{self.sandbox_sbin_dir}/git-askpass"
 
     def token_for(self, platform: Platform) -> str:
-        """该平台配置里的令牌（会话自带的那份优先 —— 由调用方决定用哪个）。"""
+        """该 Settings 视图里的平台令牌。
+
+        生产调用方拿到的都应是 ``settings_for_user`` 生成的用户视图；没有 user_id 的旧测试
+        夹具才直接读这两格。
+        """
         return (
             self.github_access_token
             if platform is Platform.GITHUB

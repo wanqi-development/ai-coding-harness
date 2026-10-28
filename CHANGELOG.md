@@ -19,11 +19,308 @@
 | api/ HTTP 接口 | ✅ 完成 |
 | safety/ 安全 | ✅ 完成（全局底线 + 按智能体的工具 / 目录边界） |
 | observability/ 可观测 | ✅ 完成 |
-| tests/ 测试 | ✅ 完成（1588 条全过） |
+| tests/ 测试 | ✅ 完成（1336 条全过） |
 
 ## 修改记录
 
+### 2026-10-28
+
+#### 启动脚本按平台拆分，并增加前后端独立入口
+
+- **动机**：原先 Windows / Linux 启动脚本都堆在仓库根目录，合并启动逻辑与单服务启动
+  无法复用，平台差异也混在同一层。
+- **改动**：
+  - Windows 实现迁入 `scripts/windows`，新增 `start-backend.bat` /
+    `start-frontend.bat`；`start.bat` 继续合并启动并打开浏览器。
+  - Linux 实现迁入 `scripts/linux`，同步新增 `start-backend.sh` /
+    `start-frontend.sh`；`start.sh` 继续后台启动后端、前台启动前端。
+  - 根目录只保留 `start.bat` 作为 Windows 兼容入口；根目录旧 `start.sh` 删除。
+  - 两个平台各有一份 `_common`，统一路径、端口、健康探测与预检逻辑。
+  - 清理 `scripts/__pycache__`；保留 `check_prompts.py`、`eval_intent.py`、
+    `make_drawio.py` 和 `verify_opensandbox.py`，四者仍分别用于提示词检查、意图评测、
+    流程图导出和沙箱诊断。
+- **关键决策**：平台启动脚本完全分开，不尝试用一个 shell 同时兼容 Windows 与 Linux；
+  单服务脚本使用当前终端前台运行，合并脚本负责编排、等待和清理。
+- **验证**：Windows 四个 `.bat` 均为 GBK + CRLF，无替换字符；公共脚本的后端/前端预检、
+  空闲端口探测和健康探测超时返回均符合预期。Linux 四个 `.sh` 全部通过 `bash -n`，
+  且从子目录正确解析到仓库根。`scripts/__pycache__` 已删除，根目录 `start.sh` 已移除。
+  全量 `pytest` **1336 passed, 2 warnings**；README / AGENTS 引用检查与
+  `git diff --check` 通过。本次没有 Python 源码变更。
+- **遗留**：为避免占用现有 8000 / 5173 服务，仅验证公共启动流程，没有实际拉起并关闭
+  一整套前后端；用户首次按新入口启动时仍需按端口占用提示操作。
+
+#### GPT-6 改用 Responses API 返回可展示的思考摘要
+
+- **动机**：`gpt-6-luna` / `gpt-6.1-sol` 走 Chat Completions 时只返回 reasoning
+  token，界面拿不到可读思考；自用网关实测 Responses API 能流式返回 reasoning summary。
+- **改动**：
+  - 模型构造新增 `gpt-6*` 能力判断：使用 Responses API、`responses/v1` 输出格式、
+    `effort=high` 与 `summary=detailed`。
+  - 保持完整本地历史，不启用 `previous_response_id`，现有 checkpoint 与上下文压缩
+    继续按本地消息工作。
+  - GPT-5、DeepSeek、GLM、Kimi 等其他模型继续走原有 Chat Completions 参数。
+  - 补充 GPT-6 Responses 参数、GPT-5 不变契约和官方 reasoning block 的测试。
+- **关键决策**：`clear_thinking` 不是展示思考的开关，本次不引入；GPT-6 的可读思考
+  只认 Responses reasoning summary，其他模型不在本次改动范围内。
+- **验证**：定向测试 **55 passed**；全量 `pytest` **1336 passed, 2 warnings**；
+  `ruff check` 通过；使用当前数据库配置构造 `gpt-6.1-sol`，v3 流实测收到 464 字
+  reasoning summary 与 185 字正文。
+- **遗留**：本次只在自用 ztoken 网关验证；切换到官方 OpenAI 或其他兼容网关时，仍需确认
+  对方是否完整支持 Responses API、reasoning summary 与工具历史回传。
+
+### 2026-10-27
+
+#### 模型配置禁止半填行，并修复切换供应商后的旧 Key 误判
+
+- **动机**：coder 行保存成 `model + base_url + api_key(空)`，运行时仍被当成已配置，
+  最终由 OpenAI SDK 抛出 `Missing credentials`。切换供应商后旧 Key 的占位符仍显示，
+  测试连接还会借用旧 Key，造成“看起来已配置”的错觉。
+- **改动**：
+  - 前端切换供应商后立即隐藏旧 Key 掩码、清空实际草稿并失效测试凭据；未保存前切回
+    原供应商可恢复旧 Key 使用权。
+  - 测试连接不再常驻显示“先填 Key”提示；点击时校验，缺 Key 直接把输入框标红，
+    缺少 base_url 同样标红。
+  - 保存按钮要求 `model + base_url + 有效 Key` 完整；保存成功后从后端最新行重建草稿，
+    清掉 `dirty / clear_key` 残留。
+  - 后端 PUT 合并旧值后做最终完整性校验，拒绝半填行；清 Key 但保留模型会返回 400。
+  - 运行时只把三字段完整的行视为已配置；半填行按“未配置”处理，可回落统一模型，
+    不再把空 Key 传给 OpenAI SDK。
+  - 测试连接不再在切换供应商后向后端借用旧行 Key。
+- **关键决策**：API Key 不跨供应商隐式继承；需要停用整行时走显式 DELETE，不用
+  “保留模型但清空 Key”的半状态。
+- **验证**：全量 `pytest` **1326 passed, 2 warnings**；前端生产构建、改动文件
+  `ruff check` 与 `git diff --check` 通过。
+- **遗留**：存量半填行不会自动补 Key，需要在界面上补全或清空；当前 coder 行仍需手动补一次。
+
+#### 用户级代码平台凭据、版本化 Session 缓存与仓库记忆平台迁移
+
+- **动机**：代码平台 token 仍是管理员全局配置，与多用户体系冲突；`app.state.sessions`
+  永久缓存导致换 token 后旧值不失效，多 worker 下也各存一份。仓库记忆路径只有
+  `owner/repo`，Gitee 与 GitHub 同名仓库会互相覆盖。
+- **改动**：
+  - `user_settings` 新增 Gitee/GitHub token 与 git 用户名；`/me/settings` 按当前用户
+    读写，GET 只回 token 掩码，PUT 不回显，清空输入框再保存即删除。
+  - 创建会话前使用当前用户凭据检查仓库访问权；无权或仓库不存在时返回 403，前端用
+    弹窗提示，不再先落一个注定失败的会话。
+  - token 更新先校验该用户全部活跃会话的仓库权限；有失权仓库则整次拒绝。成功后重写
+    活跃会话 token、递增 `credential_version/session_version`，当前轮不换凭据。
+  - 数据迁移把旧全局 token 只留给管理员；其他现有用户的会话凭据被清除，未归属历史会话
+    在对齐管理员后使用管理员凭据。
+  - 新增版本化 `SessionSnapshot` 缓存，TTL 5 分钟。Redis 模式使用 AES-256-GCM 加密，
+    启用 Redis 但缺少有效 `SESSION_CACHE_ENCRYPTION_KEY` 时拒绝启动；单 worker 无 Redis
+    时使用有 TTL 的进程内快照。
+  - 沙箱发现凭据版本落后时先推送新版 askpass/setup 脚本，再原地重跑 setup；失败才销毁
+    并在下一轮重建。setup 现在会持久化 git 用户名，且清空 token 时会删除旧凭据文件。
+  - 仓库记忆路径改为 `/memories/<platform>/<owner>/<repo>.md`；新增
+    `manage migrate-repo-memory`，一次性迁移旧 key，不保留旧路径读取。
+  - 仓库对象补 `platform`，会话复用查询和咨询锁也改为平台 + owner + name，避免跨平台
+    同名仓库碰撞。
+- **关键决策**：仓库记忆与 PR 是仓库级共享数据，不按用户复制；共享访问必须建立在
+  当前用户拥有仓库权限之上。用户配置、会话快照和沙箱凭据都用单调版本协调。
+- **验证**：迁移 `a7b8c9d0e1f2` 与 `b8c9d0e1f2a3` 已在本地 PostgreSQL 执行；仓库记忆
+  `/zzpfordevelopment/wanqi-mall.md` 已迁移为
+  `/gitee/zzpfordevelopment/wanqi-mall.md`；全量 `pytest` **1324 passed, 2 warnings**；
+  前端生产构建、`ruff check` 与 `git diff --check` 通过。
+- **遗留**：启用 Redis 的部署在重启前必须配置 `SESSION_CACHE_ENCRYPTION_KEY`；
+  PostgreSQL 中的 token 仍按现有字段明文存储，本次只加密 Redis 快照。
+
+### 2026-10-26
+
+#### AGENTS.md 改为仅本机维护
+
+- **动机**：新增“功能实施前按前后端分别确认”的协作硬约束；该约定需要跨对话压缩与代理切换保留，
+  但只属于本机协作材料，不随产品仓库发布。
+- **改动**：在本地 `AGENTS.md` 增加需求确认门槛；`.gitignore` 忽略 `AGENTS.md`，并从 Git
+  索引移除该文件，工作区文件本身保留。
+- **关键决策**：只有双方明确达成一致并放行后才实施功能；后端逐项核对细节，前端先比较
+  2～3 个候选方案；用户提出需求不等于同意当前方案。
+- **验证**：`git check-ignore -v AGENTS.md` 命中 `.gitignore`，`AGENTS.md` 已不再被 Git
+  跟踪且本地文件仍在；`git diff --check` 通过。本次只改协作约定与忽略规则，无代码测试项。
+- **遗留**：无。
+
+#### 侧栏底部账号区与管理员提供商入口
+
+- **动机**：设置入口与退出登录原先挤在侧栏顶部品牌行；提供商管理又错误地从管理员设置中消失。
+- **改动**：展开态左栏底部同一行放“用户名 + 设置图标”，用户名在左、仅图标在右、不再显示 `@`；
+  点击用户名展开账号详情，显示显示名、用户名、角色、用户 ID、账号时间、当前登录会话信息，
+  详情内再提供“修改密码 / 退出登录”；收起态保留设置图标与用户首字。设置页恢复“提供商”栏，
+  仅管理员可见。
+- **关键决策**：点击用户名不再直接退出，退出必须从账号详情显式触发；不额外显示“设置”文字和
+  “退出”文字；member 仍看不到提供商管理，但模型配置弹窗可只读使用目录。
+- **验证**：全量 `pytest` **1316 passed, 2 warnings**；前端生产构建与后端改动文件
+  `ruff check` 通过；浏览器验收确认点击用户名时 `/auth/logout` 调用数为 0、详情字段完整，
+  点击详情内“退出登录”后调用一次并回到登录页；admin 菜单含“提供商”，member 菜单不含；
+  `git diff --check` 通过。
+- **遗留**：无。
+
+#### 用户级模型、缓存路径与默认分支
+
+- **动机**：多用户下模型、代码缓存路径和默认分支不能由管理员一份全局配置覆盖所有用户；
+  上下文阈值、意图澄清阈值仍属于部署级参数，只应由管理员修改。
+- **改动**：
+  - 新增迁移 `f6a7b8c9d0e1`：新建 `user_settings`，并把现有全局缓存路径、Gitee/GitHub
+    默认分支与模型配置归给当前管理员；删除 `app_settings` 里三格已迁移的用户级键。
+  - `model_endpoints` 改为 `(user_id, agent)` 复合主键；模型、兜底模型、JEV、分类模型与
+    `intent_mode` 都按会话所属用户解析，新用户默认没有模型配置。
+  - 新增 `GET/PUT /me/settings`：当前用户维护自己的代码缓存路径和默认分支；默认缓存目录为
+    `~/.ai-coding-harness/users/<user_id>/repo_cache`。
+  - `/model-config` 对所有登录用户开放，但只读写自己的行；提供商目录 GET 仍供模型弹窗只读
+    使用，提供商目录 PUT / reload / 模型行 PUT 仍仅管理员。
+  - 每次解析会话都从 PostgreSQL 重新加载该用户的模型行、意图模式、缓存路径和默认分支，
+    因此多 worker 下不依赖处理保存请求的那个 worker 的内存快照。
+  - 设置页的“提供商”栏仅 admin 可见；member 可看到“基本设置 / 外观 / 模型配置”，
+    admin 另见“用户管理 / 提供商”。
+  - 会话创建、代码面板、PR 状态查询、diff 计算和 Agent 模型装配都使用会话所属用户设置。
+- **关键决策**：平台用户共享一个操作系统账号，因此默认缓存不直接使用共享的 `Path.home()`，
+  必须带 `user_id` 隔离；用户可填写绝对路径，但禁止文件系统根目录。
+- **验证**：迁移已从 `e5f6a7b8c9d0` 升到 `f6a7b8c9d0e1`；管理员现有 10 个模型行成功归户；
+  真实 PostgreSQL 读取验证管理员 `qa=deepseek-flash`，未配置用户为 `unset`；全量 `pytest`
+  **1316 passed, 2 warnings**；前端生产构建通过；浏览器验收管理员菜单为
+  “基本设置 / 外观 / 用户管理 / 模型配置”，member 为“基本设置 / 外观 / 模型配置”，
+  提供商栏只对 admin 显示；应用在迁移后的真实 PostgreSQL 上启动并通过 `/health`。
+- **遗留**：Gitee/GitHub 访问令牌仍是管理员全局配置；每用户代码平台凭据、仓库记忆和 PR 数据
+  隔离仍属于下一阶段。
+
+#### 多用户账号管理与 RBAC 第一阶段
+
+- **动机**：单用户认证已能保证登录门禁，但完整多用户体系还需要管理员账号生命周期、
+  角色权限、首次改密和跨用户会话隔离。
+- **改动**：
+  - `AuthMiddleware` 增加 `admin/member` 权限门禁：`/users`、`/app-settings`、
+    `/model-config` 仅管理员可访问。
+  - 强制首次改密：管理员创建账号或重置密码后，用户只能访问当前身份、退出和改密接口；
+    前端增加全屏改密门禁。
+  - 新增 `/users` 管理接口：列表、创建、修改显示名/角色/启停、重置密码、撤销登录会话。
+  - 禁止停用或降级最后一个启用管理员，也禁止管理员通过用户管理接口停用自己。
+  - 设置页增加管理员专属“用户管理”，支持创建账号、角色切换、启停、重置密码与会话撤销；
+    普通成员只显示基本设置和外观。
+  - 同仓库活跃会话复用改为 `user_id + repo`，不同用户不会再复用同一个会话与工作区。
+- **关键决策**：不开放公开注册，账号由管理员创建；创建/重置只设置临时密码，必须首次
+  登录改密；账号停用和密码重置都会撤销全部登录会话；权限拦截以后端中间件为准。
+- **验证**：用户管理/RBAC/强制改密/会话复用定向测试 **17 passed**；全量 `pytest`
+  **1313 passed, 2 warnings**；前端生产构建通过；浏览器验收确认管理员/成员菜单权限
+  与 `/users` 创建请求；`ruff check` 与 `git diff --check` 通过。
+- **遗留**：每用户独立的 Gitee/GitHub 凭据、仓库记忆和 PR 数据隔离仍属于下一阶段；
+  OIDC/SAML、邮件找回密码和 2FA 尚未实现。
+
+#### Markdown 内嵌 Mermaid 流程图
+
+- **动机**：最新会话里的订单链路图已经是合法的 Mermaid 围栏，但前端没有 Mermaid
+  渲染器，只能当普通代码块显示；此外这张图的 `{no}` 边标签、`-. 3. MQ .->`
+  虚线和 `<br/>@Transactional...` 节点文本会触发 Mermaid 11 的解析错误。
+- **改动**：
+  - 新增 `MarkdownContent.vue`，只从完整 Markdown 中切出 Mermaid 围栏，普通正文仍由
+    `marked` 渲染；聊天正文、方案正文与仓库记忆共用同一个入口。
+  - 新增 `MermaidDiagram.vue`：按需加载 Mermaid、输出 SVG、浅深主题切换重渲染，
+    支持适应宽度/原始大小、全屏查看、源码展开、复制与 SVG 下载；默认按 100%
+    可读尺寸展示，超出聊天宽高的内容在卡片内双向滚动。
+  - 按 Mermaid 首行识别流程图、状态图、时序图等类型，不再把所有图都叫“流程图”。
+  - 渲染前兼容修复三类模型常见写法：边标签内含 `{}`、虚线边标签含编号句点、
+    节点标签内含 `@`；另对 `sequenceDiagram` 参与者 ID 的保留字（如 `OFF`）做安全改名，
+    原始 Mermaid 源码不变。
+  - Mermaid 加载、唯一 ID 与渲染队列移到模块级并串行执行；同一消息含多张图时不会因
+    DOM ID 冲突互相覆盖，也不会并发争用 Mermaid 的全局解析状态。
+  - 使用 Mermaid `securityLevel: strict`，SVG 再经 DOMPurify 清洗；保留
+    `foreignObject` 以显示 HTML 节点文字，拒绝 script 与事件属性。
+  - 语法错误时显示错误和源码，不出现空白图。
+- **关键决策**：Mermaid 只在前端按需加载，不进入首屏主包；数据库和 SSE 继续保存/传输
+  原始 Markdown，历史消息无需迁移。渲染仍只发生在任务结束后的 Markdown 化阶段。
+- **验证**：`mermaid@11.17.2` / `dompurify@3.4.17`；前端生产构建通过；全量 `pytest`
+  **1309 passed, 2 warnings**；用最新会话
+  最近两轮 `record_id=885/887` 的 5 张真实图做 Edge + Playwright 渲染，5 张 SVG
+  全部成功、类型标题正确、节点文字完整、图表内 0 个 script；900px 内容区默认有效字号
+  从 4.2～5.2px 提升到 14px，适应宽度、原始大小、全屏、Esc 关闭和深色重渲染均通过。
+- **遗留**：Mermaid 为独立懒加载块，首次看图需加载约 143KB gzip 资源；无流程图的会话
+  不加载这部分代码。`npm audit --omit=dev` 仍有 Mermaid 传递的 KaTeX 低危公告，以及
+  Vue 构建链 `source-map-js` 的高危公告；当前依赖树没有可用的直接升级解。
+
+### 2026-10-25
+
+#### rework 文件改动与执行耗时持久化
+
+- **动机**：rework 更新既有 PR 时不会调用 `create_pr`，原实现只从 `create_pr` 入参保存
+  `base/head`，导致本轮已有代码改动但界面没有文件清单；另外 assistant 记录持久化后前端
+  没有恢复耗时，“working”计时在回填时丢失。
+- **改动**：
+  - rework 在同步目标 PR 后，从 PR 快照取 `base/head`（分支名优先、SHA 兜底）作为本轮
+    `changes` 的参照；coding 仍使用 `create_pr` 入参。
+  - `_run_agent` 从轮次开始做 monotonic 计时，正常、异常、循环中止与用户取消都把
+    `elapsed_ms` 写入 assistant 记录 `extra`。
+  - 前端从持久化记录恢复 `elapsedMs`；老记录按相邻 user/assistant 时间兜底，任务结束后
+    冻结显示“用时 Ns”，刷新后保持一致。
+- **关键决策**：耗时以后端持久化值为准，前端临时计时只负责运行中显示；改动文件仍只存
+  文件清单，diff 正文按需读取。
+- **验证**：PR 同步 / rework changes / 中断记录定向测试 **87 passed**；全量 `pytest`
+  **1309 passed, 2 warnings**；前端生产构建通过；`ruff check`、
+  `scripts/check_prompts.py`（冲突 0 条）与 `git diff --check` 通过。
+- **遗留**：无数据库迁移；旧记录没有 `elapsed_ms` 时使用记录时间差近似。
+
+#### 进度清单与当前方案改为只保留最新状态
+
+- **动机**：coder 因方案冲突中止后，主控会重写 `write_todos` 并重新规划；旧子清单若继续挂
+  在树里，会覆盖新进度或错误挂到“核对反馈”下面，旧方案也会一直作为当前进度残留。
+- **改动**：
+  - `write_todos` 仍以最后一次完整清单为准；子清单只挂到当前仍可唯一识别的父项。
+  - 主清单删除父项后，对应子清单直接丢弃，不再生成树尾“子智能体任务”容器。
+  - 删除“主清单条数没变就沿用旧下标”的回退，避免旧 coder 清单挂到无关新任务下。
+  - 同一父项重新委派时只保留最新一次子清单。
+  - Plan 新增 `superseded` 状态；`storePlan` 自动替代本会话最新一份 `pending/failed`
+    方案，也支持显式 `replaces_plan_id`。旧方案行保留，当前方案查询和聊天方案记录
+    不再展示。
+  - `deletePlan` 同步删除聊天中的方案进度入口，但保留方案行供 `plan_id` / PR 追溯。
+  - planner / coding 提示词补齐“coder 否决方案后带旧 plan_id 重新规划”的流程。
+- **关键决策**：`write_todos` 和 Plan 都是“当前进度”视图，不做历史归档；失败原因由
+  coder 回报、主控答复和仓库记忆承载。Plan 为避免破坏 PR 关联与恢复逻辑，只软归档，
+  不物理删除 `plans` 行。
+- **验证**：流式待办、方案工具、方案事件、提示词与 Token 定向测试 **239 passed**；
+  全量 `pytest` **1307 passed, 2 warnings**；前端生产构建通过；
+  `ruff check`、`scripts/check_prompts.py`（冲突 0 条）与 `git diff --check` 通过。
+- **遗留**：无数据库迁移；状态值存于现有文本列。
+
 ### 2026-10-24
+
+#### PostgreSQL 连接短超时与运维诊断
+
+- **动机**：从 `src` 等非项目根目录启动 CLI 时，旧配置会回落到默认本机地址；地址不可达时
+  操作系统 TCP 重试可能让命令长时间无响应，只留下难以理解的 `ConnectionTimeout` 栈。
+- **改动**：
+  - `.env` 改为由 `ROOT_DIR` 定位，不再依赖当前工作目录。
+  - 新增 `POSTGRES_CONNECT_TIMEOUT_SECONDS`，默认 5 秒；业务库与管理 CLI 统一使用。
+  - `create-admin` / `reset-password` 捕获 `OperationalError`，打印数据库 host / port / db、
+    `.env` 路径、超时秒数与底层异常类型，不输出 DSN 或密码。
+- **关键决策**：连接超时按启动配置处理，不放进可在线修改的运行期设置；修改后重启进程生效。
+- **验证**：数据库诊断定向测试 **2 passed**；全量 `pytest` **1306 passed, 2 warnings**；
+  `ruff check`、`scripts/check_prompts.py`（冲突 0 条）与 `git diff --check` 通过。
+- **遗留**：无。
+
+#### 单用户登录与数据库共享会话
+
+- **动机**：工作台目前直接暴露全部 API，没有登录门禁；先以最小可用方案支持单用户部署，
+  同时保证多 worker 下不依赖进程内 Session 或 sticky session，并为以后接外部 IdP 留边界。
+- **改动**：
+  - 新增迁移 `e5f6a7b8c9d0`：`users`、`local_credentials`、`user_identities`、
+    `auth_sessions` 四张表，并给 `sessions` 增加可空 `user_id`。
+  - 新增 `auth/security.py`：标准库 `scrypt` 密码哈希、随机不透明 token、SHA-256 存储；
+    `auth/service.py` 负责登录、失败锁定、会话恢复、退出与改密，所有会话事实存 PostgreSQL。
+  - 新增全局 `AuthMiddleware`：除 `/health`、`/auth/config`、`/auth/login` 外全部 API
+    都必须登录；写请求同时校验双提交 CSRF。
+  - 新增 `/auth/config`、`/auth/login`、`/auth/me`、`/auth/logout`、
+    `/auth/change-password`。
+  - 新增 `manage.py` 运维 CLI：交互式 `create-admin` / `reset-password`；
+    `--claim-existing` 可把认证前无 `user_id` 的历史会话认给 owner。
+  - 新建会话写入 `user_id`；列表、详情、记录、方案、用量、记忆、聊天、终止和删除
+    都校验会话归属。
+  - 前端新增登录页、401 自动回登录页、账号退出和设置页改密；Cookie 与 CSRF 名字由
+    `/auth/config` 下发，支持 `.env` 改名。
+- **关键决策**：浏览器只持有不透明 token，数据库只存 token 哈希；登录 Cookie 为
+  HttpOnly，CSRF 使用可读 Cookie + 请求头双提交。密码先用零额外依赖的 `scrypt`，
+  不引入 Argon2 包。`user_identities` 只做未来 OIDC / SAML 的稳定映射，外部系统将来
+  仍由平台自己签发 `auth_sessions`。
+- **验证**：迁移已在本地 PostgreSQL 从 `d4e5f6a7b8c9` 升到 `e5f6a7b8c9d0`；全量
+  `pytest` **1304 passed, 2 warnings**；前端生产构建通过；`scripts/check_prompts.py`
+  渲染 6 份提示词、冲突 0 条；`ruff check` 与 `git diff --check` 通过。
+- **遗留**：管理员必须由运维交互式输入密码创建，初始化命令见 `docs/auth-design.md`；
+  OIDC / SAML 适配器、多用户管理、找回密码与 2FA 本期不做。
 
 #### backlog 改为仅本机维护
 

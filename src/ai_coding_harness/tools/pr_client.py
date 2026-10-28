@@ -53,6 +53,10 @@ class PrClient(Protocol):
 
     async def get_pull(self, *, owner: str, repo: str, number: int) -> dict: ...
 
+    async def get_repo(self, *, owner: str, repo: str) -> dict: ...
+
+    async def get_user(self) -> dict: ...
+
     async def list_pulls(
         self,
         *,

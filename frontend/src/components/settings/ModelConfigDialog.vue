@@ -66,6 +66,9 @@ const emit = defineEmits<{
   'need-models': [string]
 }>()
 
+const keyInvalid = ref(false)
+const baseUrlInvalid = ref(false)
+
 /** 无分组的那几项（现在只有「自定义」）：排在所有分组之后 */
 const ungrouped = computed(() => props.providers.filter((item) => !item.ui_group))
 
@@ -83,12 +86,27 @@ const grouped = computed(() => {
   return out
 })
 
-/** 「测试连接」要地址 + key 两样都有；缺哪样说哪样（不让用户点了才撞 401）。 */
-const probeHint = computed(() => {
-  if (!props.draft.base_url.trim()) return '先填 base_url 再测'
-  if (!props.hasKey && !props.draft.api_key.trim()) return '先填 api_key 再测'
-  return ''
-})
+const hasEffectiveKey = computed(
+  () => props.hasKey || !!props.draft.api_key.trim(),
+)
+
+const canSave = computed(
+  () =>
+    !!props.draft.base_url.trim() &&
+    (props.locked || !!props.draft.model.trim()) &&
+    hasEffectiveKey.value,
+)
+
+function markKeyTyped() {
+  if (props.draft.api_key.trim()) keyInvalid.value = false
+}
+
+function testConnection() {
+  baseUrlInvalid.value = !props.draft.base_url.trim()
+  keyInvalid.value = !hasEffectiveKey.value
+  if (baseUrlInvalid.value || keyInvalid.value) return
+  emit('probe')
+}
 
 /**
  * 模型名候选：刚拉到的实时清单 → 表里已登记的文本模型（`provider_models`）。
@@ -182,34 +200,43 @@ onMounted(() => firstField.value?.focus())
           <h3>base_url / api_key</h3>
           <label class="field">
             <span class="field-label">
-              base_url <span v-if="locked" class="req">*</span>
+              base_url <span class="req">*</span>
             </span>
-            <input v-model="draft.base_url" class="input" placeholder="https://…" />
+            <input
+              v-model="draft.base_url"
+              class="input"
+              :class="{ 'input-invalid': baseUrlInvalid }"
+              :aria-invalid="baseUrlInvalid"
+              placeholder="https://…"
+              @input="baseUrlInvalid = false"
+            />
           </label>
           <label class="field">
             <span class="field-label">
-              api_key <span v-if="locked" class="req">*</span>
+              api_key <span class="req">*</span>
             </span>
             <input
               v-model="draft.api_key"
               class="input"
+              :class="{ 'input-invalid': keyInvalid }"
               type="password"
               autocomplete="off"
+              :aria-invalid="keyInvalid"
               :placeholder="hasKey ? maskedKey || 'sk-…' : 'sk-…'"
+              @input="markKeyTyped"
             />
+            <span v-if="keyInvalid" class="field-note field-note-warn">请填写 api_key</span>
           </label>
           <div class="group-actions">
             <button
               class="btn"
               type="button"
-              :disabled="busy || !!probeHint"
-              :title="probeHint"
-              @click="emit('probe')"
+              :disabled="busy"
+              @click="testConnection"
             >
               测试连接
             </button>
-            <span v-if="probeHint" class="field-note">{{ probeHint }}</span>
-            <span v-else-if="draft.probe" class="field-note">{{ draft.probe }}</span>
+            <span v-if="draft.probe" class="field-note">{{ draft.probe }}</span>
           </div>
         </div>
 
@@ -217,7 +244,7 @@ onMounted(() => firstField.value?.focus())
           <h3>模型 / 窗口大小</h3>
           <div class="field">
             <span class="field-label">
-              模型 <span class="req">*</span>
+              模型 <span v-if="!locked" class="req">*</span>
             </span>
             <div class="field-inline">
               <input
@@ -269,7 +296,7 @@ onMounted(() => firstField.value?.focus())
         <button
           class="btn btn-primary"
           type="button"
-          :disabled="busy || windowBad"
+          :disabled="busy || windowBad || !canSave"
           @click="emit('save')"
         >
           {{ busy ? '保存中…' : '保存' }}

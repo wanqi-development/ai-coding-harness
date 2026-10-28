@@ -80,7 +80,9 @@ def plan_payload(plan: Any) -> dict[str, Any]:
     }
 
 
-def _main_window(settings: Settings, intent: str) -> int:
+def _main_window(
+    settings: Settings, intent: str, user_id: int | None = None
+) -> int:
     """本轮**主控模型**的上下文窗口（tokens）；取不到配置时返回 0。
 
     窗口必须按主控那个模型算：压缩只作用于主控那份历史，而子智能体各有自己的窗口，
@@ -91,7 +93,7 @@ def _main_window(settings: Settings, intent: str) -> int:
     没有压力提示远好过整轮失败。
     """
     try:
-        return resolve_window(settings, profile_for(intent).form)
+        return resolve_window(settings, profile_for(intent).form, user_id)
     except Exception:
         logger.exception("读上下文窗口失败（本轮不做压力提醒）")
         return 0
@@ -102,14 +104,16 @@ def _ratio(peak: int, window: int) -> float:
     return round(peak / window, 3) if window > 0 else 0.0
 
 
-def _main_model(settings: Settings, intent: str) -> str:
+def _main_model(
+    settings: Settings, intent: str, user_id: int | None = None
+) -> str:
     """本轮**主控模型**的名字（与 ``_main_window`` 同一个解析口径）；取不到回空串。
 
     界面把它标在这条回答的最下边（2026-10-14 用户口径：「提供回答的模型」）。
     解析失败只是不显示那一格，不该让这一轮跑不起来。
     """
     try:
-        return resolve_model(settings, profile_for(intent).form)
+        return resolve_model(settings, profile_for(intent).form, user_id)
     except Exception:
         logger.exception("读主控模型名失败（本轮不标模型）")
         return ""

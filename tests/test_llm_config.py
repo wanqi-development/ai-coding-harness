@@ -102,6 +102,23 @@ def test_a_row_without_a_model_name_counts_as_unconfigured() -> None:
         build_model(settings, role="plan")
 
 
+def test_a_row_missing_a_key_falls_back_to_unified() -> None:
+    settings = _settings(
+        rows={
+            "coder": _row("broken-coder", api_key=""),
+            "unified": _row("safe-unified"),
+        }
+    )
+
+    assert build_model(settings, role="coder").model_name == "safe-unified"
+    assert llm_module.effective_for(settings, "coder")["source"] == "unified"
+
+
+def test_a_direct_half_configured_model_has_a_readable_error() -> None:
+    with pytest.raises(ValueError, match="缺少 api_key 或 base_url"):
+        llm_module._model_from(_row("broken", api_key=""), label="角色 'coder'")
+
+
 def test_unified_covers_every_role() -> None:
     """「统一模型」填了就顶掉所有行（各智能体一行没配也照样能跑）。"""
     settings = _settings(rows={"unified": _row("one-for-all")})
@@ -185,6 +202,31 @@ def test_glm_does_not_get_reasoning_effort() -> None:
     assert model.extra_body == {"thinking": {"type": "enabled"}}
 
 
+@pytest.mark.parametrize("name", ["gpt-6-luna", "gpt-6.1-sol"])
+def test_gpt6_uses_responses_api_with_detailed_reasoning(name: str) -> None:
+    """GPT-6 的可读思考来自 Responses summary，而不是 Chat Completions。"""
+    rows = {key: _row(name) for key in _ROWS}
+    model = build_model(_settings(rows=rows), role="orchestrate")
+
+    assert model.use_responses_api is True
+    assert model.output_version == "responses/v1"
+    assert model.reasoning == {"effort": "high", "summary": "detailed"}
+    assert model.use_previous_response_id is False
+    assert model.reasoning_effort is None
+    assert model.extra_body in (None, {})
+
+
+def test_gpt5_keeps_the_chat_completions_thinking_contract() -> None:
+    """GPT-6 的 Responses 适配不能改掉 GPT-5 现有口径。"""
+    rows = {key: _row("gpt-5.6-luna") for key in _ROWS}
+    model = build_model(_settings(rows=rows), role="orchestrate")
+
+    assert model.use_responses_api is None
+    assert model.reasoning is None
+    assert model.reasoning_effort == "high"
+    assert model.extra_body == {"thinking": {"type": "enabled"}}
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
@@ -197,6 +239,21 @@ def test_glm_does_not_get_reasoning_effort() -> None:
 )
 def test_reasoning_effort_is_openai_only(name: str, expected: bool) -> None:
     assert llm_module._wants_reasoning_effort(name) is expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("gpt-6-luna", True),
+        ("gpt-6.1-sol", True),
+        ("gpt-5.6-luna", False),
+        ("glm-5.3-flash", False),
+        ("deepseek-v4-pro", False),
+        ("kimi-k3", False),
+    ],
+)
+def test_responses_api_is_gpt6_only(name: str, expected: bool) -> None:
+    assert llm_module._wants_responses_api(name) is expected
 
 
 def test_context_window_sets_profile() -> None:

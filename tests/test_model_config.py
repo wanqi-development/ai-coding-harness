@@ -554,7 +554,7 @@ def _patch_dao(
     rows_provider = _seed_rows() if providers is None else providers
     models_table: dict[str, Any] = {} if provider_models is None else provider_models
 
-    async def list_all(db):
+    async def list_all(db, *, user_id=None):
         return list(store.values())
 
     async def list_providers(db):
@@ -603,7 +603,7 @@ def _patch_dao(
         rows = list(models_table.values())
         return [row for row in rows if provider is None or row.provider == provider]
 
-    async def upsert(db, *, agent, base_url=None, model_name=None, api_key=None,
+    async def upsert(db, *, user_id=None, agent, base_url=None, model_name=None, api_key=None,
                      context_window=None):
         row = store.get(agent) or SimpleNamespace(
             agent=agent, base_url=None, model_name=None, api_key=None, context_window=0
@@ -616,7 +616,7 @@ def _patch_dao(
                 setattr(row, field, value)
         store[agent] = row
 
-    async def remove(db, *, agent):
+    async def remove(db, *, user_id=None, agent):
         return store.pop(agent, None) is not None
 
     monkeypatch.setattr(dao, "list_model_endpoints", list_all)
@@ -938,7 +938,9 @@ class TestApi:
         assert rows["qa"]["base_url"] == "https://keep/v1", "没传的字段不动"
         assert rows["qa"]["has_key"] is True
 
-    async def test_put_can_clear_a_key_with_an_empty_string(self, monkeypatch):
+    async def test_put_rejects_clearing_a_key_while_the_model_remains_configured(
+        self, monkeypatch
+    ):
         store: dict[str, Any] = {
             "qa": SimpleNamespace(
                 agent="qa", base_url="https://x/v1", model_name="m",
@@ -947,13 +949,13 @@ class TestApi:
         }
         _patch_dao(monkeypatch, store)
 
-        body = (
-            await _call(
-                _app(), "PUT", "/model-config", json={"rows": {"qa": {"api_key": ""}}}
-            )
-        ).json()
+        resp = await _call(
+            _app(), "PUT", "/model-config", json={"rows": {"qa": {"api_key": ""}}}
+        )
 
-        assert {row["key"]: row for row in body["rows"]}["qa"]["has_key"] is False
+        assert resp.status_code == 400
+        assert "缺少 api_key" in resp.json()["detail"]
+        assert store["qa"].api_key == "sk-x", "失败时不能真的清掉旧 key"
 
     async def test_put_rejects_unknown_keys_and_bad_mode(self, monkeypatch):
         _patch_dao(monkeypatch, {})
@@ -990,7 +992,15 @@ class TestApi:
             app,
             "PUT",
             "/model-config",
-            json={"rows": {"plan": {"model": "new-model", "base_url": "https://new/v1"}}},
+            json={
+                "rows": {
+                    "plan": {
+                        "model": "new-model",
+                        "base_url": "https://new/v1",
+                        "api_key": "new-key",
+                    }
+                }
+            },
         )
 
         assert settings.agent_models["plan"].model == "new-model"

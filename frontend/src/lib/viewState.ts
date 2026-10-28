@@ -14,9 +14,9 @@
  */
 
 export type AppView = 'chat' | 'settings'
-export type SettingsPanel = 'basic' | 'look' | 'models' | 'providers'
+export type SettingsPanel = 'basic' | 'look' | 'users' | 'models' | 'providers'
 
-const PANELS: SettingsPanel[] = ['basic', 'look', 'models', 'providers']
+const PANELS: SettingsPanel[] = ['basic', 'look', 'users', 'models', 'providers']
 
 /** 认不出的 hash 一律当聊天页（手改错地址不该白屏）。 */
 export function readView(): { view: AppView; panel: SettingsPanel } {

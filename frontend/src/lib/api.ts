@@ -1,5 +1,237 @@
 // 后端 API 客户端。聊天用 POST + 手写 SSE 解析（EventSource 不支持 POST）。
 
+type UnauthorizedHandler = () => void
+let unauthorizedHandler: UnauthorizedHandler | null = null
+let csrfCookieName = 'harness_csrf'
+
+export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+  unauthorizedHandler = handler
+}
+
+function cookieValue(name: string): string {
+  const prefix = `${encodeURIComponent(name)}=`
+  for (const part of document.cookie.split(';')) {
+    const item = part.trim()
+    if (item.startsWith(prefix)) return decodeURIComponent(item.slice(prefix.length))
+  }
+  return ''
+}
+
+/** Same-origin + CSRF 的统一 fetch；401 统一把界面退回登录页。 */
+async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const method = String(init.method ?? 'GET').toUpperCase()
+  const headers = new Headers(init.headers)
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const csrf = cookieValue(csrfCookieName)
+    if (csrf) headers.set('X-CSRF-Token', csrf)
+  }
+  const response = await globalThis.fetch(input, {
+    ...init,
+    headers,
+    credentials: 'same-origin',
+  })
+  if (response.status === 401) unauthorizedHandler?.()
+  return response
+}
+
+// 本模块其余函数统一使用这个带 Cookie / CSRF / 401 处理的入口。
+const fetch = apiFetch
+
+export interface AuthUser {
+  id: number
+  username: string
+  display_name: string
+  role: string
+  must_change_password: boolean
+}
+
+export interface AuthConfig {
+  provider: string
+  initialized: boolean
+  single_user: boolean
+  login_mode: string
+  csrf_cookie: string
+}
+
+export async function getAuthConfig(): Promise<AuthConfig> {
+  const r = await fetch('/auth/config')
+  if (!r.ok) throw new Error(`认证配置加载失败：${r.status}`)
+  const data = (await r.json()) as AuthConfig
+  csrfCookieName = data.csrf_cookie || 'harness_csrf'
+  return data
+}
+
+export async function getAuthMe(): Promise<AuthUser | null> {
+  const r = await fetch('/auth/me')
+  if (r.status === 401) return null
+  if (!r.ok) throw new Error(`登录状态加载失败：${r.status}`)
+  const data = await r.json()
+  return data.user as AuthUser
+}
+
+export async function login(username: string, password: string): Promise<AuthUser> {
+  const r = await fetch('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, '登录失败'))
+  const data = await r.json()
+  return data.user as AuthUser
+}
+
+export async function logout(): Promise<void> {
+  const r = await fetch('/auth/logout', { method: 'POST' })
+  if (!r.ok && r.status !== 401) throw new Error(await errorDetail(r, '退出失败'))
+}
+
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<AuthUser> {
+  const r = await fetch('/auth/change-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, '修改密码失败'))
+  const data = await r.json()
+  return data.user as AuthUser
+}
+
+export interface ManagedUser {
+  id: number
+  username: string
+  display_name: string
+  role: 'admin' | 'member'
+  is_active: boolean
+  must_change_password: boolean
+  active_sessions: number
+  last_active_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export async function listUsers(): Promise<ManagedUser[]> {
+  const r = await fetch('/users')
+  if (!r.ok) throw new Error(await errorDetail(r, '用户列表加载失败'))
+  return (await r.json()) as ManagedUser[]
+}
+
+export async function createUser(payload: {
+  username: string
+  display_name: string
+  role: 'admin' | 'member'
+  temporary_password: string
+}): Promise<ManagedUser> {
+  const r = await fetch('/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, '创建用户失败'))
+  return (await r.json()) as ManagedUser
+}
+
+export async function updateUser(
+  userId: number,
+  payload: {
+    display_name?: string
+    role?: 'admin' | 'member'
+    is_active?: boolean
+  },
+): Promise<ManagedUser> {
+  const r = await fetch(`/users/${userId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, '更新用户失败'))
+  return (await r.json()) as ManagedUser
+}
+
+export async function resetUserPassword(
+  userId: number,
+  newPassword: string,
+): Promise<ManagedUser> {
+  const r = await fetch(`/users/${userId}/reset-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ new_password: newPassword }),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, '重置密码失败'))
+  return (await r.json()) as ManagedUser
+}
+
+export async function revokeUserSessions(userId: number): Promise<ManagedUser> {
+  const r = await fetch(`/users/${userId}/revoke-sessions`, { method: 'POST' })
+  if (!r.ok) throw new Error(await errorDetail(r, '撤销登录会话失败'))
+  return (await r.json()) as ManagedUser
+}
+
+export interface MyProfile {
+  id: number
+  username: string
+  display_name: string
+  role: 'admin' | 'member'
+  created_at: string
+  password_changed_at: string | null
+  active_sessions: number
+  last_active_at: string | null
+  current_session_started_at: string | null
+  current_session_expires_at: string | null
+}
+
+export async function getMyProfile(): Promise<MyProfile> {
+  const r = await fetch('/me/profile')
+  if (!r.ok) throw new Error(await errorDetail(r, '账号详情加载失败'))
+  return (await r.json()) as MyProfile
+}
+
+export interface UserRuntimeSettings {
+  repo_view_dir: string
+  repo_view_dir_source: 'default' | 'db'
+  repo_view_dir_default: string
+  gitee_base_branch: string
+  github_base_branch: string
+  gitee_access_token: string
+  gitee_access_token_configured: boolean
+  gitee_username: string
+  github_access_token: string
+  github_access_token_configured: boolean
+  github_username: string
+  updated_at: string | null
+}
+
+export async function getMySettings(): Promise<UserRuntimeSettings> {
+  const r = await fetch('/me/settings')
+  if (!r.ok) throw new Error(await errorDetail(r, '个人设置加载失败'))
+  return (await r.json()) as UserRuntimeSettings
+}
+
+export async function putMySettings(payload: {
+  repo_view_dir?: string
+  gitee_base_branch?: string
+  github_base_branch?: string
+  gitee_access_token?: string
+  clear_gitee_token?: boolean
+  gitee_username?: string
+  github_access_token?: string
+  clear_github_token?: boolean
+  github_username?: string
+}): Promise<UserRuntimeSettings> {
+  const r = await fetch('/me/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, '个人设置保存失败'))
+  return (await r.json()) as UserRuntimeSettings
+}
+
 export interface SessionItem {
   session_id: string
   title: string | null
@@ -303,7 +535,7 @@ export async function createSession(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!r.ok) throw new Error(`创建会话失败：${r.status} ${await r.text()}`)
+  if (!r.ok) throw new Error(await errorDetail(r, `创建会话失败：${r.status}`))
   const data = await r.json()
   return { sessionId: data.session_id, reused: Boolean(data.reused) }
 }

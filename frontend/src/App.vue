@@ -9,6 +9,11 @@ import {
   getRecords,
   getClarification,
   getSession,
+  getAuthConfig,
+  getAuthMe,
+  getMyProfile,
+  logout,
+  setUnauthorizedHandler,
   listSessions,
   postChat,
   resumeChat,
@@ -24,8 +29,11 @@ import {
   type UsageDetail,
   type ChangesInfo,
   type WorkspaceStatus,
+  type AuthUser,
+  type MyProfile,
 } from './lib/api'
 import { renderMarkdown } from './lib/markdown'
+import MarkdownContent from './components/MarkdownContent.vue'
 import MemoryPanel from './components/panels/MemoryPanel.vue'
 import LogPanel from './components/panels/LogPanel.vue'
 import PrPanel from './components/panels/PrPanel.vue'
@@ -35,6 +43,8 @@ import ChangesPanel from './components/panels/ChangesPanel.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
 import ClarificationDialog from './components/ClarificationDialog.vue'
 import HandoffRun from './components/HandoffRun.vue'
+import LoginPage from './components/LoginPage.vue'
+import PasswordChangeGate from './components/PasswordChangeGate.vue'
 import { defaultPanelTab } from './lib/prefs'
 import { usePanelWidth } from './lib/splitter'
 import { splitLongText } from './lib/streamblocks'
@@ -642,6 +652,7 @@ function fitComposer() {
 // 发送清空 / 粘贴 / 快捷动作改值都会经过这里，不必在每个调用点各写一次。
 watch(input, () => void nextTick(fitComposer))
 const loading = ref(false)
+const createError = ref('')
 const hasMoreHistory = ref(false)
 const loadingOlder = ref(false)
 const nextBeforeId = ref<number | null>(null)
@@ -722,7 +733,7 @@ const rightTab = ref<'code' | 'memory' | 'pulls' | 'logs' | 'usage'>(defaultPane
 const expandedSteps = ref<number[]>([])
 // 右侧栏「全屏」（面板盖满整个窗口）：临时状态，不持久化
 const panelFullscreen = ref(false)
-// 左上角那颗齿轮：设置**整页工作台**（左菜单三栏）。
+// 左下角的设置入口：设置**整页工作台**（左菜单按权限显示）。
 //
 // 两处刻意的做法：
 // - 切页时聊天区是 `v-show` 藏起来而不是 `v-if` 卸掉 —— 正在跑的流还在往 App 的状态里写，
@@ -763,6 +774,101 @@ const LAST_SESSION_KEY = 'ui.lastSessionId'
 const NEW_CHAT_KEY = 'ui.newChatPending'
 /** 消息上要不要显示 token 角标（默认显示：藏起来等于没做）。 */
 const SHOW_USAGE_KEY = 'ui.showMessageUsage'
+
+// 认证门禁：authReady 前不启动会话加载；authUser 为空时只渲染登录页。
+const authReady = ref(false)
+const authUser = ref<AuthUser | null>(null)
+const accountOpen = ref(false)
+const accountProfile = ref<MyProfile | null>(null)
+const accountLoading = ref(false)
+const accountError = ref('')
+
+function closeAccountMenu() {
+  accountOpen.value = false
+}
+
+function onAccountMenuKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeAccountMenu()
+}
+
+async function loadAccountProfile() {
+  if (accountProfile.value || accountLoading.value) return
+  accountLoading.value = true
+  accountError.value = ''
+  try {
+    accountProfile.value = await getMyProfile()
+  } catch (exc: any) {
+    accountError.value = exc?.message ?? '账号详情加载失败'
+  } finally {
+    accountLoading.value = false
+  }
+}
+
+function openAccountDetails(expandFirst = false) {
+  if (expandFirst) sidebarCollapsed.value = false
+  accountOpen.value = true
+  void loadAccountProfile()
+}
+
+function toggleAccountDetails() {
+  if (accountOpen.value) {
+    closeAccountMenu()
+    return
+  }
+  openAccountDetails()
+}
+
+function accountDate(value: string | null | undefined): string {
+  if (!value) return '—'
+  return new Date(value).toLocaleString()
+}
+
+function accountRoleLabel(role: string | undefined): string {
+  return role === 'admin' ? '管理员' : '成员'
+}
+
+function enterWorkspace(user: AuthUser) {
+  authUser.value = user
+  authReady.value = true
+  if (user.must_change_password) return
+  void reloadSessions().then(restoreLastView)
+}
+
+async function bootstrapAuth() {
+  try {
+    await getAuthConfig()
+    const user = await getAuthMe()
+    authUser.value = user
+  } catch (exc) {
+    console.error(exc)
+    authUser.value = null
+  } finally {
+    authReady.value = true
+  }
+  if (authUser.value && !authUser.value.must_change_password) {
+    await reloadSessions()
+    await restoreLastView()
+  }
+}
+
+function passwordChanged(user: AuthUser) {
+  authUser.value = user
+  void reloadSessions().then(restoreLastView)
+}
+
+async function leaveWorkspace() {
+  try {
+    await logout()
+  } finally {
+    accountOpen.value = false
+    accountProfile.value = null
+    accountError.value = ''
+    authUser.value = null
+    messages.value = []
+    sessions.value = []
+    currentId.value = ''
+  }
+}
 
 /** localStorage 在隐私模式 / 被禁时会抛异常：读不到、写不进都只当「没记住」。 */
 function readPref(key: string): string {
@@ -952,7 +1058,7 @@ async function confirmNewChat() {
       void prepareWorkspace(created.sessionId)
     }
   } catch (e: any) {
-    alert(e.message ?? '创建失败')
+    createError.value = e.message ?? '创建会话失败'
   } finally {
     loading.value = false
   }
@@ -1116,6 +1222,8 @@ const PLAN_LABEL: Record<string, string> = {
   executing: '实施中',
   done: '已完成',
   failed: '实施失败',
+  superseded: '已替代',
+  closed: '已删除',
 }
 
 /** 工具名 → 活动描述。只说「在做什么」，不提是谁在做 —— 唯一的例外是 `task` 那一格，
@@ -1677,9 +1785,18 @@ async function attachRunning(id: string) {
 }
 
 // 初次加载：先拉会话列表，再恢复上次的页面（见 restoreLastView）
-onMounted(async () => {
-  await reloadSessions()
-  await restoreLastView()
+setUnauthorizedHandler(() => {
+  authUser.value = null
+  authReady.value = true
+  messages.value = []
+  sessions.value = []
+  currentId.value = ''
+})
+
+onMounted(() => {
+  void bootstrapAuth()
+  window.addEventListener('click', closeAccountMenu)
+  window.addEventListener('keydown', onAccountMenuKeydown)
 })
 // 手改地址 / 前进后退改了 hash：跟着切页（页面自己写 hash 那几次不会触发这里）
 const unwatchView = watchView((next) => {
@@ -1706,11 +1823,24 @@ onUnmounted(() => {
   stopWorkspacePoll()
   if (tickTimer) clearInterval(tickTimer)
   unwatchView()
+  window.removeEventListener('click', closeAccountMenu)
+  window.removeEventListener('keydown', onAccountMenuKeydown)
+  setUnauthorizedHandler(null)
 })
 </script>
 
 <template>
-  <div class="app">
+  <div v-if="!authReady" class="auth-page">
+    <section class="auth-card"><p class="auth-note">正在检查登录状态…</p></section>
+  </div>
+  <LoginPage v-else-if="!authUser" @authenticated="enterWorkspace" />
+  <PasswordChangeGate
+    v-else-if="authUser.must_change_password"
+    :user="authUser"
+    @changed="passwordChanged"
+    @logout="leaveWorkspace"
+  />
+  <div v-else class="app">
     <!-- 左侧会话栏：可收起（收成一条竖标签）、可拖宽 -->
     <aside
       class="sidebar"
@@ -1723,30 +1853,28 @@ onUnmounted(() => {
         <button class="panel-toggle-btn" title="展开会话栏" @click="toggleSidebar">›</button>
         <button class="rail-tab" title="展开会话栏" @click="toggleSidebar">会话</button>
         <button class="rail-icon" title="新对话" @click="startNewChat">＋</button>
+        <div class="rail-footer">
+          <button class="rail-icon" title="设置" aria-label="设置" @click="view = 'settings'">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M2.5 5h11M2.5 11h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              <circle cx="6" cy="5" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="10.5" cy="11" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+          </button>
+          <button
+            class="rail-user"
+            title="账号详情"
+            :aria-label="`账号详情 ${authUser.username}`"
+            @click.stop="openAccountDetails(true)"
+          >
+            {{ (authUser.display_name || authUser.username).slice(0, 1) }}
+          </button>
+        </div>
       </div>
 
       <div v-else class="sidebar-body">
         <div class="brand-row">
           <div class="brand">ai-coding-harness</div>
-          <!-- 图标用内联 SVG 而不是 emoji（emoji 在不同系统上字形不一、也一眼廉价） -->
-          <button
-            class="panel-toggle-btn"
-            title="设置"
-            aria-label="设置"
-            @click="view = 'settings'"
-          >
-            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-              <path
-                d="M2.5 5h11M2.5 11h11"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
-              />
-              <circle cx="6" cy="5" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
-              <circle cx="10.5" cy="11" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
-            </svg>
-          </button>
           <button class="panel-toggle-btn" title="收起会话栏" @click="toggleSidebar">‹</button>
         </div>
         <button class="new-chat" @click="startNewChat">＋ 新对话</button>
@@ -1771,6 +1899,57 @@ onUnmounted(() => {
             <button class="session-btn session-del" title="删除" @click.stop="removeSession(s.session_id)">
               ×
             </button>
+          </div>
+        </div>
+        <div class="sidebar-footer">
+          <button
+            class="account-chip"
+            type="button"
+            title="账号详情"
+            @click.stop="toggleAccountDetails"
+          >
+            {{ authUser.username }}
+          </button>
+          <button class="sidebar-settings" type="button" title="设置" aria-label="设置" @click="view = 'settings'">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M2.5 5h11M2.5 11h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              <circle cx="6" cy="5" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="10.5" cy="11" r="1.9" fill="var(--surface)" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+          </button>
+          <div v-if="accountOpen" class="account-popover" @click.stop>
+            <div class="account-popover-head">
+              <span class="account-avatar">{{ (authUser.display_name || authUser.username).slice(0, 1) }}</span>
+              <div>
+                <strong>{{ authUser.display_name }}</strong>
+                <span>{{ authUser.username }}</span>
+              </div>
+              <span class="user-badge" :class="authUser.role">{{ accountRoleLabel(authUser.role) }}</span>
+            </div>
+
+            <p v-if="accountLoading" class="account-note">正在读取账号详情…</p>
+            <p v-else-if="accountError" class="account-note error">{{ accountError }}</p>
+            <dl v-else-if="accountProfile" class="account-details">
+              <dt>用户 ID</dt><dd>{{ accountProfile.id }}</dd>
+              <dt>账号创建</dt><dd>{{ accountDate(accountProfile.created_at) }}</dd>
+              <dt>最近活动</dt><dd>{{ accountDate(accountProfile.last_active_at) }}</dd>
+              <dt>活跃会话</dt><dd>{{ accountProfile.active_sessions }}</dd>
+              <dt>当前登录</dt><dd>{{ accountDate(accountProfile.current_session_started_at) }}</dd>
+              <dt>会话到期</dt><dd>{{ accountDate(accountProfile.current_session_expires_at) }}</dd>
+            </dl>
+
+            <div class="account-actions">
+              <button
+                class="btn btn-small"
+                type="button"
+                @click="settingsPanel = 'basic'; view = 'settings'; closeAccountMenu()"
+              >
+                修改密码
+              </button>
+              <button class="btn btn-small account-logout" type="button" @click="leaveWorkspace">
+                退出登录
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1860,12 +2039,11 @@ onUnmounted(() => {
                 :class="m.at ? 'markdown' : 'streaming-text'"
               >
                 <!-- v-memo：任务结束后正文不再变，整组只 parse 一次。 -->
-                <div
+                <MarkdownContent
                   v-if="m.at"
                   v-memo="[groupText(entry.parts)]"
-                  class="md-block"
-                  v-html="renderMarkdown(groupText(entry.parts) || '…')"
-                ></div>
+                  :source="groupText(entry.parts)"
+                />
                 <div v-else class="streaming-plain">{{ groupText(entry.parts) }}</div>
               </div>
             </template>
@@ -1928,12 +2106,12 @@ onUnmounted(() => {
                 </ol>
                 <p v-else class="plan-empty">该方案没有结构化步骤</p>
                 <!-- 方案全文（Markdown）：步骤是索引，正文才是细节 -->
-                <div
+                <MarkdownContent
                   v-if="planMarkdown(m)"
                   v-memo="[planMarkdown(m)]"
-                  class="plan-content md-block markdown"
-                  v-html="renderMarkdown(planMarkdown(m))"
-                ></div>
+                  class="plan-content"
+                  :source="planMarkdown(m)"
+                />
               </div>
             </div>
             <ul v-if="showsTodos(m)" class="ai-part todos">
@@ -2252,11 +2430,13 @@ onUnmounted(() => {
       </div>
     </aside>
 
-    <!-- 设置页（整页工作台）：左上角齿轮打开；左菜单分基本设置 / 外观 / 模型配置。
+    <!-- 设置页（整页工作台）：左下角「设置」打开；左菜单按角色显示。
          当前在哪一栏由 App 持有（它同时负责写 hash），设置页只发意图上来。 -->
     <SettingsPage
       v-if="view === 'settings'"
       :panel="settingsPanel"
+      :role="authUser.role"
+      :user-id="authUser.id"
       @close="view = 'chat'"
       @panel="settingsPanel = $event"
       @reset-layout="resetLayout"
@@ -2270,6 +2450,31 @@ onUnmounted(() => {
       @other="otherClarification"
       @close="clarification = null"
     />
+
+    <div v-if="createError" class="modal-mask" @click.self="createError = ''">
+      <section class="modal" role="dialog" aria-modal="true" aria-label="无法创建会话">
+        <header class="modal-head">
+          <strong>无法创建会话</strong>
+          <button class="icon-btn" type="button" aria-label="关闭" @click="createError = ''">×</button>
+        </header>
+        <div class="modal-body">
+          <p class="modal-error">{{ createError }}</p>
+          <p class="field-note">
+            请确认仓库地址正确，并检查当前账号的 Gitee / GitHub 令牌是否有该仓库权限。
+          </p>
+        </div>
+        <footer class="modal-foot">
+          <button class="btn" type="button" @click="createError = ''">关闭</button>
+          <button
+            class="btn btn-primary"
+            type="button"
+            @click="createError = ''; settingsPanel = 'basic'; view = 'settings'"
+          >
+            打开代码平台设置
+          </button>
+        </footer>
+      </section>
+    </div>
 
   </div>
 </template>

@@ -31,6 +31,7 @@ from .common import (
     _reload_provider_models,
     _snapshot,
     fetch_provider_model_entries,
+    request_user_id,
 )
 
 router = APIRouter(prefix="/model-config", tags=["model-config"])
@@ -122,7 +123,13 @@ async def refresh_provider_models(
     # key 与「哪家」的反推都读**现读库**那份：设置页刚改完目录就用新值，不用重启
     async with request.app.state.database.session() as db:
         fresh_metas = await _provider_metas(settings, db, only_enabled=False)
-    api_key = _borrowed_key(settings, provider, fresh_metas)
+    api_key = await _borrowed_key(
+        settings,
+        request.app.state.database,
+        request_user_id(request),
+        provider,
+        fresh_metas,
+    )
     try:
         entries = await fetch_provider_model_entries(
             target,
@@ -203,6 +210,10 @@ async def reload_providers(request: Request) -> ModelConfigSnapshot:
     # 种子对齐也会把那串名字灌进模型详情表，内存里那份跟着刷一遍
     await _reload_provider_models(settings, request.app.state.database)
     async with request.app.state.database.session() as db:
-        stored = {row.agent: row for row in await dao.list_model_endpoints(db)}
+        user_id = request_user_id(request)
+        stored = {
+            row.agent: row
+            for row in await dao.list_model_endpoints(db, user_id=user_id)
+        }
         metas = await _provider_metas(settings, db)
-    return _snapshot(settings, stored, metas)
+    return _snapshot(settings, stored, metas, user_id)

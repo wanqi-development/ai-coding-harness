@@ -36,6 +36,7 @@ class PlanContext:
 
 # 步骤状态：pending 待办 / running 进行中 / done 完成 / failed 失败
 _STEP_STATUSES = ("pending", "running", "done", "failed")
+_REPLACEABLE_STATUSES = ("pending", "failed")
 
 #: 正文的硬上限（字符）。这不是审美要求，是**生成稳定性**要求：实测一份 9.5k 字的正文
 #: 会在里面自我修补（同一节写两遍、带「更正稿」字样）并在中途断掉（2026-10-12，plan 41）。
@@ -159,6 +160,7 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
         content: str,
         steps: list,
         title: str | None = None,
+        replaces_plan_id: int | None = None,
     ) -> str:
         """把制定好的实施方案写入 DB（供 coder 通过 get_unexecuted_plan 取用）。
 
@@ -169,6 +171,8 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
                 「做什么」**（如「搭建工程骨架」「实现 Service 层」）；实现细节不要写进 goal，
                 放 content 与 done_criteria。序号与状态由系统生成，不要自己编号。
             title: 方案标题（可选）。
+            replaces_plan_id: 被本次方案替代的旧 plan_id。coder 否决旧方案后重新规划时传入；
+                不传时自动替代本会话最新一份 pending / failed 方案。
         """
         normalized, error = _normalize_steps(steps)
         if error:
@@ -177,6 +181,36 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
         if content_error:
             return f"正文不合法：{content_error}（方案未写入，请重写后重新调用 storePlan。）"
         async with database.session() as db:
+            replaced = None
+            if replaces_plan_id is not None:
+                replaced = await dao.get_plan(
+                    db,
+                    session_id=ctx.session_db_id,
+                    plan_id=replaces_plan_id,
+                )
+                if replaced is None:
+                    return (
+                        f"未找到被替代的方案 {replaces_plan_id}"
+                        "（或它不属于本会话），新方案未写入。"
+                    )
+                if replaced.status not in _REPLACEABLE_STATUSES:
+                    return (
+                        f"方案 {replaces_plan_id} 当前状态为 {replaced.status}，"
+                        "只有 pending / failed 方案可被新方案替代（新方案未写入）。"
+                    )
+            else:
+                replaced = await dao.get_replaceable_plan(
+                    db, session_id=ctx.session_db_id
+                )
+            if replaced is not None:
+                await dao.set_plan_status(
+                    db, replaced.id, "superseded", session_id=ctx.session_db_id
+                )
+                await dao.delete_plan_record(
+                    db,
+                    session_id=ctx.session_db_id,
+                    plan_id=replaced.id,
+                )
             row = await dao.store_plan(
                 db,
                 session_id=ctx.session_db_id,
@@ -190,7 +224,8 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
         state = get_configurable("turn_state")
         if isinstance(state, TurnState):
             state.plan_id = plan_id
-        return f"方案已写入（plan_id={plan_id}，共 {len(normalized)} 步）。"
+        suffix = f"；已替代 plan_id={replaced.id}" if replaced is not None else ""
+        return f"方案已写入（plan_id={plan_id}，共 {len(normalized)} 步{suffix}）。"
 
     @tool
     async def getPlan(plan_id: int | None = None) -> str:
@@ -220,7 +255,8 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
         这份方案还在、还没被执行过。所以这个工具**只回一个布尔、不拉正文** ——
         正文让 coder 自己用 `get_unexecuted_plan` 取（那才是唯一权威的那份）。
 
-        ``False`` 的三种情形：方案不存在 / 不属于本会话、已软删（closed）、已执行完（done）。
+        ``False`` 的四种情形：方案不存在 / 不属于本会话、已软删（closed）、
+        已被新方案替代（superseded）、已执行完（done）。
 
         Args:
             plan_id: 方案 ID（上一轮对话里出现过的编号、或 `storePlan` 的返回）。
@@ -250,8 +286,8 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
             plan = await dao.get_plan(db, session_id=ctx.session_db_id, plan_id=plan_id)
             if plan is None:
                 return f"未找到方案 {plan_id}（或它不属于本会话）。"
-            if plan.status == "closed":
-                return f"方案 {plan_id} 已删除（closed），不再修改。"
+            if plan.status in ("closed", "superseded"):
+                return f"方案 {plan_id} 当前状态为 {plan.status}，不再修改。"
             if content is not None:
                 # 改正文与写正文同一套自检：坏正文从哪条路进来都不该落库
                 content_error = _check_content(content, list(plan.steps or []))
@@ -288,8 +324,8 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
             plan = await dao.get_plan(db, session_id=ctx.session_db_id, plan_id=plan_id)
             if plan is None:
                 return f"未找到方案 {plan_id}（或它不属于本会话）。"
-            if plan.status == "closed":
-                return f"方案 {plan_id} 已删除（closed），不再修改。"
+            if plan.status in ("closed", "superseded"):
+                return f"方案 {plan_id} 当前状态为 {plan.status}，不再修改。"
             if plan.status == "executing":
                 return (
                     f"方案 {plan_id} 正在执行（executing），改步骤会让 coder 手上的计划与"
@@ -302,7 +338,7 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
 
     @tool
     async def deletePlan(plan_id: int) -> str:
-        """删除方案（**软删**：状态改为 closed，记录仍留在库里）。
+        """删除方案（**软删**：状态改为 closed；方案行保留，聊天进度入口同步移除）。
 
         删除前必须先向用户说明是哪一份方案（plan_id / 标题）并拿到明确同意 —— 不得自行删除。
 
@@ -315,8 +351,13 @@ def build_plan_tools(database: Database, ctx: PlanContext) -> list[BaseTool]:
                 return f"未找到方案 {plan_id}（或它不属于本会话）。"
             if plan.status == "closed":
                 return f"方案 {plan_id} 之前已经删过（closed）。"
+            if plan.status == "superseded":
+                return f"方案 {plan_id} 已被新方案替代（superseded），无需删除。"
             await dao.set_plan_status(
                 db, plan_id, "closed", session_id=ctx.session_db_id
+            )
+            await dao.delete_plan_record(
+                db, session_id=ctx.session_db_id, plan_id=plan_id
             )
         return f"方案 {plan_id} 已删除（状态改为 closed）。"
 

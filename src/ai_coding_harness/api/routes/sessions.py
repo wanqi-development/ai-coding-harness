@@ -28,7 +28,7 @@ from ai_coding_harness.api.schemas import (
     UsageActor,
     UsageSnapshot,
 )
-from ai_coding_harness.api.session_lookup import resolve_session
+from ai_coding_harness.api.session_lookup import current_user_id, resolve_session
 from ai_coding_harness.backends.composite import memory_path, read_memory
 from ai_coding_harness.db import dao
 from ai_coding_harness.observability.log_tail import read_session_logs
@@ -36,8 +36,10 @@ from ai_coding_harness.observability.run_log import account_key
 from ai_coding_harness.safety.redact import redact, secret_terms
 from ai_coding_harness.server.service import WORKSPACE_ERROR_MESSAGE, plan_payload
 from ai_coding_harness.session.manager import WORKSPACE_READY, Session, WorkspaceError
+from ai_coding_harness.session.session_cache import SessionSnapshot
 from ai_coding_harness.tools.git import build_git_client
 from ai_coding_harness.tools.pr_client import PULL_OPEN, PrLookupError, pull_summary
+from ai_coding_harness.tools.repo_access import RepoAccessError
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +63,32 @@ async def create_session(
     打开会话时再 ``POST /sessions/{id}/workspace`` 等它就绪。
     """
     manager = request.app.state.manager
-    created = await manager.create_session(req.repo_url)
-    request.app.state.sessions[created.session.public_id] = created.session
+    try:
+        created = await manager.create_session(
+            req.repo_url,
+            user_id=current_user_id(request),
+        )
+    except RepoAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+    cache = getattr(request.app.state, "session_cache", None)
+    if cache is not None:
+        session = created.session
+        await cache.put(
+            SessionSnapshot.from_parts(
+                public_id=session.public_id,
+                db_id=session.db_id,
+                user_id=session.user_id,
+                status=session.status,
+                repo_url=session.repo_url,
+                repo=session.repo,
+                credential_version=session.credential_version,
+                session_version=session.session_version,
+            )
+        )
+    else:
+        legacy = getattr(request.app.state, "sessions", None)
+        if isinstance(legacy, dict):
+            legacy[created.session.public_id] = created.session
     if not created.reused:
         manager.start_provisioning(created.session)
     return SessionResponse(
@@ -77,7 +103,9 @@ async def list_sessions(request: Request, limit: int = 50) -> list[SessionListIt
     """会话列表（供前端历史侧栏）。"""
     db = request.app.state.database
     async with db.session() as s:
-        rows = await dao.list_sessions_with_repo(s, limit=limit)
+        rows = await dao.list_sessions_with_repo(
+            s, limit=limit, user_id=current_user_id(request)
+        )
     return [
         SessionListItem(
             session_id=str(sess.public_id),
@@ -109,6 +137,9 @@ async def get_session_detail(session_id: str, request: Request) -> SessionDetail
     if found is None:
         raise HTTPException(status_code=404, detail="session not found")
     row, repo = found
+    user_id = current_user_id(request)
+    if user_id is not None and getattr(row, "user_id", None) != user_id:
+        raise HTTPException(status_code=404, detail="session not found")
     return SessionDetail(
         session_id=str(row.public_id),
         title=row.title,
@@ -148,18 +179,12 @@ async def get_records(
     before_id: int | None = None,
 ) -> RecordPage:
     """会话时间线的一页（默认最近 20 条），``before_id`` 向前翻。"""
+    session = await resolve_session(request, session_id)
     db = request.app.state.database
-    try:
-        public_id = uuid.UUID(session_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid session_id") from None
     async with db.session() as s:
-        sess = await dao.get_session_by_public_id(s, public_id)
-        if sess is None:
-            raise HTTPException(status_code=404, detail="session not found")
         rows, has_more, next_before_id = await dao.list_records_page(
             s,
-            session_id=sess.id,
+            session_id=session.db_id,
             before_id=before_id,
             limit=max(1, min(limit, 100)),
         )
@@ -209,16 +234,10 @@ async def get_plan(session_id: str, request: Request) -> PlanInfo | None:
 
     给「打开历史会话 / 刷新页面」还原进度面板用 —— SSE 的 plan 事件只在对话进行中推。
     """
+    session = await resolve_session(request, session_id)
     db = request.app.state.database
-    try:
-        public_id = uuid.UUID(session_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid session_id") from None
     async with db.session() as s:
-        sess = await dao.get_session_by_public_id(s, public_id)
-        if sess is None:
-            raise HTTPException(status_code=404, detail="session not found")
-        plan = await dao.get_latest_plan(s, session_id=sess.id)
+        plan = await dao.get_latest_plan(s, session_id=session.db_id)
     return None if plan is None else PlanInfo(**plan_payload(plan))
 
 
@@ -442,7 +461,13 @@ async def get_pulls(session_id: str, request: Request) -> PullList:
     与闸门判「有没有未合入的 PR」用的是同一个判定。
     """
     session = await resolve_session(request, session_id)
-    client = build_git_client(request.app.state.settings, session.repo)
+    manager = getattr(request.app.state, "manager", None)
+    settings = (
+        manager.settings_for(session)
+        if manager is not None
+        else request.app.state.settings
+    )
+    client = build_git_client(settings, session.repo)
     try:
         raw = await client.all_pulls()
     except PrLookupError as exc:
@@ -473,16 +498,10 @@ async def get_usage(session_id: str, request: Request) -> UsageSnapshot:
       「其中 N 轮没有用量数据」，而不是把缺的轮次当 0 消耗；
     - ``missing`` 是「平台没回用量的调用次数」。
     """
+    session = await resolve_session(request, session_id)
     db = request.app.state.database
-    try:
-        public_id = uuid.UUID(session_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid session_id") from None
     async with db.session() as s:
-        sess = await dao.get_session_by_public_id(s, public_id)
-        if sess is None:
-            raise HTTPException(status_code=404, detail="session not found")
-        rows = await dao.list_records_with_detail(s, session_id=sess.id)
+        rows = await dao.list_records_with_detail(s, session_id=session.db_id)
     return _aggregate_usage(rows)
 
 
@@ -497,23 +516,17 @@ async def get_memory(session_id: str, request: Request) -> MemorySnapshot:
     每轮开工前按 PR 实况重算（见 AGENTS.md 的写入口径）。在这里开一个「改一下」的口子，
     就把那条约束破了；要更新记忆就走对话（刷新仓库记忆）或跑一轮编码/审查。
     """
-    db = request.app.state.database
-    try:
-        public_id = uuid.UUID(session_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid session_id") from None
-    async with db.session() as s:
-        found = await dao.get_session_with_repo(s, public_id=public_id)
-    if found is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    _row, repo = found
-    if repo is None:
-        raise HTTPException(status_code=409, detail="会话缺少仓库信息，请新建会话。")
+    session = await resolve_session(request, session_id)
+    repo = session.repo
     prefix = request.app.state.settings.memories_prefix
     return MemorySnapshot(
-        path=memory_path(repo.owner, repo.name, prefix),
+        path=memory_path(repo.platform.value, repo.owner, repo.repo, prefix),
         content=await read_memory(
-            request.app.state.store, repo.owner, repo.name, prefix
+                request.app.state.store,
+                repo.platform.value,
+                repo.owner,
+                repo.repo,
+                prefix,
         ),
     )
 
@@ -527,6 +540,7 @@ async def cancel_run(session_id: str, request: Request) -> dict[str, bool]:
     订阅者随之看到流结束、不再产帧。**不查库、不改会话状态** —— 会话与历史都留着
     （要拆会话走 ``DELETE``），所以没在跑就回 ``{"cancelled": false}``，重按一次也不算错误。
     """
+    await resolve_session(request, session_id)
     return {"cancelled": await request.app.state.runs.cancel(session_id)}
 
 
@@ -537,19 +551,16 @@ async def destroy_session(session_id: str, request: Request) -> dict[str, bool]:
     会话不在内存（后端重启过）时也能删干净 —— 管理器据库里记的 sandbox_id 终止容器，
     不再像以前那样只改个状态、把容器漏在 OpenSandbox 侧。
     """
+    session = await resolve_session(request, session_id)
     manager = request.app.state.manager
-    request.app.state.sessions.pop(session_id, None)
+    cache = getattr(request.app.state, "session_cache", None)
+    if cache is not None:
+        await cache.invalidate(session_id)
+    legacy = getattr(request.app.state, "sessions", None)
+    if isinstance(legacy, dict):
+        legacy.pop(session_id, None)
     # 会话要拆了，正在跑的那一轮留着只会对着废掉的工作区写库
     await request.app.state.runs.cancel(session_id)
 
-    db = request.app.state.database
-    try:
-        public_id = uuid.UUID(session_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid session_id") from None
-    async with db.session() as s:
-        row = await dao.get_session_by_public_id(s, public_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    await manager.destroy_session(public_id=session_id, db_id=row.id)
+    await manager.destroy_session(public_id=session_id, db_id=session.db_id)
     return {"ok": True}

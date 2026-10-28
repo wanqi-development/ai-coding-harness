@@ -204,11 +204,15 @@ class TurnRecordsMixin:
             logger.exception("写会话标题失败（不影响主流程）")
 
     async def _summarize_new_pulls(
-        self, pulls: tuple[dict[str, Any], ...]
+        self, session: Session, pulls: tuple[dict[str, Any], ...]
     ) -> dict[int, PrMemorySummary]:
         """用一次模型调用批量摘要本轮新出现的 PR。"""
-        if self._memory_model is None:
-            self._memory_model = build_model(self._settings, role="qa")
+        user_id = getattr(session, "user_id", None)
+        user_key = int(user_id or 0)
+        model = self._memory_models.get(user_key)
+        if model is None:
+            model = build_model(self._settings, role="qa", user_id=user_id)
+            self._memory_models[user_key] = model
         compact = []
         for pull in pulls:
             summary = pull_summary(pull)
@@ -222,7 +226,7 @@ class TurnRecordsMixin:
                     "body": str(pull.get("body") or "").strip()[:800],
                 }
             )
-        reply = await self._memory_model.ainvoke(
+        reply = await model.ainvoke(
             [
                 SystemMessage(
                     content=(
@@ -256,7 +260,7 @@ class TurnRecordsMixin:
             repo=session.repo.repo,
             pulls=pulls,
             now=now_stamp(),
-            summarize=self._summarize_new_pulls,
+            summarize=lambda new_pulls: self._summarize_new_pulls(session, new_pulls),
         )
 
     async def _sync_repo_memory_before_turn(
@@ -266,7 +270,10 @@ class TurnRecordsMixin:
         if self._memory_backend is None:
             return None
         path = memory_store_key(
-            session.repo.owner, session.repo.repo, self._settings.memories_prefix
+            session.repo.platform.value,
+            session.repo.owner,
+            session.repo.repo,
+            self._settings.memories_prefix,
         )
         result = await self._sync_memory(
             session, self._memory_backend, path, pulls
@@ -285,11 +292,15 @@ class TurnRecordsMixin:
     ) -> None:
         """coding / rework 轮末再查一次 PR 并走同一套记忆同步。"""
         path = memory_path(
-            session.repo.owner, session.repo.repo, self._settings.memories_prefix
+            session.repo.platform.value,
+            session.repo.owner,
+            session.repo.repo,
+            self._settings.memories_prefix,
         )
         try:
+            settings = self._manager.settings_for(session)
             snapshot = await load_pull_snapshot(
-                self._settings,
+                settings,
                 session.repo,
                 database=self._db,
                 session_id=session.db_id,

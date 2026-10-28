@@ -30,7 +30,9 @@ LARGE_TOOL_RESULTS_PREFIX = "/large_tool_results/"
 MEMORIES_NAMESPACE: tuple[str, ...] = ("memories",)
 
 
-def memory_path(owner: str, repo: str, prefix: str = "/memories/") -> str:
+def memory_path(
+    platform: str, owner: str, repo: str, prefix: str = "/memories/"
+) -> str:
     """仓库记忆文件的运行时路径 —— **记忆路径的唯一口径**，读写两侧都调它。
 
     历史教训：server 层读记忆、工具层写记忆各自拼过一份路径，两处口径一旦不一致，
@@ -39,11 +41,13 @@ def memory_path(owner: str, repo: str, prefix: str = "/memories/") -> str:
     前缀与后端路由（``CompositeBackend`` 的 ``memories_prefix``）同一口径，
     传别的值就等于写到没人读的 key 上。
     """
-    return f"{prefix.rstrip('/')}/{owner}/{repo}.md"
+    return f"{prefix.rstrip('/')}/{platform.strip().lower()}/{owner}/{repo}.md"
 
 
-def memory_store_key(owner: str, repo: str, prefix: str = "/memories/") -> str:
-    """仓库记忆在 store 里的**实际 key**：``/<owner>/<repo>.md``（路由前缀已被吃掉）。
+def memory_store_key(
+    platform: str, owner: str, repo: str, prefix: str = "/memories/"
+) -> str:
+    """仓库记忆在 store 里的实际 key：``/<platform>/<owner>/<repo>.md``。
 
     ``CompositeBackend`` 命中路由前缀后是**先把前缀剥掉**再交给子后端（见上游
     ``_route_for_path`` 的说明），所以 ``StoreBackend`` 看到的 key 是去前缀的那半截。
@@ -53,7 +57,7 @@ def memory_store_key(owner: str, repo: str, prefix: str = "/memories/") -> str:
 
     实现上从 ``memory_path`` 剥前缀而不是再拼一遍字符串：路径形状只留 ``memory_path`` 一处定义。
     """
-    return memory_path(owner, repo, prefix).removeprefix(prefix.rstrip("/"))
+    return memory_path(platform, owner, repo, prefix).removeprefix(prefix.rstrip("/"))
 
 
 def build_composite_backend(
@@ -84,7 +88,11 @@ def build_composite_backend(
 
 
 async def read_memory(
-    store: BaseStore, owner: str, repo: str, prefix: str = "/memories/"
+    store: BaseStore,
+    platform: str,
+    owner: str,
+    repo: str,
+    prefix: str = "/memories/",
 ) -> str | None:
     """读仓库记忆全文；这个仓库还没写过记忆时返回 ``None``。
 
@@ -96,7 +104,9 @@ async def read_memory(
     ``file_data_to_string`` 是库自己的归一化（老的 list[str] 内容也认），用它而不是直接取
     ``value["content"]``，少一份要自己维护的兼容逻辑。
     """
-    item = await store.aget(MEMORIES_NAMESPACE, memory_store_key(owner, repo, prefix))
+    item = await store.aget(
+        MEMORIES_NAMESPACE, memory_store_key(platform, owner, repo, prefix)
+    )
     if item is None:
         return None
     value = getattr(item, "value", None)

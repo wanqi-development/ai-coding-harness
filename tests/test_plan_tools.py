@@ -298,6 +298,10 @@ class TestPlanCrud:
             calls.append(("set_status", plan_id, status, session_id))
             return True
 
+        async def fake_delete_record(db, *, session_id, plan_id):
+            calls.append(("delete_record", plan_id, session_id))
+            return 1
+
         async def fake_set_steps(db, *, plan_id, session_id, steps):
             calls.append(("set_steps", plan_id, len(steps)))
             return True
@@ -310,6 +314,7 @@ class TestPlanCrud:
             ("get_plan", fake_get_plan),
             ("get_latest_plan", fake_get_latest),
             ("set_plan_status", fake_set_status),
+            ("delete_plan_record", fake_delete_record),
             ("set_plan_steps", fake_set_steps),
             ("update_plan_content", fake_update),
         ):
@@ -325,6 +330,7 @@ class TestPlanCrud:
 
         assert "已删除（状态改为 closed）" in msg
         assert ("set_status", 7, "closed", 1) in calls
+        assert ("delete_record", 7, 1) in calls
 
     async def test_deleting_twice_says_so(self, monkeypatch):
         msg, calls = await self._call(
@@ -333,6 +339,14 @@ class TestPlanCrud:
 
         assert "之前已经删过" in msg
         assert not [c for c in calls if c[0] == "set_status"]
+
+    async def test_a_superseded_plan_does_not_need_deletion(self, monkeypatch):
+        msg, calls = await self._call(
+            monkeypatch, "deletePlan", plan=_plan(status="superseded"), plan_id=7
+        )
+
+        assert "已被新方案替代" in msg
+        assert not [c for c in calls if c[0] in ("set_status", "delete_record")]
 
     async def test_a_missing_plan_reports_not_found(self, monkeypatch):
         msg, _ = await self._call(monkeypatch, "deletePlan", plan=None, plan_id=7)
@@ -366,7 +380,7 @@ class TestPlanCrud:
             content="新" * 120,
         )
 
-        assert "已删除（closed），不再修改" in msg
+        assert "当前状态为 closed，不再修改" in msg
         assert not [c for c in calls if c[0] == "update"]
 
     async def test_update_steps_replaces_and_resets_progress(self, monkeypatch):
@@ -428,7 +442,11 @@ class TestRoundStateCapture:
         async def fake_store(db, **kwargs):
             return _plan(id=9)
 
+        async def no_replace(db, *, session_id):
+            return None
+
         monkeypatch.setattr(plan_mod.dao, "store_plan", fake_store)
+        monkeypatch.setattr(plan_mod.dao, "get_replaceable_plan", no_replace)
         state = TurnState()
         token = var_child_runnable_config.set(
             {"configurable": {"turn_state": state}}
@@ -447,6 +465,73 @@ class TestRoundStateCapture:
             var_child_runnable_config.reset(token)
 
         assert state.plan_id == 9
+
+    async def test_store_plan_supersedes_the_current_plan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple] = []
+
+        async def fake_replaceable(db, *, session_id):
+            return _plan(id=7, status="failed")
+
+        async def fake_set_status(db, plan_id, status, *, session_id=None):
+            calls.append(("set_status", plan_id, status, session_id))
+            return True
+
+        async def fake_delete_record(db, *, session_id, plan_id):
+            calls.append(("delete_record", plan_id, session_id))
+            return 1
+
+        async def fake_store(db, **kwargs):
+            calls.append(("store", kwargs["content"]))
+            return _plan(id=9, status="pending")
+
+        monkeypatch.setattr(plan_mod.dao, "get_replaceable_plan", fake_replaceable)
+        monkeypatch.setattr(plan_mod.dao, "set_plan_status", fake_set_status)
+        monkeypatch.setattr(plan_mod.dao, "delete_plan_record", fake_delete_record)
+        monkeypatch.setattr(plan_mod.dao, "store_plan", fake_store)
+        tool = next(
+            t for t in build_plan_tools(_Db(), _ctx()) if t.name == "storePlan"
+        )
+
+        message = await tool.ainvoke(
+            {"content": "甲" * 120, "steps": [{"goal": "改 A"}]}
+        )
+
+        assert "plan_id=9" in message and "已替代 plan_id=7" in message
+        assert calls[:2] == [
+            ("set_status", 7, "superseded", 1),
+            ("delete_record", 7, 1),
+        ]
+
+    async def test_store_plan_rejects_an_unavailable_explicit_replacement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple] = []
+
+        async def fake_get(db, *, session_id, plan_id):
+            calls.append(("get", plan_id, session_id))
+            return _plan(id=plan_id, status="done")
+
+        async def no_store(*_args, **_kwargs):
+            raise AssertionError("旧方案不可替代时不能写新方案")
+
+        monkeypatch.setattr(plan_mod.dao, "get_plan", fake_get)
+        monkeypatch.setattr(plan_mod.dao, "store_plan", no_store)
+        tool = next(
+            t for t in build_plan_tools(_Db(), _ctx()) if t.name == "storePlan"
+        )
+
+        message = await tool.ainvoke(
+            {
+                "content": "甲" * 120,
+                "steps": [{"goal": "改 A"}],
+                "replaces_plan_id": 7,
+            }
+        )
+
+        assert "只有 pending / failed" in message
+        assert calls == [("get", 7, 1)]
 
     async def test_get_unexecuted_plan_writes_plan_id_to_turn_state(
         self, monkeypatch: pytest.MonkeyPatch

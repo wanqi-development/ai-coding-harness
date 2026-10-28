@@ -486,8 +486,8 @@ class TestUserVisibleStream:
             {"type": "reasoning", "content": "先看代码。", "agent": "coder"}
         ]
 
-    async def test_subagent_todos_without_a_main_list_get_a_container(self, plan_reads):
-        """主清单没建时不再整份吞掉：树尾补容器兜住，SSE 上要看得见。"""
+    async def test_subagent_todos_without_a_main_list_are_dropped(self, plan_reads):
+        """主清单没建时没有当前进度落点，子清单不单独造容器。"""
         ns = sub_ns("t1")  # 与 task 的 call_id 对上，排除「没记成委派」
         out = await _run(
             [
@@ -503,15 +503,7 @@ class TestUserVisibleStream:
             ]
         )
         frames = [e for e in out if e["type"] == "todos"]
-        assert frames, "容器帧至少要下发一次"
-        for frame in frames:
-            assert frame["items"] == [
-                {
-                    "content": "编码子任务",
-                    "status": "pending",
-                    "children": [{"content": "子任务", "status": "pending"}],
-                }
-            ]
+        assert frames == []
 
     async def test_subagent_todos_land_under_the_running_item(self, recorded):
         """一条链路走通：主清单 → 委派 → 子清单，SSE 与落库都该是嵌套的样子。"""

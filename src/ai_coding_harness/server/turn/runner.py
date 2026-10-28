@@ -198,6 +198,7 @@ class TurnRunnerMixin:
                 dialogue,
                 allowed_intents=allowed_intents,
                 repo_state=repo_status,
+                user_id=getattr(session, "user_id", None),
             )
         state_block: str | None = None
         gate = gate_intent_for_state(decision.intent, allowed_intents)

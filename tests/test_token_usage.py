@@ -537,6 +537,7 @@ def _app() -> FastAPI:
     app = FastAPI()
     app.include_router(sessions_route.router)
     app.state.database = SimpleNamespace(session=_db_session)
+    app.state.sessions = {}
     # 真配置：接口里要用它算 context 的窗口
     app.state.settings = Settings(_env_file=None)
     return app
@@ -556,7 +557,9 @@ async def _get(
 
     monkeypatch.setattr(dao, "get_session_by_public_id", fake_session)
     monkeypatch.setattr(dao, "list_records_with_detail", fake_records)
-    transport = httpx.ASGITransport(app=_app())
+    app = _app()
+    app.state.sessions[SESSION] = SimpleNamespace(user_id=None, db_id=1)
+    transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.get(path)
 

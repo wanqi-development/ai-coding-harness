@@ -56,18 +56,23 @@ def _enabled(request: Request) -> None:
         raise HTTPException(status_code=404, detail="代码面板已关闭（REPO_VIEW_ENABLED=false）")
 
 
-async def _spec(request: Request, session_id: str) -> RepoSpec:
+async def _spec(request: Request, session_id: str):
     _enabled(request)
     session = await resolve_session(request, session_id)
-    return RepoSpec.from_session(session)
+    manager = getattr(request.app.state, "manager", None)
+    settings = (
+        manager.settings_for(session)
+        if manager is not None
+        else request.app.state.settings
+    )
+    return settings, RepoSpec.from_session(session)
 
 
 def _branches_payload(branches) -> list[RepoBranch]:
     return [RepoBranch(**vars(branch)) for branch in branches]
 
 
-async def _status(request: Request, spec: RepoSpec, *, cloned_now: bool = False) -> RepoSyncResult:
-    settings = _settings(request)
+async def _status(settings, spec: RepoSpec, *, cloned_now: bool = False) -> RepoSyncResult:
     cloned = is_cloned(settings, spec)
     default = ""
     branches = []
@@ -92,9 +97,9 @@ async def _status(request: Request, spec: RepoSpec, *, cloned_now: bool = False)
 @router.get("/{session_id}/repo", response_model=RepoSyncResult)
 async def get_repo_status(session_id: str, request: Request) -> RepoSyncResult:
     """缓存状态 + 分支清单（**不联网**）：面板打开时先问它，有缓存就直接显示。"""
-    spec = await _spec(request, session_id)
+    settings, spec = await _spec(request, session_id)
     try:
-        return await _status(request, spec)
+        return await _status(settings, spec)
     except RepoViewError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -102,9 +107,9 @@ async def get_repo_status(session_id: str, request: Request) -> RepoSyncResult:
 @router.post("/{session_id}/repo/sync", response_model=RepoSyncResult)
 async def sync_repo(session_id: str, request: Request) -> RepoSyncResult:
     """下载或更新这份缓存：没有就 clone，有就 fetch。幂等，同一仓库并发进来只跑一次。"""
-    spec = await _spec(request, session_id)
+    settings, spec = await _spec(request, session_id)
     try:
-        result = await sync(_settings(request), spec)
+        result = await sync(settings, spec)
     except GitMissingError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RepoViewError as exc:
@@ -114,8 +119,8 @@ async def sync_repo(session_id: str, request: Request) -> RepoSyncResult:
         cloned_now=result.cloned,
         default_branch=result.default_branch,
         branches=_branches_payload(result.branches),
-        fetched_at=fetched_at(_settings(request), spec),
-        git=find_git(_settings(request)),
+        fetched_at=fetched_at(settings, spec),
+        git=find_git(settings),
     )
 
 
@@ -127,9 +132,9 @@ async def get_repo_tree(
     path: str = Query("", description="仓库内相对路径；留空是根目录"),
 ) -> RepoTree:
     """列一层目录（惰性展开：前端点一层问一次，不把整棵文件树一次拉下来）。"""
-    spec = await _spec(request, session_id)
+    settings, spec = await _spec(request, session_id)
     try:
-        entries = await tree(_settings(request), spec, ref=ref, path=path)
+        entries = await tree(settings, spec, ref=ref, path=path)
     except RepoViewError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RepoTree(
@@ -147,9 +152,9 @@ async def get_repo_file(
     path: str = Query(..., description="仓库内相对路径"),
 ) -> RepoFile:
     """读一个文件的正文；太大 / 二进制只回标记。"""
-    spec = await _spec(request, session_id)
+    settings, spec = await _spec(request, session_id)
     try:
-        content = await read_file(_settings(request), spec, ref=ref, path=path)
+        content = await read_file(settings, spec, ref=ref, path=path)
     except RepoViewError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RepoFile(**vars(content))
@@ -181,8 +186,7 @@ async def get_repo_diff(
     这正是把 diff 放本地算的理由）。正文先脱敏再回（令牌/口令不该出现在聊天里），
     超过上限显式截断并把 ``truncated`` 传出去。
     """
-    settings = _settings(request)
-    spec = await _spec(request, session_id)
+    settings, spec = await _spec(request, session_id)
     try:
         raw = await file_diff(settings, spec, base=base, head=head, path=path)
     except GitMissingError as exc:

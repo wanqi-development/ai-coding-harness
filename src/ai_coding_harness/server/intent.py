@@ -258,7 +258,7 @@ def gate_intent_for_state(
         )
     return StateGateResult(
         None,
-        "当前无法确认仓库的 PR 状态，不能安全地区分 coding 与 rework。"
+        "当前无法确认仓库的 PR 状态,"
         "这次先只做只读问答；需要改代码时请稍后重试。",
     )
 
@@ -795,7 +795,7 @@ class JevDecider:
         await self._client.aclose()
 
 
-def build_jev_decider(settings: Any) -> JevDecider | None:
+def build_jev_decider(settings: Any, *, user_id: int | None = None) -> JevDecider | None:
     """按配置造 JEV 判定器；没启用 / 没配齐 / 装不上 SDK 时返回 ``None``（跳过这一关）。
 
     凭据来自界面上的「意图识别（JEV）」那一行（2026-10-15 起 ``TYPESAFE_*`` 三个 .env 键
@@ -806,11 +806,18 @@ def build_jev_decider(settings: Any) -> JevDecider | None:
     """
     if not getattr(settings, "intent_jev_enabled", False):
         return None
-    api_key = str(getattr(settings, "typesafe_api_key", "") or "")
+    from ai_coding_harness.agent.llm import model_rows_for
+
+    row = model_rows_for(settings, user_id).get("jev")
+    api_key = str(
+        row.api_key if row is not None else getattr(settings, "typesafe_api_key", "") or ""
+    )
     if not api_key:
         logger.info("「意图识别（JEV）」那一行没配 api_key，跳过 JEV")
         return None
-    base_url = str(getattr(settings, "typesafe_base_url", "") or "")
+    base_url = str(
+        row.base_url if row is not None else getattr(settings, "typesafe_base_url", "") or ""
+    )
     if not base_url:
         logger.info("「意图识别（JEV）」那一行没配 base_url，跳过 JEV")
         return None
@@ -818,7 +825,11 @@ def build_jev_decider(settings: Any) -> JevDecider | None:
         return JevDecider(
             api_key=api_key,
             base_url=base_url,
-            model=str(getattr(settings, "typesafe_model_name", "") or ""),
+            model=str(
+                row.model
+                if row is not None
+                else getattr(settings, "typesafe_model_name", "") or ""
+            ),
             timeout=float(getattr(settings, "typesafe_timeout_seconds", 10.0)),
         )
     # 判定器缺一层不影响服务启动

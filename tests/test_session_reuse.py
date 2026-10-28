@@ -29,6 +29,7 @@ from ai_coding_harness.session.manager import (
     SessionManager,
 )
 from ai_coding_harness.tools.git import GiteeRepo
+from ai_coding_harness.tools.repo_access import RepoAccessError
 
 REPO_URL = "https://gitee.com/owner/repo.git"
 
@@ -46,6 +47,13 @@ class FakeStore:
         self.lock_calls: list[str] = []
         self._lock = asyncio.Lock()
 
+    async def get(self, _model: object, _key: object) -> None:
+        """UserRuntimeSettings lookup: tests use defaults."""
+
+    async def scalars(self, _query: object) -> list[object]:
+        """Per-user model endpoint lookup: tests use no model rows."""
+        return []
+
     async def acquire(self, key: str) -> None:
         self.lock_calls.append(key)
         await self._lock.acquire()
@@ -54,12 +62,21 @@ class FakeStore:
         if self._lock.locked():
             self._lock.release()
 
-    def find(self, owner: str, name: str) -> tuple[SimpleNamespace, SimpleNamespace] | None:
+    def find(
+        self,
+        owner: str,
+        name: str,
+        *,
+        user_id: int | None = None,
+        platform: str | None = None,
+    ) -> tuple[SimpleNamespace, SimpleNamespace] | None:
         for row, repo in zip(self.sessions, self.repos, strict=True):
             if (
                 repo.owner.lower() == owner.lower()
                 and repo.name.lower() == name.lower()
+                and (platform is None or getattr(repo, "platform", "gitee") == platform)
                 and row.status == "active"
+                and (user_id is None or row.user_id == user_id)
             ):
                 return row, repo
         return None
@@ -73,19 +90,29 @@ class FakeStore:
         token: str | None = None,
         status: str = "active",
         workspace_status: str = WORKSPACE_READY,
+        user_id: int | None = None,
     ) -> SimpleNamespace:
         row = SimpleNamespace(
             id=len(self.sessions) + 1,
             public_id=uuid.uuid4(),
+            user_id=user_id,
             status=status,
             gitee_token=token,
             gitee_username="oauth2",
             git_platform="gitee",
+            credential_version=0,
+            session_version=0,
             workspace_status=workspace_status,
         )
         self.sessions.append(row)
         self.repos.append(
-            SimpleNamespace(session_id=row.id, owner=owner, name=name, url=url)
+            SimpleNamespace(
+                session_id=row.id,
+                owner=owner,
+                name=name,
+                url=url,
+                platform="gitee",
+            )
         )
         return row
 
@@ -115,17 +142,35 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeStore:
     """把 ``create_session`` 用到的 dao 全换成假件（签名与真实实现一致）。"""
     st = FakeStore()
 
-    async def lock_repo(db, *, owner: str, name: str) -> None:
-        await st.acquire(f"{owner}/{name}".lower())
+    async def lock_repo(
+        db,
+        *,
+        owner: str,
+        name: str,
+        user_id: int | None = None,
+        platform: str | None = None,
+    ) -> None:
+        scope = f"{platform}:{owner}/{name}".lower()
+        if user_id is not None:
+            scope = f"user:{user_id}:{scope}"
+        await st.acquire(scope)
 
-    async def find_active_session_by_repo(db, *, owner: str, name: str):
+    async def find_active_session_by_repo(
+        db,
+        *,
+        owner: str,
+        name: str,
+        user_id: int | None = None,
+        platform: str | None = None,
+    ):
         await asyncio.sleep(0)  # 让并发的另一方有机会插进来（真查询也有 I/O 点）
-        return st.find(owner, name)
+        return st.find(owner, name, user_id=user_id, platform=platform)
 
     async def create_session(
         db,
         *,
         public_id,
+        user_id=None,
         gitee_token=None,
         gitee_username=None,
         git_platform=None,
@@ -135,19 +180,30 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeStore:
         row = SimpleNamespace(
             id=len(st.sessions) + 1,
             public_id=public_id,
+            user_id=user_id,
             status="active",
             # 存占位符而不是真值：断言失败时 pytest 会打出 locals，而令牌不许进任何输出
             gitee_token=("tok" if gitee_token else None),
             gitee_username=gitee_username,
             git_platform="gitee",
+            credential_version=0,
+            session_version=0,
             workspace_status="pending",
         )
         st.sessions.append(row)
         return row
 
-    async def create_repository(db, *, session_id, owner, name, url) -> None:
+    async def create_repository(
+        db, *, session_id, owner, name, url, platform="gitee"
+    ) -> None:
         st.repos.append(
-            SimpleNamespace(session_id=session_id, owner=owner, name=name, url=url)
+            SimpleNamespace(
+                session_id=session_id,
+                owner=owner,
+                name=name,
+                url=url,
+                platform=platform,
+            )
         )
 
     monkeypatch.setattr(dao, "lock_repo", lock_repo)
@@ -159,7 +215,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeStore:
 
 def make_manager(store: FakeStore) -> SessionManager:
     return SessionManager(
-        settings=Settings(),
+        settings=Settings(verify_repo_access=False),
         model_for=lambda role: SimpleNamespace(),
         fallback_for=lambda role: None,
         web_search_tool=SimpleNamespace(),
@@ -178,6 +234,23 @@ async def test_new_repo_creates_a_session(store: FakeStore) -> None:
         uuid.UUID(created.session.public_id)
     ]
     assert [(r.owner, r.name, r.url) for r in store.repos] == [("owner", "repo", REPO_URL)]
+
+
+async def test_repository_access_is_checked_before_creating_a_session(
+    store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = make_manager(store)
+    manager._settings.verify_repo_access = True
+
+    async def denied(settings, repo):
+        raise RepoAccessError("无权访问")
+
+    monkeypatch.setattr("ai_coding_harness.session.manager.verify_repo_access", denied)
+
+    with pytest.raises(RepoAccessError, match="无权访问"):
+        await manager.create_session(REPO_URL)
+    assert store.sessions == []
+    assert store.repos == []
 
 
 async def test_same_repo_reuses_the_active_session(store: FakeStore) -> None:
@@ -220,6 +293,18 @@ async def test_concurrent_create_for_one_repo_keeps_one_session(
     assert first.session.public_id == second.session.public_id
 
 
+async def test_same_repo_is_isolated_between_users(store: FakeStore) -> None:
+    manager = make_manager(store)
+
+    first = await manager.create_session(REPO_URL, user_id=7)
+    second = await manager.create_session(REPO_URL, user_id=8)
+
+    assert first.reused is False
+    assert second.reused is False
+    assert first.session.public_id != second.session.public_id
+    assert [row.user_id for row in store.sessions] == [7, 8]
+
+
 class FakeManager:
     """路由层只要这两个方法。"""
 
@@ -230,8 +315,11 @@ class FakeManager:
     async def create_session(
         self,
         repo_url: str,
+        *,
+        user_id: int | None = None,
     ) -> CreatedSession:
         self.repo_url = repo_url
+        self.user_id = user_id
         return self._created
 
     def start_provisioning(self, session: Session) -> None:

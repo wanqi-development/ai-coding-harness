@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -52,12 +53,40 @@ from ai_coding_harness.sandbox.volumes import (
     build_workspace_volume,
     workspace_volume_name,
 )
+from ai_coding_harness.session.user_runtime import (
+    UserRuntimeSettings,
+    load_user_runtime_settings,
+    settings_for_user,
+)
 from ai_coding_harness.tools.fetch_url import build_fetch_url_tool
 from ai_coding_harness.tools.handoff import HandoffContext
 from ai_coding_harness.tools.plan import PlanContext
 from ai_coding_harness.tools.register import build_main_tools, build_subagent_tools
+from ai_coding_harness.tools.repo_access import verify_repo_access
 
 logger = logging.getLogger(__name__)
+
+
+def _model_factory(
+    factory: Callable[..., Any],
+) -> Callable[[str, int | None], Any]:
+    """Accept legacy one-argument test factories while production gets ``user_id``."""
+    try:
+        parameters = inspect.signature(factory).parameters.values()
+        positional = [
+            item
+            for item in parameters
+            if item.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        variadic = any(
+            item.kind is inspect.Parameter.VAR_POSITIONAL for item in parameters
+        )
+        if variadic or len(positional) >= 2:
+            return lambda role, user_id: factory(role, user_id)
+    except (TypeError, ValueError):
+        pass
+    return lambda role, _user_id: factory(role)
 
 # 代码工作区状态（sessions.workspace_status）—— 前端据此显示「准备中 / 可用 / 异常」
 WORKSPACE_PENDING = "pending"
@@ -85,6 +114,11 @@ class Session:
     db_id: int  # 业务库内部主键
     repo: RepoSpec
     repo_url: str
+    user_id: int | None = None
+    runtime_settings: UserRuntimeSettings | None = None
+    status: str = "active"
+    credential_version: int = 0
+    session_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +146,7 @@ class SessionRuntime:
 
     sandbox: OpenSandboxProxy
     backend: BackendProtocol
+    credential_version: int = 0
 
 
 @dataclass
@@ -154,8 +189,8 @@ class SessionManager:
         self,
         *,
         settings: Settings,
-        model_for: Callable[[str], BaseChatModel],
-        fallback_for: Callable[[str], BaseChatModel | None],
+        model_for: Callable[[str, int | None], BaseChatModel],
+        fallback_for: Callable[[str, int | None], BaseChatModel | None],
         web_search_tool: BaseTool,
         store: BaseStore,
         checkpointer: BaseCheckpointSaver,
@@ -163,8 +198,8 @@ class SessionManager:
         circuit_store: CircuitStore | None = None,
     ) -> None:
         self._settings = settings
-        self._model_for = model_for
-        self._fallback_for = fallback_for
+        self._model_for = _model_factory(model_for)
+        self._fallback_for = _model_factory(fallback_for)
         self._web_search = web_search_tool
         self._fetch_url = build_fetch_url_tool()
         self._store = store
@@ -176,6 +211,13 @@ class SessionManager:
         self._runtimes: dict[str, SessionRuntime] = {}
         self._pending: dict[str, _Pending] = {}
 
+    def settings_for(self, session: Session) -> Settings:
+        """该会话所属用户的设置视图（缓存路径与默认分支按用户覆盖）。"""
+        runtime_settings = getattr(session, "runtime_settings", None)
+        if runtime_settings is None:
+            return self._settings
+        return settings_for_user(self._settings, runtime_settings)
+
     @property
     def store(self) -> BaseStore:
         """持久 Store；仓库记忆在沙箱建立前也要读写。"""
@@ -185,6 +227,8 @@ class SessionManager:
     async def create_session(
         self,
         repo_url: str,
+        *,
+        user_id: int | None = None,
     ) -> CreatedSession:
         """创建会话：只写库（拿 id + 关联仓库），工作区交给 ``ensure_runtime``。
 
@@ -197,11 +241,37 @@ class SessionManager:
         跑着的会话不会中途换凭据。复用走库里记的那份（见 ``session_from_row``）。
         """
         platform, owner, repo = parse_repo_url(repo_url)
+        user_runtime = await load_user_runtime_settings(
+            self._settings, self._db, user_id
+        )
+        user_settings = settings_for_user(self._settings, user_runtime)
+
+        repo_spec = RepoSpec(
+            platform=platform,
+            owner=owner,
+            repo=repo,
+            token=user_settings.token_for(platform),
+            git_username=user_settings.username_for(platform),
+        )
+        if self._settings.verify_repo_access:
+            await verify_repo_access(user_settings, repo_spec)
 
         async with self._db.session() as db:
             # 先拿锁再查：两个并发请求（双击、两个标签页）否则会双双查空、各建一个会话
-            await dao.lock_repo(db, owner=owner, name=repo)
-            existing = await dao.find_active_session_by_repo(db, owner=owner, name=repo)
+            await dao.lock_repo(
+                db,
+                owner=owner,
+                name=repo,
+                user_id=user_id,
+                platform=platform.value,
+            )
+            existing = await dao.find_active_session_by_repo(
+                db,
+                owner=owner,
+                name=repo,
+                user_id=user_id,
+                platform=platform.value,
+            )
             if existing is not None:
                 row, stored = existing
                 logger.info(
@@ -217,20 +287,16 @@ class SessionManager:
                         gitee_token=row.gitee_token,
                         gitee_username=row.gitee_username,
                         git_platform=row.git_platform,
+                        user_id=getattr(row, "user_id", None),
+                        runtime_settings=user_runtime,
+                        status=row.status,
+                        credential_version=row.credential_version,
+                        session_version=row.session_version,
                     ),
                     reused=True,
                     workspace_status=row.workspace_status,
                 )
 
-            repo_spec = RepoSpec(
-                platform=platform,
-                owner=owner,
-                repo=repo,
-                token=self._settings.token_for(platform),
-                # 用户名留空由 RepoSpec 填平台默认值（Gitee ``oauth2`` / GitHub
-                # ``x-access-token``）；PAT 场景应在设置页填真实用户名
-                git_username=self._settings.username_for(platform),
-            )
             public_id = uuid4()
 
             row = await dao.create_session(
@@ -239,10 +305,16 @@ class SessionManager:
                 gitee_token=repo_spec.token or None,
                 gitee_username=repo_spec.git_username,
                 git_platform=repo_spec.platform.value,
+                user_id=user_id,
             )
             await dao.create_repository(
                 # 存用户给的原地址（代码面板按它 clone；不在这里改写他的输入）
-                db, session_id=row.id, owner=owner, name=repo, url=repo_url
+                db,
+                session_id=row.id,
+                owner=owner,
+                name=repo,
+                url=repo_url,
+                platform=platform.value,
             )
             db_id = row.id
         logger.info("会话已落库：public_id=%s db_id=%s", public_id, db_id)
@@ -250,8 +322,10 @@ class SessionManager:
             session=Session(
                 public_id=str(public_id),
                 db_id=db_id,
+                user_id=user_id,
                 repo=repo_spec,
                 repo_url=repo_url,
+                runtime_settings=user_runtime,
             ),
             reused=False,
             # 新建的会话下一步就进 provisioning（路由随即 start_provisioning）
@@ -274,6 +348,11 @@ class SessionManager:
         gitee_token: str | None,
         gitee_username: str | None,
         git_platform: str | None = None,
+        user_id: int | None = None,
+        runtime_settings: UserRuntimeSettings | None = None,
+        status: str = "active",
+        credential_version: int = 0,
+        session_version: int = 0,
     ) -> Session:
         """由库里的行组装会话描述。
 
@@ -284,6 +363,7 @@ class SessionManager:
         return Session(
             public_id=public_id,
             db_id=db_id,
+            user_id=user_id,
             repo=RepoSpec(
                 platform=Platform.of(git_platform),
                 owner=owner,
@@ -292,6 +372,10 @@ class SessionManager:
                 git_username=gitee_username or "",
             ),
             repo_url=repo_url,
+            runtime_settings=runtime_settings,
+            status=status,
+            credential_version=int(credential_version or 0),
+            session_version=int(session_version or 0),
         )
 
     # -- 工作区（异步建，用前等）-------------------------------------------
@@ -313,7 +397,18 @@ class SessionManager:
             # 节流，失败只记日志）。运行中那一侧由代理在每次沙箱调用前兜住 —— 一轮可能跑很久，
             # 只靠这一处续期不够（见 ``sandbox/proxy.py::_maybe_renew``）。
             await runtime.sandbox.renew_if_due()
-            return runtime
+            if runtime.credential_version < session.credential_version:
+                try:
+                    await self._refresh_sandbox_credentials(session, runtime)
+                except Exception:
+                    logger.exception(
+                        "沙箱凭据原地刷新失败，转为重建：public_id=%s", public_id
+                    )
+                    await self._destroy_quietly_proxy(runtime.sandbox)
+                    self._runtimes.pop(public_id, None)
+                    runtime = None
+            if runtime is not None:
+                return runtime
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _ENSURE_TIMEOUT_SECONDS
@@ -339,13 +434,15 @@ class SessionManager:
             self._abandon(pending)
         raise error or WorkspaceError("代码工作区创建失败")
 
-    def _fallback_middleware(self, role: str, agent: str) -> FallbackMiddleware | None:
+    def _fallback_middleware(
+        self, role: str, agent: str, user_id: int | None = None
+    ) -> FallbackMiddleware | None:
         """把 ``fallback_for(role)`` 给的模型包成兜底中间件；没兜底就是 ``None``。
 
         角色名与日志标注（``%(agent)s`` 那一列）只有这一层同时知道：子智能体两者同值，
         主控则是「形态名 + ``MAIN_AGENT``」。
         """
-        model = self._fallback_for(role)
+        model = self._fallback_for(role, user_id)
         if model is None:
             return None
         return FallbackMiddleware(
@@ -371,13 +468,15 @@ class SessionManager:
         **为什么不缓存**（2026-10-14 用户口径）：模型与上下文窗口是建实例时读的，缓存住之后
         在设置页改完要重启才生效。每轮现建的代价是一次装配（毫秒级），换来的是「改完立刻生效」。
         """
+        settings = self.settings_for(session)
+        user_id = getattr(session, "user_id", None)
         plan_ctx = PlanContext(
             session_db_id=session.db_id,
             owner=session.repo.owner,
             repo=session.repo.repo,
         )
         main_tools = build_main_tools(
-            self._settings,
+            settings,
             self._web_search,
             self._fetch_url,
             session.repo,
@@ -390,34 +489,34 @@ class SessionManager:
                 manager=self,
                 runtime=runtime,
                 session=session,
-                settings=self._settings,
+                settings=settings,
                 form=profile.form,
             ),
         )
         # 主控的模型只建一次：压缩中间件要用**同一个实例** —— 触发线是按它 profile 上
         # 那个窗口算的（``agent/llm.py::_model_from`` 写进去的那一格）
-        main_model = self._model_for(profile.form)
+        main_model = self._model_for(profile.form, user_id)
         subagents = build_subagents(
             tools_by_role={
                 role: build_subagent_tools(
-                    role, self._settings, self._web_search, self._fetch_url,
+                    role, settings, self._web_search, self._fetch_url,
                     session.repo, self._db, plan_ctx,
                 )
                 for role in profile.subagents
             },
-            model_for=self._model_for,
+            model_for=lambda role: self._model_for(role, user_id),
             policies={
-                role: policy_for(role, self._settings) for role in profile.subagents
+                role: policy_for(role, settings) for role in profile.subagents
             },
             safety=self._safety,
             fallbacks={
                 role: fb
                 for role in profile.subagents
-                if (fb := self._fallback_middleware(role, role)) is not None
+                if (fb := self._fallback_middleware(role, role, user_id)) is not None
             },
             # 子智能体也各挂一份记忆中间件（每次调用现给一个实例：它们可能并发跑）
             memory_factory=lambda role: build_memory_middleware(
-                self._settings, session.repo, runtime.backend, role=role
+                settings, session.repo, runtime.backend, role=role
             ),
             plan_recovery_factory=lambda role: (
                 PlanRecoveryMiddleware(
@@ -431,7 +530,7 @@ class SessionManager:
             # 压缩（含压缩线处的应急裁剪）：每个角色按**它自己那个模型**的窗口算触发线。
             # 上游那份已在 ``agent/graph.py`` 里按类排掉，所以这里不给就是「这个角色不压缩」
             summarization_for=lambda role, model: build_summarization(
-                model, runtime.backend, self._settings, agent=role
+                model, runtime.backend, settings, agent=role
             ),
         )
         agent = build_agent(
@@ -441,17 +540,17 @@ class SessionManager:
             store=self._store,
             checkpointer=self._checkpointer,
             system_prompt=build_main_prompt(
-                session.repo_url, form=profile.form, settings=self._settings
+                session.repo_url, form=profile.form, settings=settings
             ),
             # 边界按**形态**取（与模型、主工具同一根轴），子智能体按角色各取一份
-            policy=policy_for(profile.form, self._settings),
+            policy=policy_for(profile.form, settings),
             safety=self._safety,
-            fallback=self._fallback_middleware(profile.form, MAIN_AGENT),
+            fallback=self._fallback_middleware(profile.form, MAIN_AGENT, user_id),
             # 记忆：所有形态都挂 —— 每轮开始把记忆全文注入系统提示，模型不必再读一遍。
             # ``build_memory_middleware`` 按形态判要不要带闸门：plan / coding 两个主控
             # 才带（先查 PR、刷新记忆，有未合入的就拦下本轮），其余形态是只读注入。
             memory=build_memory_middleware(
-                self._settings, session.repo, runtime.backend, profile.form
+                settings, session.repo, runtime.backend, profile.form
             ),
             plan_recovery=(
                 PlanRecoveryMiddleware(
@@ -466,12 +565,12 @@ class SessionManager:
             summarization=build_summarization(
                 main_model,
                 runtime.backend,
-                self._settings,
+                settings,
                 agent=MAIN_AGENT,
                 form=profile.form,
             ),
             subagents=subagents,
-            skills=[self._settings.sandbox_skills_dir],
+            skills=[settings.sandbox_skills_dir],
         )
         logger.info(
             "主智能体构建完成：public_id=%s form=%s",
@@ -610,7 +709,11 @@ class SessionManager:
                 db, session.db_id, sandbox_id=sandbox.id, workspace_volume=volume_name
             )
         logger.info("代码工作区就绪：public_id=%s sandbox=%s", session.public_id, sandbox.id)
-        return SessionRuntime(sandbox=sandbox, backend=backend)
+        return SessionRuntime(
+            sandbox=sandbox,
+            backend=backend,
+            credential_version=session.credential_version,
+        )
 
     def _runtime_inputs(
         self, session: Session
@@ -637,10 +740,44 @@ class SessionManager:
             "GIT_ASKPASS": self._settings.git_askpass_path,
             "GIT_TERMINAL_PROMPT": "0",
         }
-        if session.repo.token:
-            env[self._settings.sandbox_git_token_env] = session.repo.token
-            env[self._settings.sandbox_git_username_env] = session.repo.git_username
+        env[self._settings.sandbox_git_token_env] = session.repo.token
+        env[self._settings.sandbox_git_username_env] = session.repo.git_username
         return (volumes or None), volume_name, env
+
+    async def _refresh_sandbox_credentials(
+        self, session: Session, runtime: SessionRuntime
+    ) -> None:
+        """Refresh an existing sandbox without rebuilding it."""
+        # Push current askpass/setup scripts first: after a service upgrade an already
+        # running sandbox may still have the old username-via-env implementation.
+        await self._provider.install_runtime_assets(runtime.sandbox)  # type: ignore[arg-type]
+        result = await runtime.sandbox.run(
+            self._settings.sandbox_setup_command,
+            envs={
+                self._settings.sandbox_git_token_env: session.repo.token,
+                self._settings.sandbox_git_username_env: session.repo.git_username,
+            },
+        )
+        if not result.ok:
+            raise WorkspaceError(
+                f"刷新沙箱凭据失败：{result.stderr or result.text}"
+            )
+        runtime.credential_version = session.credential_version
+        logger.info(
+            "沙箱凭据已更新：public_id=%s credential_version=%s",
+            session.public_id,
+            session.credential_version,
+        )
+
+    async def close_local_runtimes(self) -> None:
+        """Drop local handles without destroying shared sandbox containers."""
+        self._runtimes.clear()
+
+    async def _destroy_quietly_proxy(self, sandbox: OpenSandboxProxy) -> None:
+        try:
+            await sandbox.destroy()
+        except Exception:
+            logger.exception("回收凭据失效的沙箱失败")
 
     async def _mark(self, session: Session, status: str, *, error: str | None) -> None:
         """落库工作区状态；写库失败只记账，不能让状态记录把主流程带崩。"""

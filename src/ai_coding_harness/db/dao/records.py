@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_coding_harness.db.models import (
+    Plan,
     SessionRecord,
     SessionRecordDetail,
 )
@@ -30,6 +31,30 @@ async def plan_record_exists(
         .limit(1)
     )
     return found is not None
+
+
+async def delete_plan_record(
+    db: AsyncSession, *, session_id: int, plan_id: int
+) -> int:
+    """删除某份方案在聊天流里的展示记录（方案行本身不动）。"""
+    record_ids = select(SessionRecord.id).where(
+        SessionRecord.session_id == session_id,
+        SessionRecord.type == "plan",
+        SessionRecord.ref_id == plan_id,
+    )
+    await db.execute(
+        delete(SessionRecordDetail).where(
+            SessionRecordDetail.record_id.in_(record_ids)
+        )
+    )
+    result = await db.execute(
+        delete(SessionRecord).where(
+            SessionRecord.session_id == session_id,
+            SessionRecord.type == "plan",
+            SessionRecord.ref_id == plan_id,
+        )
+    )
+    return int(result.rowcount or 0)
 
 
 async def add_record(
@@ -227,7 +252,23 @@ async def list_records_page(
     query = (
         select(SessionRecord, SessionRecordDetail)
         .outerjoin(SessionRecordDetail, SessionRecordDetail.record_id == SessionRecord.id)
+        .outerjoin(
+            Plan,
+            and_(
+                SessionRecord.type == "plan",
+                Plan.id == SessionRecord.ref_id,
+                Plan.session_id == SessionRecord.session_id,
+            ),
+        )
         .where(SessionRecord.session_id == session_id)
+        # 方案记录只是当前进度入口：软删或被新方案替代后，刷新页面也不再回放旧方案。
+        .where(
+            or_(
+                SessionRecord.type != "plan",
+                Plan.id.is_(None),
+                Plan.status.not_in(("closed", "superseded")),
+            )
+        )
     )
     if before_id is not None:
         query = query.where(SessionRecord.id < before_id)

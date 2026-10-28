@@ -8,6 +8,106 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=1, max_length=128)
+
+
+class AuthUserInfo(BaseModel):
+    id: int
+    username: str
+    display_name: str
+    role: str
+    must_change_password: bool = False
+
+
+class AuthConfigInfo(BaseModel):
+    provider: str = "local"
+    initialized: bool
+    single_user: bool = False
+    login_mode: str = "password"
+    csrf_cookie: str = "harness_csrf"
+
+
+class AuthSessionResponse(BaseModel):
+    user: AuthUserInfo
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(default="", max_length=128)
+    role: str = Field(default="member", pattern="^(admin|member)$")
+    temporary_password: str = Field(min_length=1, max_length=128)
+
+
+class UserUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=128)
+    role: str | None = Field(default=None, pattern="^(admin|member)$")
+    is_active: bool | None = None
+
+
+class UserResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=1, max_length=128)
+
+
+class ManagedUserInfo(BaseModel):
+    id: int
+    username: str
+    display_name: str
+    role: str
+    is_active: bool
+    must_change_password: bool
+    active_sessions: int
+    last_active_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MeProfileInfo(BaseModel):
+    id: int
+    username: str
+    display_name: str
+    role: str
+    created_at: datetime
+    password_changed_at: datetime | None = None
+    active_sessions: int
+    last_active_at: datetime | None = None
+    current_session_started_at: datetime | None = None
+    current_session_expires_at: datetime | None = None
+
+
+class UserRuntimeSettingsInfo(BaseModel):
+    repo_view_dir: str
+    repo_view_dir_source: str
+    repo_view_dir_default: str
+    gitee_base_branch: str
+    github_base_branch: str
+    gitee_access_token: str = ""
+    gitee_access_token_configured: bool = False
+    gitee_username: str = ""
+    github_access_token: str = ""
+    github_access_token_configured: bool = False
+    github_username: str = ""
+    updated_at: datetime | None = None
+
+
+class UserRuntimeSettingsUpdate(BaseModel):
+    repo_view_dir: str | None = None
+    gitee_base_branch: str | None = None
+    github_base_branch: str | None = None
+    gitee_access_token: str | None = None
+    clear_gitee_token: bool = False
+    gitee_username: str | None = None
+    github_access_token: str | None = None
+    clear_github_token: bool = False
+    github_username: str | None = None
+
+
 class CreateSessionRequest(BaseModel):
     repo_url: str
     # 平台由 repo_url 判定；令牌**不在这里传** —— 统一取设置页「代码平台」那两格

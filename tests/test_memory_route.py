@@ -29,10 +29,12 @@ from ai_coding_harness.backends.composite import (
 )
 from ai_coding_harness.config import Settings
 from ai_coding_harness.db import dao
+from ai_coding_harness.session.manager import SessionManager
 
 SESSION_ID = "6f1a7c58-0000-4000-8000-000000000001"
 PUBLIC_ID = UUID(SESSION_ID)
 OWNER, REPO = "acme", "demo"
+PLATFORM = "gitee"
 MEMORY = "# 仓库记忆：acme/demo\n\n> 最后更新：2026-10-10 09:12　｜　最近 PR：#7 待合并\n"
 
 
@@ -60,8 +62,10 @@ def _app(store: _FakeStore, *, repo: Any = "auto") -> FastAPI:
     app = FastAPI()
     app.include_router(sessions_route.router)
     app.state.database = _FakeDb()
+    app.state.manager = SimpleNamespace(session_from_row=SessionManager.session_from_row)
     app.state.store = store
     app.state.settings = Settings(_env_file=None)
+    app.state.sessions = {}
     return app
 
 
@@ -74,7 +78,15 @@ async def _get(app: FastAPI, path: str) -> httpx.Response:
 def _patch_session(monkeypatch: pytest.MonkeyPatch, repo: Any) -> None:
     async def get_session_with_repo(db: Any, *, public_id: UUID) -> Any:
         assert public_id == PUBLIC_ID
-        row = SimpleNamespace(id=1, public_id=public_id)
+        row = SimpleNamespace(
+            id=1,
+            public_id=public_id,
+            status="active",
+            gitee_token=None,
+            gitee_username=None,
+            git_platform="gitee",
+            user_id=None,
+        )
         return row, repo
 
     monkeypatch.setattr(dao, "get_session_with_repo", get_session_with_repo)
@@ -100,11 +112,11 @@ async def test_it_reads_the_key_the_composite_actually_wrote(monkeypatch) -> Non
 
     assert resp.status_code == 200
     body = resp.json()
-    logical = memory_path(OWNER, REPO, settings.memories_prefix)
-    key = memory_store_key(OWNER, REPO, settings.memories_prefix)
+    logical = memory_path(PLATFORM, OWNER, REPO, settings.memories_prefix)
+    key = memory_store_key(PLATFORM, OWNER, REPO, settings.memories_prefix)
     assert body["content"] == MEMORY, "全文原样返回"
     assert body["path"] == logical, "回给前端的路径是逻辑路径"
-    assert key == f"/{OWNER}/{REPO}.md", "store 里存的是剥掉前缀的那半截"
+    assert key == f"/{PLATFORM}/{OWNER}/{REPO}.md", "store 里存的是剥掉前缀的那半截"
     assert store.reads == [(MEMORIES_NAMESPACE, key)], "namespace 与 key 都要对"
     # 与 ``build_composite_backend`` 里那条路由同一个常量（那边也用的它，改一处就两边一起变）
     assert MEMORIES_NAMESPACE == ("memories",)
@@ -164,4 +176,4 @@ async def test_read_memory_ignores_a_broken_item_shape() -> None:
         async def aget(self, namespace: tuple[str, ...], key: str) -> Any:
             return item
 
-    assert await read_memory(_Store(), OWNER, REPO) is None  # type: ignore[arg-type]
+    assert await read_memory(_Store(), PLATFORM, OWNER, REPO) is None  # type: ignore[arg-type]

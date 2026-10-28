@@ -299,11 +299,6 @@ def subagent_name(raw: Any) -> str:
     return ""
 
 
-# 子智能体角色 → 任务列表里那一行的中文标签。角色名出自 ``task`` 的 ``subagent_type``，
-# 权威清单在 ``agent/subagents.py`` 的 ``_ROLES``；这里刻意**不 import** —— ``stream`` 是
-# 协议层，不反向依赖 ``agent`` 层。表里没有的角色照旧原样显示它的名字。
-_ROLE_LABELS = {"planner": "规划", "coder": "编码", "reviewer": "评审"}
-
 # 子智能体角色 → **它该挂在主清单哪一步**（按清单项里的词认）。一主三从的流程是固定的，
 # 主控写的清单项也总带着这几个词（实测：「制定…实施方案」「按方案实施代码并提交 PR」
 # 「对 PR 做代码审查」）。
@@ -383,14 +378,6 @@ def delegation_step(raw: Any) -> int | None:
 _NO_AGENT_NAMES = frozenset({"", "None", "none"})
 
 
-def _rollup(items: list[dict[str, str]]) -> str:
-    """容器项的状态：全部完成才算完成，有人在做的就是进行中，其余待办。"""
-    statuses = {item["status"] for item in items}
-    if statuses == {"completed"}:
-        return "completed"
-    return "in_progress" if "in_progress" in statuses else DEFAULT_STATUS
-
-
 # 条目文字的挂靠键：模型习惯把这一项的**结果**追加进文字（`实施…提 PR` →
 # `实施…提 PR（PR #9）`），逐字比对就认不出是同一项了 —— 归一化时把结尾的补充说明
 # 和空白一起抹掉。（2026-09-27 实见：planner / coder 的子清单跑完就掉到树尾。）
@@ -418,8 +405,8 @@ class V3Translator:
 
     子智能体的**正文**一律丢掉（内部编排），但它的 ``write_todos`` 挂进主清单那一项
     下当子任务 —— 委派到哪一项，靠 ``note_delegation`` 在 ``task`` 开始时记下来。
-    挂不上（主清单为空 / 已全部完成 / 那一项的文字被改没了）时，不丢，改在树尾补一个
-    容器项兜住。
+    主清单是当前进度快照：当前清单里找不到委派时的父项，说明主控已经取消了那一步，
+    对应子清单也一并丢掉，不另造历史容器。
 
     产出的正文是**未脱敏**的原文 —— 脱敏在出口做（SSE 与落库各一处），
     免得同一份文本被过滤两遍、口径还不一致。
@@ -432,6 +419,8 @@ class V3Translator:
         self._allow_todos = allow_todos
         # 主清单（顶层；子项在 tree() 里现挂）
         self._main: list[dict[str, str]] = []
+        # 主控是否至少写过一份清单；用来区分「主清单为空」与「根本还没写主清单」。
+        self._main_set = False
         # (namespace, block 下标) → 这个块是不是 write_todos。下标按消息编号，所以必须
         # 带上 namespace：主智能体与子智能体的块号会撞。
         self._todo_blocks: set[tuple[tuple[str, ...], Any]] = set()
@@ -446,10 +435,9 @@ class V3Translator:
         self._pending: list[tuple[str, str | None]] = []
         # 已经认领过委派的子智能体（同一个子智能体只认一次，认完就固定挂靠）
         self._claimed: set[str] = set()
-        # call_id → 上一次成功挂靠的锚：(父项当时的文字, 那一项的下标, 当时主清单的条数)。
-        # 挂上就记住它 —— 父项随后被改写时先按这串认（它比委派那一刻那串更接近现状），
-        # 实在认不出还能靠位置沿用（见 ``_locate``）。
-        self._anchors: dict[str, tuple[str, int, int]] = {}
+        # call_id → 上一次成功挂靠的锚：(父项当时的文字, 那一项的下标)。
+        # 父项被追加说明、做等价改写时可继续认；完全认不出就按「已取消」丢掉。
+        self._anchors: dict[str, tuple[str, int]] = {}
 
     def feed(self, event: dict) -> list[dict]:
         """吃一条 v3 事件，吐出要下发的 SSE 事件（可能为空）。"""
@@ -554,37 +542,30 @@ class V3Translator:
         return None
 
     def tree(self) -> list[dict]:
-        """主清单 + 各子智能体的清单：子项挂到它那次委派对应的那一项下。
+        """当前主清单 + 仍能找到父项的子智能体清单。
 
         挂靠的线索是**文字**，但不逐字比：主控每帧重写整份清单，还习惯把结果追加进条目
         文字里，逐字比会让子树突然掉到树尾（用户看到的就是「子任务跑完就漂移」）。
         认亲规则见 ``_locate``。
 
-        实在挂不上落点的子清单（主清单为空、已全部完成、那一项被整条删掉）不丢，改为在
-        树尾补一个容器项兜住 —— 否则本轮唯一的进度信息就整份消失了。
+        找不到当前父项的子清单直接丢弃：``write_todos`` 只展示当前进度，不做历史归档。
+        同一父项重新委派时，后一次清单覆盖前一次，保留最新进度。
         """
         texts = [item["content"] for item in self._main]
-        attached: set[str] = set()
         kids_at: dict[int, list[dict[str, str]]] = {}
         for call_id, items in self._sub_items.items():
-            # items 为空（参数还没流全、或模型给了空数组）时别补空壳容器
             if not items:
                 continue
             index = self._locate(call_id, texts)
             if index is None:
                 continue
-            # 同一项被委派多次：后一次覆盖前一次（子智能体每次给的也是全量清单）
+            # 同一项被委派多次：清单只表示当前进度，后一次覆盖前一次。
             kids_at[index] = items
-            attached.add(call_id)
-            # 挂上就记住这一项现在长什么样：下一帧先按它认，父项再被改写也不至于失联
-            self._anchors[call_id] = (texts[index], index, len(texts))
+            self._anchors[call_id] = (texts[index], index)
         tree: list[dict] = []
         for index, item in enumerate(self._main):
             kids = kids_at.get(index)
             tree.append({**item, "children": kids} if kids else dict(item))
-        for call_id, items in self._sub_items.items():
-            if items and call_id not in attached:
-                tree.append(self._container(call_id, items))
         return tree
 
     def _locate(self, call_id: str, texts: list[str]) -> int | None:
@@ -592,13 +573,12 @@ class V3Translator:
 
         认亲顺序：**锚**（上次挂上那一项的文字）→ **委派那一刻**那串，各自先逐字比，
         再归一化比（``_todo_text_key``，抹掉「（plan_id=36）」「（PR #9）」这类结尾补充），
-        再前缀比；都认不出时，如果主清单**结构没变**（条数与挂上那一刻相同），就沿用锚
-        记下的位置 —— 模型改的通常只是措辞，不是把这一项删了。
+        再前缀比。都认不出就是父项已经不在当前清单里，返回 ``None``，调用方丢弃子清单。
 
         归一化与前缀都要求**唯一命中**：主清单里两串归一到同一个键时宁可不挂，也不能
         把子项挂到别的父项下面去。
         """
-        anchor = self._anchors.get(call_id)  # (文字, 下标, 当时的条数)
+        anchor = self._anchors.get(call_id)  # (文字, 下标)
         wants = [anchor[0] if anchor else "", self._parents.get(call_id) or ""]
         for want in wants:
             if not want:
@@ -626,30 +606,7 @@ class V3Translator:
                     near.append(i)
             if len(near) == 1:
                 return near[0]
-        if anchor and len(texts) == anchor[2] and anchor[1] < len(texts):
-            return anchor[1]
         return None
-
-    def _container(self, call_id: str, items: list[dict[str, str]]) -> dict:
-        """给挂不上主清单的子清单补的容器项。
-
-        它是**纯展示壳**，不是主智能体写过的计划项，所以状态由子项汇总 —— 容器自己
-        没有独立进度，写死 ``in_progress`` 会在收尾时永久停在那儿。
-
-        名字那一行是给用户看的（这就是任务列表里那行文字），所以认识的三个角色翻成中文
-        （「编码子任务」），不把 ``coder`` 这种内部角色名摊到他面前。名字优先取子智能体
-        自报的那个（见 ``_note_child_agent``），取不到才回退到 ``task`` 入参记下的那份，
-        两处都没有才用兜底话。
-        """
-        name = self._names.get(call_id)
-        label = _ROLE_LABELS.get(name, "")
-        if label:
-            title = f"{label}子任务"
-        else:
-            # 表里没有的角色照旧把名字带上 —— 将来新增角色时，好过塌成一句看不出是什么
-            # 的兜底话；连名字都取不到（task 入参畸形）才用兜底话。
-            title = f"「{name}」子任务" if name else "子智能体任务"
-        return {"content": title, "status": _rollup(items), "children": items}
 
     def _delegation_parent(self, role: str, step: int | None) -> str | None:
         """这次委派该挂在主清单的哪一项下：**先看步骤号，再看角色，最后回落到现状**。
@@ -777,6 +734,7 @@ class V3Translator:
         """把一份清单落到它该在的位置，回吐整棵树；没有落点就什么都不吐。"""
         if not namespace:
             self._main = items
+            self._main_set = True
         else:
             call_id = delegation_id(namespace)
             if not call_id:
@@ -786,5 +744,7 @@ class V3Translator:
         # 每次全量下发（和 plan 事件一个惯用法），前端整体替换那棵树；落库那份也换掉：
         # 子智能体的进度也是在 _apply 里进来的，最后存下的那棵一定是最新的。
         tree = self.tree()
+        if not self._main_set and not tree:
+            return []
         self.parts.set_todos(tree)
         return [{"type": "todos", "items": tree}]

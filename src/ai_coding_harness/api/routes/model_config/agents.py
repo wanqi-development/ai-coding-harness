@@ -18,9 +18,20 @@ from ai_coding_harness.db import dao
 
 logger = logging.getLogger(__name__)
 
-from .common import _provider_metas, _snapshot
+from .common import _provider_metas, _snapshot, request_user_id
 
 router = APIRouter(prefix="/model-config", tags=["model-config"])
+
+
+def _merged_value(
+    fields: dict[str, object],
+    current: object | None,
+    field: str,
+    column: str,
+) -> str:
+    if field in fields:
+        return str(fields[field] or "").strip()
+    return str(getattr(current, column, None) or "").strip()
 
 
 @router.get("", response_model=ModelConfigSnapshot)
@@ -33,10 +44,17 @@ async def get_model_config(request: Request) -> ModelConfigSnapshot:
     要重启后端**才会反映到生效值上（提供商目录不一样：那份是每条请求现读库的）。
     """
     settings: Settings = request.app.state.settings
+    user_id = request_user_id(request)
+    from ai_coding_harness.api.app import apply_model_endpoints
+
+    await apply_model_endpoints(settings, request.app.state.database)
     async with request.app.state.database.session() as db:
-        stored = {row.agent: row for row in await dao.list_model_endpoints(db)}
+        stored = {
+            row.agent: row
+            for row in await dao.list_model_endpoints(db, user_id=user_id)
+        }
         metas = await _provider_metas(settings, db)
-    return _snapshot(settings, stored, metas)
+    return _snapshot(settings, stored, metas, user_id)
 
 
 @router.put("", response_model=ModelConfigSnapshot)
@@ -52,13 +70,44 @@ async def put_model_config(
     就用新连接**，不用重启后端（2026-10-14 用户口径：配置热生效）。正在跑的那一轮不换。
     """
     allowed = {key for key, _ in MODEL_AGENT_ROWS}
+    labels = dict(MODEL_AGENT_ROWS)
+    user_id = request_user_id(request)
     async with request.app.state.database.session() as db:
+        existing = {
+            row.agent: row
+            for row in await dao.list_model_endpoints(db, user_id=user_id)
+        }
         for key, item in payload.rows.items():
             if key not in allowed:
                 raise HTTPException(status_code=400, detail=f"unknown agent key: {key}")
             fields = item.model_dump(exclude_unset=True)
+            current = existing.get(key)
+
+            values = {
+                "model": _merged_value(fields, current, "model", "model_name"),
+                "base_url": _merged_value(fields, current, "base_url", "base_url"),
+                "api_key": _merged_value(fields, current, "api_key", "api_key"),
+            }
+            if any(values.values()):
+                required = ("base_url", "api_key")
+                if key != "jev":
+                    required = ("model", *required)
+                missing = [
+                    name
+                    for name in required
+                    if not values[name]
+                ]
+                if missing:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"「{labels.get(key, key)}」这一行配置不完整："
+                            f"缺少 {' / '.join(missing)}。要停用这一行请用「清空这一行」。"
+                        ),
+                    )
             await dao.upsert_model_endpoint(
                 db,
+                user_id=user_id,
                 agent=key,
                 base_url=fields.get("base_url"),
                 model_name=fields.get("model"),
@@ -69,14 +118,22 @@ async def put_model_config(
             if payload.intent_mode not in ("jev", "llm"):
                 raise HTTPException(status_code=400, detail="intent_mode 只能是 jev / llm")
             await dao.upsert_model_endpoint(
-                db, agent="intent_mode", model_name=payload.intent_mode
+                db,
+                user_id=user_id,
+                agent="intent_mode",
+                model_name=payload.intent_mode,
             )
-        stored = {row.agent: row for row in await dao.list_model_endpoints(db)}
+        stored = {
+            row.agent: row
+            for row in await dao.list_model_endpoints(db, user_id=user_id)
+        }
         metas = await _provider_metas(request.app.state.settings, db)
     from ai_coding_harness.api.app import apply_model_endpoints  # 局部 import：避免装配期循环
 
     await apply_model_endpoints(request.app.state.settings, request.app.state.database)
-    return _snapshot(request.app.state.settings, stored, metas)
+    if user_id is not None:
+        await request.app.state.service.invalidate_model_cache(user_id)
+    return _snapshot(request.app.state.settings, stored, metas, user_id)
 
 
 @router.delete("/{agent}", response_model=ModelConfigSnapshot)
@@ -85,11 +142,17 @@ async def delete_model_config(agent: str, request: Request) -> ModelConfigSnapsh
     allowed = {key for key, _ in MODEL_AGENT_ROWS} | {"intent_mode"}
     if agent not in allowed:
         raise HTTPException(status_code=400, detail=f"unknown agent key: {agent}")
+    user_id = request_user_id(request)
     async with request.app.state.database.session() as db:
-        await dao.delete_model_endpoint(db, agent=agent)
-        stored = {row.agent: row for row in await dao.list_model_endpoints(db)}
+        await dao.delete_model_endpoint(db, user_id=user_id, agent=agent)
+        stored = {
+            row.agent: row
+            for row in await dao.list_model_endpoints(db, user_id=user_id)
+        }
         metas = await _provider_metas(request.app.state.settings, db)
     from ai_coding_harness.api.app import apply_model_endpoints  # 局部 import：避免装配期循环
 
     await apply_model_endpoints(request.app.state.settings, request.app.state.database)
-    return _snapshot(request.app.state.settings, stored, metas)
+    if user_id is not None:
+        await request.app.state.service.invalidate_model_cache(user_id)
+    return _snapshot(request.app.state.settings, stored, metas, user_id)

@@ -99,6 +99,10 @@ class SandboxProvider:
         await self._install_assets(client)
         await self._run_setup(client)
 
+    async def install_runtime_assets(self, client: SandboxClient) -> None:
+        """Refresh scripts on an already-running sandbox before credential setup."""
+        await self._install_scripts(client)
+
     async def _install_assets(self, client: SandboxClient) -> None:
         """把仓库里的 skill / 规则 / 凭据脚本推进沙箱。
 
@@ -107,19 +111,7 @@ class SandboxProvider:
         推的就是哪个路径，两者不会漂移。
         """
         settings = self._settings
-        scripts = [settings.git_askpass_path]
-        setup = settings.sandbox_setup_command.strip()
-        if setup:
-            scripts.append(setup)
-
-        assets = _repo_path(settings.sandbox_assets_dir)
-        for target in scripts:
-            await client.write_file(target, _read_asset(assets / Path(target).name))
-        result = await client.run(f"chmod 0755 {' '.join(scripts)}")
-        if not result.ok:
-            raise RuntimeError(
-                f"sandbox assets not executable: {result.stderr or result.text}"
-            )
+        await self._install_scripts(client)
 
         await self._upload_tree(
             client,
@@ -146,6 +138,23 @@ class SandboxProvider:
         if not identity.ok:
             raise RuntimeError(
                 f"sandbox git identity failed: {identity.stderr or identity.text}"
+            )
+
+    async def _install_scripts(self, client: SandboxClient) -> None:
+        """Install only the small askpass/setup scripts used by credential refresh."""
+        settings = self._settings
+        scripts = [settings.git_askpass_path]
+        setup = settings.sandbox_setup_command.strip()
+        if setup:
+            scripts.append(setup)
+
+        assets = _repo_path(settings.sandbox_assets_dir)
+        for target in scripts:
+            await client.write_file(target, _read_asset(assets / Path(target).name))
+        result = await client.run(f"chmod 0755 {' '.join(scripts)}")
+        if not result.ok:
+            raise RuntimeError(
+                f"sandbox assets not executable: {result.stderr or result.text}"
             )
 
     async def _upload_tree(

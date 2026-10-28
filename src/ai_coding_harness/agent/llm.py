@@ -66,27 +66,54 @@ def _unconfigured(role: str) -> ValueError:
     )
 
 
-def _row_key_for(settings: Settings, role: str) -> str | None:
+def model_rows_for(
+    settings: Settings, user_id: int | None = None
+) -> dict[str, ModelConfig]:
+    """该用户自己的模型行；``user_id=None`` 只给无用户的单元测试/旧调用。"""
+    if user_id is None:
+        return settings.agent_models
+    return settings.user_agent_models.get(int(user_id), {})
+
+
+def intent_mode_for(settings: Settings, user_id: int | None = None) -> str:
+    if user_id is None:
+        return settings.intent_mode if settings.intent_mode in ("jev", "llm") else "jev"
+    mode = settings.user_intent_modes.get(int(user_id), "jev")
+    return mode if mode in ("jev", "llm") else "jev"
+
+
+def _row_key_for(
+    settings: Settings, role: str, user_id: int | None = None
+) -> str | None:
     """哪一行赢了：① **该智能体那一行**（配了就按它）→ ② ``unified``（**只兜底没配的行**）。
 
     2026-10-15 用户口径：统一模型**不是总闸**，它只覆盖没填的部分 —— 所以这里的顺序是
     「自己的行优先」，``unified`` 退成兜底。
     """
-    rows = settings.agent_models
+    rows = model_rows_for(settings, user_id)
     for key in (agent_key(role), "unified"):
         row = rows.get(key)
-        if row is not None and row.model:
+        if _row_is_complete(row):
             return key
     return None
 
 
-def _row_for(settings: Settings, role: str) -> ModelConfig | None:
+def _row_is_complete(row: ModelConfig | None) -> bool:
+    """A runtime row needs all three connection fields; partial rows use unified instead."""
+    return bool(row is not None and row.model and row.base_url and row.api_key)
+
+
+def _row_for(
+    settings: Settings, role: str, user_id: int | None = None
+) -> ModelConfig | None:
     """取值的那一行；没配返回 ``None``（**不再**回落到 ``.env``）。"""
-    key = _row_key_for(settings, role)
-    return None if key is None else settings.agent_models[key]
+    key = _row_key_for(settings, role, user_id)
+    return None if key is None else model_rows_for(settings, user_id)[key]
 
 
-def resolve_window(settings: Settings, role: str) -> int:
+def resolve_window(
+    settings: Settings, role: str, user_id: int | None = None
+) -> int:
     """这个角色的上下文窗口。
 
     ① 那一行填了 → ② **按模型查**（供应商的模型详情表：先 ``(供应商, 模型)`` 再按模型名）
@@ -103,7 +130,7 @@ def resolve_window(settings: Settings, role: str) -> int:
     这里只做**解析**。兜底（默认 128k，可在设置页改）是用户口径里的保守取值：偏小只是早一点
     触发压缩与压力提示。
     """
-    return _row_window(settings, _row_for(settings, role))[0]
+    return _row_window(settings, _row_for(settings, role, user_id))[0]
 
 
 def _row_window(settings: Settings, row: ModelConfig | None) -> tuple[int, str]:
@@ -127,12 +154,16 @@ def _row_window(settings: Settings, row: ModelConfig | None) -> tuple[int, str]:
     return (window if window > 0 else FALLBACK_CONTEXT_WINDOW), "fallback"
 
 
-def resolve_window_with_source(settings: Settings, role: str) -> tuple[int, str]:
+def resolve_window_with_source(
+    settings: Settings, role: str, user_id: int | None = None
+) -> tuple[int, str]:
     """这个角色的窗口 + 它是哪来的（口径与 ``resolve_window`` 同一份，只是多回一格来源）。"""
-    return _row_window(settings, _row_for(settings, role))
+    return _row_window(settings, _row_for(settings, role, user_id))
 
 
-def resolve_model(settings: Settings, role: str) -> str:
+def resolve_model(
+    settings: Settings, role: str, user_id: int | None = None
+) -> str:
     """这个角色**实际会用**的模型名：① 该智能体那一行 → ② ``unified``（兜底）→ ③ 没配＝空串。
 
     给界面标「这条回答是哪个模型说的」（2026-10-14 用户口径）用 —— 只做解析、**不建客户端**：
@@ -141,11 +172,13 @@ def resolve_model(settings: Settings, role: str) -> str:
     **真走了兜底这里不体现**：兜底是运行时的第二跳，账与调用都记在同一个角色名下，
     实测的 v3 事件载荷里也没有「这次是谁答的」这一格。
     """
-    row = _row_for(settings, role)
+    row = _row_for(settings, role, user_id)
     return str(row.model) if row is not None and row.model else ""
 
 
-def effective_for(settings: Settings, role: str) -> dict[str, Any]:
+def effective_for(
+    settings: Settings, role: str, user_id: int | None = None
+) -> dict[str, Any]:
     """这个角色**现在真的用**什么（设置页的「生效值」读它：只解析，不建客户端）。
 
     ``source`` 三态：
@@ -165,19 +198,22 @@ def effective_for(settings: Settings, role: str) -> dict[str, Any]:
     * ``role="classifier"`` —— 取值顺序与 ``build_classifier_model`` 一致：
       「意图识别（大模型）」→ ``unified``。
     """
+    rows = model_rows_for(settings, user_id)
     if role == "unified":
-        row = settings.agent_models.get("unified")
-        key = "unified" if row is not None and row.model else None
+        row = rows.get("unified")
+        key = "unified" if _row_is_complete(row) else None
     elif role == "classifier":
-        own = settings.agent_models.get("classifier")
-        if own is not None and own.model:
+        own = rows.get("classifier")
+        if _row_is_complete(own):
             key, row = "classifier", own
         else:
-            unified = settings.agent_models.get("unified")
-            key, row = ("unified", unified) if unified is not None and unified.model else (None, None)
+            unified = rows.get("unified")
+            key, row = (
+                ("unified", unified) if _row_is_complete(unified) else (None, None)
+            )
     else:
-        key = _row_key_for(settings, role)
-        row = settings.agent_models.get(key) if key is not None else None
+        key = _row_key_for(settings, role, user_id)
+        row = rows.get(key) if key is not None else None
     if key is None or row is None:
         return {
             "role": role,
@@ -209,16 +245,18 @@ def _row_config(row: ModelConfig, *, window: int) -> ModelConfig:
     return replace(row, context_window=window or FALLBACK_CONTEXT_WINDOW)
 
 
-def _config_for(settings: Settings, role: str) -> ModelConfig:
+def _config_for(
+    settings: Settings, role: str, user_id: int | None = None
+) -> ModelConfig:
     """这个角色用哪套连接：① 该智能体那一行 → ② ``unified``（只兜底没配的行）。
 
     **没有第 ③ 档**（2026-10-15 用户口径：干掉出厂默认）：两行都没配就当场报错，
     文案里点明是哪一行、去哪儿配。
     """
-    row = _row_for(settings, role)
+    row = _row_for(settings, role, user_id)
     if row is None:
         raise _unconfigured(role)
-    return _row_config(row, window=resolve_window(settings, role))
+    return _row_config(row, window=resolve_window(settings, role, user_id))
 
 
 def _wants_reasoning_effort(model: str) -> bool:
@@ -232,13 +270,28 @@ def _wants_reasoning_effort(model: str) -> bool:
     return name.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
+def _wants_responses_api(model: str) -> bool:
+    """GPT-6 通过 Responses API 返回可展示的 reasoning summary。
+
+    2026-10-28 实测：``gpt-6-luna`` / ``gpt-6.1-sol`` 走 Chat Completions 时只有
+    reasoning token，没有可读思考；切到 Responses API 并显式请求
+    ``summary="detailed"`` 后才返回 ``response.reasoning_summary_text.delta``。
+    这是模型/接口能力差异，不是全局默认，其他仍走 Chat Completions。
+    """
+    name = (model or "").strip().lower()
+    return name.startswith("gpt-6")
+
+
 def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
     """按一份配置建模型实例（OpenAI 兼容）。``label`` 只用于报错时指认是谁。
 
-    思考参数分两家：``extra_body`` 的 ``thinking`` 保留（glm / deepseek 接受，qwen
-    默认开启）；``reasoning_effort`` **只给 OpenAI 推理模型** —— 2026-10-20 实测智谱
-    glm-5.3-flash：不带该键时 ``reasoning_content`` 正常返回，带上 ``high`` 思考内容
-    变成 0，``medium`` 直接 400（「该模型始终思考，不支持关闭思考」）。
+    思考参数有三种口径：GPT-6 走 Responses API 并请求 reasoning summary；其他
+    ``extra_body`` 的 ``thinking`` 保留（glm / deepseek 接受，qwen 默认开启）；
+    ``reasoning_effort`` **只给 Chat Completions 的 OpenAI 推理模型**。
+
+    GPT-5 保持原 Chat Completions 口径：2026-10-20 实测智谱 glm-5.3-flash 不带该键时
+    ``reasoning_content`` 正常返回，带上 ``high`` 思考内容变成 0，``medium`` 直接 400
+    （「该模型始终思考，不支持关闭思考」）。
 
     **温度按模型名兜一层**（``config.temperature_for``）：界面上的行没有温度这一格，
     而 kimi 系**只收 1**（传 0.3 直接 400）—— 2026-10-15 那次分析轮就是主模型失败后
@@ -246,14 +299,24 @@ def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
     """
     if not cfg.model:
         raise ValueError(f"{label} 的模型名未配置")
-    critical_param = cfg.api_key or cfg.base_url
-    if not critical_param:
-        raise ValueError("api_key and base_url are required")
+    if not cfg.api_key or not cfg.base_url:
+        raise ValueError(f"{label} 缺少 api_key 或 base_url，请到设置页补全这一行")
     # 用带 reasoning 补丁的 ChatOpenAI：第三方网关的 ``reasoning_content`` 在
     # LangChain 的流式转换里会被丢掉，见 ``agent/chat_model.py``。
-    thinking: dict[str, Any] = {"extra_body": {"thinking": {"type": "enabled"}}}
-    if _wants_reasoning_effort(cfg.model):
-        thinking["reasoning_effort"] = "high"
+    if _wants_responses_api(cfg.model):
+        model_options: dict[str, Any] = {
+            "use_responses_api": True,
+            "output_version": "responses/v1",
+            "reasoning": {"effort": "high", "summary": "detailed"},
+            # 完整历史已包含 Responses reasoning item；继续走本地 checkpoint，
+            # 不把会话状态隐式转交给网关的 previous_response_id。
+            "use_previous_response_id": False,
+        }
+    else:
+        thinking: dict[str, Any] = {"extra_body": {"thinking": {"type": "enabled"}}}
+        if _wants_reasoning_effort(cfg.model):
+            thinking["reasoning_effort"] = "high"
+        model_options = thinking
     model = ReasoningChatOpenAI(
         model=cfg.model,
         api_key=cfg.api_key or None,
@@ -264,7 +327,7 @@ def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
         # 就是这么来的。网关不认这个字段时由 StreamUsageMiddleware 按地址降级重试。
         stream_usage=True,
         streaming=True,
-        **thinking,
+        **model_options,
     )
     if cfg.context_window > 0:
         # 压缩中间件的 fraction 触发器要求模型带 max_input_tokens —— 这一格就是它读的
@@ -275,13 +338,17 @@ def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
     return model
 
 
-def build_model(settings: Settings, *, role: str) -> BaseChatModel:
+def build_model(
+    settings: Settings, *, role: str, user_id: int | None = None
+) -> BaseChatModel:
     """按**角色**构造模型（OpenAI 兼容）。角色路由见 ``_AGENT_KEY``，构造细节见
     ``_model_from``。这一行没配模型时抛 ``ValueError``（文案见 ``_unconfigured``）。"""
-    return _model_from(_config_for(settings, role), label=f"角色 {role!r}")
+    return _model_from(_config_for(settings, role, user_id), label=f"角色 {role!r}")
 
 
-def build_fallback(settings: Settings, *, role: str) -> BaseChatModel | None:
+def build_fallback(
+    settings: Settings, *, role: str, user_id: int | None = None
+) -> BaseChatModel | None:
     """该角色的**兜底**模型；``None`` 表示这个角色没有兜底（``FallbackMiddleware`` 不挂）。
 
     只有**全局一条**保底，不做链式降级，**唯一来源是界面上「兜底模型」那一行**
@@ -294,10 +361,10 @@ def build_fallback(settings: Settings, *, role: str) -> BaseChatModel | None:
     - 角色自己的那一行也没配 —— 主模型都没有，兜底更无从谈起（``_config_for`` 会报错，
       这里先按「没有兜底」返回，把报错留给主模型那一处）。
     """
-    row = settings.agent_models.get("fallback")
+    row = model_rows_for(settings, user_id).get("fallback")
     if row is None or not row.model:
         return None
-    primary = _row_for(settings, role)
+    primary = _row_for(settings, role, user_id)
     if primary is not None and (row.base_url, row.model) == (
         primary.base_url,
         primary.model,
@@ -315,7 +382,9 @@ def build_fallback(settings: Settings, *, role: str) -> BaseChatModel | None:
 _CLASSIFIER_MAX_TOKENS = 512
 
 
-def build_classifier_model(settings: Settings) -> BaseChatModel:
+def build_classifier_model(
+    settings: Settings, *, user_id: int | None = None
+) -> BaseChatModel:
     """意图分类用的模型：**界面上一行**（「意图识别（大模型）」），关思考、温度 0、不挂工具。
 
     分类是「选一个词」的判定任务，思考纯属浪费：实测关掉后 2.8~5.0s → 0.3s，
@@ -326,7 +395,8 @@ def build_classifier_model(settings: Settings) -> BaseChatModel:
     「默认大模型」）→ 都没有就抛错 —— 调用方接住之后落**关键字口径**（判定是增强，
     不是新的故障点，见 ``server/turn/intent.py``）。
     """
-    cfg = settings.agent_models.get("classifier") or settings.agent_models.get("unified")
+    rows = model_rows_for(settings, user_id)
+    cfg = rows.get("classifier") or rows.get("unified")
     if cfg is None or not cfg.model:
         raise ValueError(
             "「意图识别（大模型）」这一行还没配置模型："
