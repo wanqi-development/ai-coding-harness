@@ -38,7 +38,7 @@
 空白格 = 该智能体不写这个目录：写文件类工具会被撤掉，`execute` 里的写动词 / 重定向
 在调用前被拦下。**没登记名字的智能体按最保守处理**（一律不写），而不是放开。
 
-> **这张表只管沙箱目录。** 仓库记忆（`/memories/<owner>/<repo>.md`）在 StoreBackend 上，
+> **这张表只管沙箱目录。** 仓库记忆（`/memories/<platform>/<owner>/<repo>.md`）在 StoreBackend 上，
 > 不在沙箱里、也不受上表约束：模型正文由 `orchestrate`（coding / rework）写；
 > PR 新增记录与状态由轮首 / 轮末平台同步写。`qa` 与 `plan` 没有写正文的工具。
 > 工具子集见 `tools/register.py` 的 `_FORM_TOOLS`。

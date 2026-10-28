@@ -12,6 +12,8 @@ from ai_coding_harness.db.models import (
 
 from ._common import _now
 
+_CURRENT_PLAN_STATUSES = ("pending", "failed")
+
 
 # ---------------------------------------------------------------------------
 # plans
@@ -49,24 +51,45 @@ async def get_unexecuted_plan(db: AsyncSession, *, session_id: int) -> Plan | No
     )
 
 
-async def get_latest_plan(db: AsyncSession, *, session_id: int) -> Plan | None:
-    """取该会话最新的一条方案（给「展示当前进度」用）：**已删除（closed）的不算**。
+async def get_replaceable_plan(db: AsyncSession, *, session_id: int) -> Plan | None:
+    """取当前可由新方案替代的那一份（最新 pending / failed）。
 
-    ``get_unexecuted_plan`` 只认 pending，方案一开工就取不到了；面板要的是正在
-    推进或刚完成的那一份。按 id 倒序，避免同秒创建的两份方案靠 created_at 分不出先后。
-    软删除的方案（``status='closed'``）不参与：用户删掉它之后，面板该回落到上一条或空，
-    而不是继续显示一份「已删除」的方案。
+    一个会话的当前进度最多保留一份方案；``done`` 是已完成任务的历史，``executing``
+    正在执行，三者都不自动替代。
     """
     return await db.scalar(
         select(Plan)
-        .where(Plan.session_id == session_id, Plan.status != "closed")
+        .where(
+            Plan.session_id == session_id,
+            Plan.status.in_(_CURRENT_PLAN_STATUSES),
+        )
+        .order_by(Plan.id.desc())
+        .limit(1)
+        .with_for_update()
+    )
+
+
+async def get_latest_plan(db: AsyncSession, *, session_id: int) -> Plan | None:
+    """取该会话最新的一条当前方案（给「展示当前进度」用）。
+
+    ``get_unexecuted_plan`` 只认 pending，方案一开工就取不到了；面板要的是正在
+    推进或刚完成的那一份。按 id 倒序，避免同秒创建的两份方案靠 created_at 分不出先后。
+    用户软删（``closed``）和已被新方案替代（``superseded``）的方案不参与：
+    它们不再是当前进度，但行仍留在库里供 PR / 方案 ID 追溯。
+    """
+    return await db.scalar(
+        select(Plan)
+        .where(
+            Plan.session_id == session_id,
+            Plan.status.not_in(("closed", "superseded")),
+        )
         .order_by(Plan.id.desc())
         .limit(1)
     )
 
 
 async def get_plan(db: AsyncSession, *, session_id: int, plan_id: int) -> Plan | None:
-    """按 id 取本会话的一条方案。**含已删除（closed）的** —— 软删只是状态变了。
+    """按 id 取本会话的一条方案。**含 closed / superseded** —— 归档只是状态变了。
 
     ``WHERE`` 里限定 ``session_id``：模型给的 plan_id 可能来自别的会话（或纯属猜的），
     跨会话读写方案是不该发生的事。
@@ -132,7 +155,8 @@ async def set_plan_status(
 ) -> bool:
     """改方案状态。给了 ``session_id`` 就顺带限定会话（新工具都会给）。
 
-    ``closed`` 是**软删除**用的状态：记录留在库里、面板与「未执行方案」都不再认它。
+    ``closed`` 是用户软删除，``superseded`` 是被新方案替代；两者都留在库里，
+    但面板与「未执行方案」都不再认它们。
     """
     values: dict = {"status": status, "updated_at": _now()}
     if status == "executing":

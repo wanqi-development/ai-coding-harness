@@ -110,6 +110,7 @@ def _checked(value: object, *, limit: int, what: str) -> tuple[str, str | None]:
 class MemoryContext:
     """记忆工具绑定的会话上下文。"""
 
+    platform: str
     owner: str
     repo: str
     backend: BackendProtocol
@@ -118,7 +119,7 @@ class MemoryContext:
 
 def build_memory_tools(ctx: MemoryContext) -> list[BaseTool]:
     """构建主智能体的记忆工具（只写，不含读——读走 ``read_file``）。"""
-    path = memory_path(ctx.owner, ctx.repo, ctx.prefix)
+    path = memory_path(ctx.platform, ctx.owner, ctx.repo, ctx.prefix)
 
     @tool
     async def save_repo_memory(section: str, payload: dict) -> str:

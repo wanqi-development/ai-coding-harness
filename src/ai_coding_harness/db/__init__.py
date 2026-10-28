@@ -5,7 +5,9 @@ from ai_coding_harness.db.engine import Database
 from ai_coding_harness.db.models import (
     AgentSession,
     AppSetting,
+    AuthSession,
     Clarification,
+    LocalCredential,
     ModelEndpoint,
     ModelProvider,
     Plan,
@@ -14,14 +16,18 @@ from ai_coding_harness.db.models import (
     Repository,
     SessionRecord,
     SessionRecordDetail,
+    User,
+    UserIdentity,
 )
 
 __all__ = [
     "AgentSession",
     "AppSetting",
+    "AuthSession",
     "Base",
     "Clarification",
     "Database",
+    "LocalCredential",
     "ModelEndpoint",
     "ModelProvider",
     "Plan",
@@ -30,4 +36,6 @@ __all__ = [
     "Repository",
     "SessionRecord",
     "SessionRecordDetail",
+    "User",
+    "UserIdentity",
 ]

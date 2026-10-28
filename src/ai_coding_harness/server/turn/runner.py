@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from functools import partial
 from typing import Any
@@ -48,7 +49,7 @@ from ai_coding_harness.server.intent import (
     clarification_decision,
     gate_intent_for_state,
 )
-from ai_coding_harness.server.pr_workspace import sync_pull_workspace, target_pull
+from ai_coding_harness.server.pr_workspace import pull_refs, sync_pull_workspace, target_pull
 from ai_coding_harness.server.repo_state import describe_snapshot, intent_candidates
 from ai_coding_harness.session.manager import (
     Session,
@@ -95,6 +96,10 @@ def _add_run_ids(frame: dict[str, Any], run_id: Any, parent_run_id: Any) -> dict
     return frame
 
 
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((time.perf_counter() - started_at) * 1000))
+
+
 class TurnRunnerMixin:
     """runner 相关方法（由 HarnessService 组合）。"""
 
@@ -119,6 +124,7 @@ class TurnRunnerMixin:
         会话这个日志维度**不在这里设** —— 设在 ``api/session_lookup.resolve_session``：
         每个会话级请求都从那儿过，连 ``/workspace`` 触发的 provisioning 也算这个会话的日志。
         """
+        started_at = time.perf_counter()
         terms = secret_terms(
             session.repo.token,
             # 两家平台的令牌都可能被模型复述（设置页配的那份）
@@ -192,6 +198,7 @@ class TurnRunnerMixin:
                 dialogue,
                 allowed_intents=allowed_intents,
                 repo_state=repo_status,
+                user_id=getattr(session, "user_id", None),
             )
         state_block: str | None = None
         gate = gate_intent_for_state(decision.intent, allowed_intents)
@@ -290,6 +297,7 @@ class TurnRunnerMixin:
             yield {"type": "done"}
             return
 
+        rework_refs: dict[str, str] | None = None
         if intent == "rework" and snapshot is not None:
             target = target_pull(message, snapshot.owned_open_prs)
             if target is not None:
@@ -333,6 +341,7 @@ class TurnRunnerMixin:
                     target.get("number"),
                     head_sha[:8],
                 )
+                rework_refs = pull_refs(target)
 
         try:
             async for event in self._run_agent(
@@ -343,6 +352,8 @@ class TurnRunnerMixin:
                 terms,
                 state=state,
                 clarification=clarification,
+                initial_pr_refs=rework_refs,
+                started_at=started_at,
             ):
                 yield event
             # 轮末打底：只有 coding / rework 共用的 orchestrate 形态才有要沉淀的事实。
@@ -387,11 +398,15 @@ class TurnRunnerMixin:
         *,
         state: TurnState,
         clarification: dict[str, Any] | None = None,
+        initial_pr_refs: dict[str, str] | None = None,
+        started_at: float | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # 装配形态按本轮意图定：qa / analysis 只读，plan / review 单智能体（主控自己出
         # 方案 / 自己审），coding 与 rework 挂三个子智能体（两者共用一套装配，表见
         # agent/profiles.py）。同一会话换形态不影响历史 —— thread 是共享的。
         agent = self._manager.get_agent(runtime, session, profile_for(intent))
+        if started_at is None:
+            started_at = time.perf_counter()
         config = RunnableConfig(
             configurable={
                 "thread_id": self._manager.thread_id(session),
@@ -430,9 +445,8 @@ class TurnRunnerMixin:
         # 才说得出「正在编码」而不是笼统的「正在处理子任务」。收尾那帧也得带 —— 不带的话
         # 子智能体一返回，提示就翻回泛化文案，而主智能体还要想几秒才开口。
         delegated: dict[str, str] = {}
-        # 本轮若建了 PR，这里留下它的 base / head —— 收尾时拿它去本地缓存算「这一轮改了什么」。
-        # 入参在 tool-started 那一帧上（与「派给谁」同一个来源），之后拿不到。
-        pr_refs: dict[str, str] | None = None
+        # coding 由 create_pr 入参提供参照；rework 在进入 Agent 前由目标 PR 快照提供。
+        pr_refs = dict(initial_pr_refs) if initial_pr_refs else None
 
         # v3 的 astream_events 返回的是协程，得先 await 出流（v2 直接就是流）
         try:
@@ -557,6 +571,7 @@ class TurnRunnerMixin:
             )
             await self._record_interrupted(
                 session, text, translator, intent, terms, usage=usage,
+                elapsed_ms=_elapsed_ms(started_at),
             )
             raise
         except TurnStop as stop:
@@ -577,7 +592,7 @@ class TurnRunnerMixin:
             )
             await self._record_interrupted(
                 session, text, translator, intent, terms, exc,
-                usage=usage, changes=changes,
+                usage=usage, changes=changes, elapsed_ms=_elapsed_ms(started_at),
             )
             raise
 
@@ -595,7 +610,7 @@ class TurnRunnerMixin:
             await self._record_interrupted(
                 session, text, translator, intent, terms,
                 closing=stop.marker, extra=stop.extra,
-                usage=usage, changes=changes,
+                usage=usage, changes=changes, elapsed_ms=_elapsed_ms(started_at),
             )
             # 标记的写法与记录里的一致（``_record_interrupted`` 用空行分隔），
             # 这样实时看到的东西和刷新后回放的一样
@@ -656,6 +671,7 @@ class TurnRunnerMixin:
         extra: dict[str, Any] = {
             "intent": intent,
             "usage": usage,
+            "elapsed_ms": _elapsed_ms(started_at),
         }
         if clarification_frame is not None:
             extra["clarification"] = clarification_frame

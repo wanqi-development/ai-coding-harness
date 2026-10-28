@@ -196,7 +196,13 @@ def plan_reads(monkeypatch) -> list[int]:
     return reads
 
 
-async def _run(events: list[dict], terms: tuple[str, ...] = ()) -> list[dict]:
+async def _run(
+    events: list[dict],
+    terms: tuple[str, ...] = (),
+    *,
+    intent: str = "coding",
+    initial_pr_refs: dict[str, str] | None = None,
+) -> list[dict]:
     svc = HarnessService(
         settings=FAKE_SETTINGS, manager=_FakeManager(events), database=_FakeDb()
     )
@@ -207,8 +213,9 @@ async def _run(events: list[dict], terms: tuple[str, ...] = ()) -> list[dict]:
     return [
         e
         async for e in svc._run_agent(
-            session, runtime, "做点事", "coding", terms,
+            session, runtime, "做点事", intent, terms,
             state=TurnState(message="做点事"),
+            initial_pr_refs=initial_pr_refs,
         )
     ]
 
@@ -479,8 +486,8 @@ class TestUserVisibleStream:
             {"type": "reasoning", "content": "先看代码。", "agent": "coder"}
         ]
 
-    async def test_subagent_todos_without_a_main_list_get_a_container(self, plan_reads):
-        """主清单没建时不再整份吞掉：树尾补容器兜住，SSE 上要看得见。"""
+    async def test_subagent_todos_without_a_main_list_are_dropped(self, plan_reads):
+        """主清单没建时没有当前进度落点，子清单不单独造容器。"""
         ns = sub_ns("t1")  # 与 task 的 call_id 对上，排除「没记成委派」
         out = await _run(
             [
@@ -496,15 +503,7 @@ class TestUserVisibleStream:
             ]
         )
         frames = [e for e in out if e["type"] == "todos"]
-        assert frames, "容器帧至少要下发一次"
-        for frame in frames:
-            assert frame["items"] == [
-                {
-                    "content": "编码子任务",
-                    "status": "pending",
-                    "children": [{"content": "子任务", "status": "pending"}],
-                }
-            ]
+        assert frames == []
 
     async def test_subagent_todos_land_under_the_running_item(self, recorded):
         """一条链路走通：主清单 → 委派 → 子清单，SSE 与落库都该是嵌套的样子。"""
@@ -645,7 +644,9 @@ class TestUserVisibleStream:
         assert record["summary"] == "已拿到方案。"
         # 假事件里没有 ``message-finish`` 的用量 → 账是空的（不是没有 usage 这一项：
         # 每一轮都要在记录上留下「这一轮花了多少」的位置，界面据此区分「没花」与「没记」）
-        assert record["extra"] == {"intent": "coding", "usage": EMPTY_USAGE}
+        extra = record["extra"]
+        assert isinstance(extra.pop("elapsed_ms"), int)
+        assert extra == {"intent": "coding", "usage": EMPTY_USAGE}
 
     async def test_subagent_narration_is_not_persisted(self, recorded):
         """子智能体的文本也不进落库内容，否则重新打开会话又冒出来。"""
@@ -669,7 +670,9 @@ class TestUserVisibleStream:
             ]
         )
 
-        assert recorded[-1]["extra"] == {
+        extra = recorded[-1]["extra"]
+        assert isinstance(extra.pop("elapsed_ms"), int)
+        assert extra == {
             "intent": "coding",
             "parts": [
                 {"kind": "text", "content": "先列清单。开始动手。"},

@@ -44,6 +44,11 @@ from ai_coding_harness.safety.redact import mask_secret
 
 logger = logging.getLogger(__name__)
 
+
+def request_user_id(request: Request) -> int | None:
+    auth = getattr(request.state, "auth", None)
+    return int(auth.user.id) if auth is not None else None
+
 #: 探测厂商 ``/models`` 的超时：这只是界面上的一个按钮，不该让请求挂在那儿
 _PROBE_TIMEOUT_SECONDS = 10.0
 
@@ -274,6 +279,7 @@ def _row_payload(
     label: str,
     row: ModelEndpoint | None,
     metas: Sequence[ProviderMeta],
+    user_id: int | None = None,
 ) -> ModelConfigRow:
     """一行的对外形状：**库里填了什么**（可能什么都没有）+ **现在真的用谁**（``effective``）。
 
@@ -299,7 +305,11 @@ def _row_payload(
         has_key=bool(stored and row.api_key),
         context_window=int((row.context_window or 0) if stored else 0),
         source="db" if stored else "unset",
-        effective=ModelConfigEffective(**effective_for(settings, role)) if role else None,
+        effective=(
+            ModelConfigEffective(**effective_for(settings, role, user_id))
+            if role
+            else None
+        ),
     )
 
 
@@ -307,13 +317,20 @@ def _snapshot(
     settings: Settings,
     stored: dict[str, ModelEndpoint],
     metas: tuple[ProviderMeta, ...],
+    user_id: int | None = None,
 ) -> ModelConfigSnapshot:
     rows = [
-        _row_payload(settings, key, label, stored.get(key), metas)
+        _row_payload(settings, key, label, stored.get(key), metas, user_id)
         for key, label in MODEL_AGENT_ROWS
     ]
     mode_row = stored.get("intent_mode")
-    mode = (mode_row.model_name if mode_row is not None else None) or settings.intent_mode
+    from ai_coding_harness.agent.llm import intent_mode_for
+
+    mode = (
+        (mode_row.model_name if mode_row is not None else None)
+        or intent_mode_for(settings, user_id)
+    )
+    jev_row = stored.get("jev")
     return ModelConfigSnapshot(
         rows=rows,
         providers=[
@@ -326,7 +343,9 @@ def _snapshot(
         ],
         intent_mode=mode if mode in ("jev", "llm") else "jev",
         # JEV 这一侧配齐了没有（地址 + key 两样）—— 没配齐时选了 JEV 会落关键字口径（严格二选一）
-        jev_configured=bool(settings.typesafe_api_key and settings.typesafe_base_url)
+        jev_configured=bool(
+            jev_row is not None and jev_row.api_key and jev_row.base_url
+        )
         and settings.intent_jev_enabled,
     )
 
@@ -337,25 +356,46 @@ async def _stored_key(settings: Settings, request: Request, agent: str) -> str:
     读库而不是读内存那份：行里可能只填了地址与 key、还没填模型名 —— 那样的行不在
     ``settings.agent_models`` 里（那份只装「配了模型」的行），但它的 key 照样能用。
     """
-    if agent == "jev":
+    if agent == "jev" and request_user_id(request) is None:
         return settings.typesafe_api_key
     from ai_coding_harness.db import dao
 
     async with request.app.state.database.session() as db:
-        rows = await dao.list_model_endpoints(db)
+        rows = await dao.list_model_endpoints(
+            db, user_id=request_user_id(request)
+        )
     row = next((item for item in rows if item.agent == agent), None)
     return (row.api_key or "") if row is not None else ""
 
 
-def _borrowed_key(settings: Settings, provider: str, metas: Sequence[ProviderMeta]) -> str:
+async def _borrowed_key(
+    settings: Settings,
+    database: Any,
+    user_id: int | None,
+    provider: str,
+    metas: Sequence[ProviderMeta],
+) -> str:
     """刷新模型清单时用的 key —— **借用现有 agent 行的**（用户口径：借用 agent 的就行）。
 
     谁那一行的 ``base_url`` 落在这家就用谁的；一行都没有（或那几行都没填 key）时再看 ``.env``
     里这家的凭据。两处都借不到就回空串，由调用方给一句人话。
     """
-    for row in settings.agent_models.values():
+    from ai_coding_harness.db import dao
+
+    rows = []
+    try:
+        async with database.session() as db:
+            rows = await dao.list_model_endpoints(db, user_id=user_id)
+    except (AttributeError, TypeError):
+        if user_id is not None:
+            raise
+    for row in rows:
         if row.api_key and provider_key_for(row.base_url or "", metas) == provider:
             return row.api_key
+    if user_id is None:
+        for row in settings.agent_models.values():
+            if row.api_key and provider_key_for(row.base_url or "", metas) == provider:
+                return row.api_key
     env_key = str(getattr(settings, f"{provider}_api_key", "") or "")
     return env_key
 

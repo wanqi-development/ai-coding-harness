@@ -13,7 +13,7 @@
  */
 import { ref, watch } from 'vue'
 import { getMemory, type MemorySnapshot } from '../../lib/api'
-import { renderMarkdown } from '../../lib/markdown'
+import MarkdownContent from '../MarkdownContent.vue'
 
 const props = defineProps<{ sessionId: string }>()
 
@@ -66,7 +66,7 @@ watch(() => props.sessionId, load, { immediate: true })
         这个仓库还没有仓库记忆 —— 它会在一轮**编码或审查收尾**时由主控写出来
         （也可以在对话里说「刷新仓库记忆」按 PR 实况补一次）。
       </p>
-      <div v-else class="memory-body markdown" v-html="renderMarkdown(snapshot.content)"></div>
+      <MarkdownContent v-else class="memory-body" :source="snapshot.content" />
     </template>
   </div>
 </template>

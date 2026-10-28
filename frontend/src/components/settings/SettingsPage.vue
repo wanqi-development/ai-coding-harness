@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 设置页（整页工作台）：左菜单三栏 —— **基本设置 / 外观 / 模型配置**。
+ * 设置页（整页工作台）：左菜单按权限显示基本设置、外观、用户管理与全局配置。
  *
  * 分工与「存在哪」：
  *
@@ -14,12 +14,15 @@
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
+  changePassword,
   getAppSettings,
+  getMySettings,
   getProviderModels,
   deleteModelConfig,
   getModelConfig,
   probeProvider,
   putAppSettings,
+  putMySettings,
   putModelConfig,
   refreshProviderModels,
   type CodingGroupRole,
@@ -29,10 +32,12 @@ import {
   type ProviderOption,
   type RuntimeSettingItem,
   type RuntimeSettingsSnapshot,
+  type UserRuntimeSettings,
 } from '../../lib/api'
 import ModelConfigDialog from './ModelConfigDialog.vue'
 import ModelEntry from './ModelEntry.vue'
 import ProvidersPanel from './ProvidersPanel.vue'
+import UserAdminPanel from './UserAdminPanel.vue'
 import { formatWindow, parseWindow } from '../../lib/modelWindow'
 import {
   CODE_SIZE,
@@ -51,15 +56,19 @@ import {
 } from '../../lib/prefs'
 import type { SettingsPanel } from '../../lib/viewState'
 
-const props = defineProps<{ panel: SettingsPanel }>()
+const props = defineProps<{ panel: SettingsPanel; role: string; userId: number }>()
 const emit = defineEmits<{ close: []; 'reset-layout': []; panel: [SettingsPanel] }>()
 /** 左菜单的三栏。模型配置放最后 —— 它是「高级」那一栏，前两栏是日常会动的。 */
-const PANELS: { key: SettingsPanel; label: string }[] = [
+const ALL_PANELS: { key: SettingsPanel; label: string; admin?: boolean }[] = [
   { key: 'basic', label: '基本设置' },
   { key: 'look', label: '外观' },
+  { key: 'users', label: '用户管理', admin: true },
   { key: 'models', label: '模型配置' },
-  { key: 'providers', label: '提供商' },
+  { key: 'providers', label: '提供商', admin: true },
 ]
+const panels = computed(() =>
+  ALL_PANELS.filter((item) => !item.admin || props.role === 'admin'),
+)
 /** 当前栏由 App 持有（它同时负责把它写进 URL hash，刷新才不会跳回聊天页）。 */
 const panel = computed(() => props.panel)
 
@@ -90,6 +99,17 @@ function resetLayout() {
 // -- 基本设置：运行期配置（改完**立刻生效**，不用重启）------------------------
 
 const appSettings = ref<RuntimeSettingsSnapshot | null>(null)
+const mySettings = ref<UserRuntimeSettings | null>(null)
+const myDraft = ref({
+  repo_view_dir: '',
+  gitee_base_branch: '',
+  github_base_branch: '',
+  gitee_access_token: '',
+  gitee_username: '',
+  github_access_token: '',
+  github_username: '',
+})
+const clearMyTokens = ref({ gitee: false, github: false })
 /** 编辑中的草稿（键 → 字符串；与后端值分开，编辑中不该被刷新覆盖）。 */
 const runtimeDrafts = ref<Record<string, string>>({})
 
@@ -117,6 +137,43 @@ async function loadRuntime() {
   } catch (e: any) {
     error.value = e?.message ?? '读取失败'
   }
+}
+
+async function loadMySettings(): Promise<void> {
+  try {
+    const fresh = await getMySettings()
+    applyMySettings(fresh)
+  } catch (e: any) {
+    error.value = e?.message ?? '个人设置读取失败'
+  }
+}
+
+function applyMySettings(fresh: UserRuntimeSettings): void {
+  mySettings.value = fresh
+  myDraft.value = {
+    repo_view_dir: fresh.repo_view_dir,
+    gitee_base_branch: fresh.gitee_base_branch,
+    github_base_branch: fresh.github_base_branch,
+    gitee_access_token: fresh.gitee_access_token,
+    gitee_username: fresh.gitee_username,
+    github_access_token: fresh.github_access_token,
+    github_username: fresh.github_username,
+  }
+  clearMyTokens.value = { gitee: false, github: false }
+}
+
+async function saveMySettings(): Promise<void> {
+  const current = mySettings.value
+  if (!current) return
+  const changed: Record<string, string | boolean> = {}
+  for (const key of Object.keys(myDraft.value) as (keyof typeof myDraft.value)[]) {
+    if (myDraft.value[key] !== current[key]) changed[key] = myDraft.value[key]
+  }
+  if (clearMyTokens.value.gitee) changed.clear_gitee_token = true
+  if (clearMyTokens.value.github) changed.clear_github_token = true
+  if (!Object.keys(changed).length) return
+  const fresh = await putMySettings(changed)
+  applyMySettings(fresh)
 }
 
 /**
@@ -160,17 +217,63 @@ async function saveRuntime() {
   }
 }
 
+async function saveBasic(): Promise<void> {
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    await saveMySettings()
+    if (props.role === 'admin') await saveRuntime()
+    if (!error.value) notice.value = '已保存，立刻生效。'
+  } catch (e: any) {
+    error.value = e?.message ?? '保存失败'
+  } finally {
+    busy.value = false
+  }
+}
+
 // -- 模型配置（只有切到那一栏才去拉：省一次请求，也免得别栏弹红条）--------------
 
 const data = ref<ModelConfigSnapshot | null>(null)
 const error = ref('')
 const notice = ref('')
 const busy = ref(false)
+const passwordBusy = ref(false)
 const intentMode = ref('jev')
+const currentPassword = ref('')
+const newPassword = ref('')
+const confirmPassword = ref('')
+
+async function savePassword() {
+  error.value = ''
+  notice.value = ''
+  if (!currentPassword.value || !newPassword.value) {
+    error.value = '请填写当前密码和新密码。'
+    return
+  }
+  if (newPassword.value !== confirmPassword.value) {
+    error.value = '两次输入的新密码不一致。'
+    return
+  }
+  passwordBusy.value = true
+  try {
+    await changePassword(currentPassword.value, newPassword.value)
+    currentPassword.value = ''
+    newPassword.value = ''
+    confirmPassword.value = ''
+    notice.value = '登录密码已修改，其他设备上的登录会话已失效。'
+  } catch (e: any) {
+    error.value = e?.message ?? '修改密码失败'
+  } finally {
+    passwordBusy.value = false
+  }
+}
 
 /** 一行的可编辑草稿（与后端快照分开：编辑中不该被刷新覆盖）。 */
 type Draft = {
   provider: string
+  /** 打开这一行时的原始供应商；未保存前切回去可恢复已存 Key 的使用权。 */
+  original_provider: string
   base_url: string
   model: string
   api_key: string
@@ -424,6 +527,7 @@ function draftFor(row: ModelConfigRow): Draft {
   const shown = row.context_window > 0 ? row.context_window : (real ? (eff?.window ?? 0) : 0)
   return {
     provider: row.provider,
+    original_provider: row.provider,
     base_url: row.base_url,
     model: row.model,
     api_key: '',
@@ -440,12 +544,11 @@ function draftFor(row: ModelConfigRow): Draft {
 /**
  * 换提供商：把它的默认地址带出来（用户仍可改）。
  *
- * 换了一家，**上一家的 key 也要清掉**（用户口径 2026-10-15）：界面清空只是草稿，
- * 库里那一把得靠保存时送空串 —— 不送的话「留空＝不改」会把旧家的 key 留在新地址上。
+ * 换供应商后旧 Key 立即失效；保存时送空串清库。未保存前切回原供应商，
+ * 旧 Key 仍可继续使用，避免误切换后必须重新粘贴。
  */
 function pickProvider(row: ModelConfigRow, key: string) {
   const draft = draftOf(row)
-  const hadKey = row.has_key
   draft.provider = key
   draft.dirty = true
   if (key !== 'custom' && providers.value.some((item) => item.key === key)) void ensureModels(key)
@@ -457,7 +560,7 @@ function pickProvider(row: ModelConfigRow, key: string) {
   draft.context_window = ''
   draft.window_exact = 0
   draft.window_auto = true
-  draft.clear_key = hadKey
+  draft.clear_key = row.has_key && key !== draft.original_provider
   draft.models = []
   draft.probe = ''
   draft.base_url = ''
@@ -501,7 +604,7 @@ async function probe(row: ModelConfigRow) {
     const result = await probeProvider(
       draft.base_url,
       draft.api_key || null,
-      row.key,
+      draft.clear_key ? undefined : row.key,
       draft.provider,
     )
     // 只有**实时**清单才进候选框（2026-10-15 起没有"内置候选"这回事了）
@@ -562,6 +665,8 @@ async function saveRow(row: ModelConfigRow) {
     if (Object.keys(item).length) {
       data.value = await putModelConfig({ [row.key]: item })
       notice.value = `「${row.label}」已保存，下一轮生效。`
+      const saved = data.value.rows.find((candidate) => candidate.key === row.key)
+      if (saved) drafts.value[row.key] = draftFor(saved)
       await load()
     } else {
       notice.value = '没有改动。'
@@ -611,7 +716,20 @@ watch(
   panel,
   (key) => {
     if (key === 'models' && data.value === null) void load()
-    if (key === 'basic' && appSettings.value === null) void loadRuntime()
+    if (key === 'basic') {
+      if (mySettings.value === null) void loadMySettings()
+      if (props.role === 'admin' && appSettings.value === null) void loadRuntime()
+    }
+  },
+  { immediate: true },
+)
+
+watch(
+  [() => props.panel, () => props.role],
+  ([key, role]) => {
+    if (role !== 'admin' && (key === 'users' || key === 'providers')) {
+      emit('panel', 'basic')
+    }
   },
   { immediate: true },
 )
@@ -652,7 +770,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         class="btn btn-primary"
         type="button"
         :disabled="busy"
-        @click="saveRuntime()"
+        @click="saveBasic()"
       >
         {{ busy ? '保存中…' : '保存' }}
       </button>
@@ -665,7 +783,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <div class="page-inner">
         <nav class="set-menu" aria-label="设置分类">
           <button
-            v-for="item in PANELS"
+            v-for="item in panels"
             :key="item.key"
             class="set-menu-item"
             :class="{ 'is-on': panel === item.key }"
@@ -680,6 +798,152 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <div class="set-panel">
           <!-- 基本设置：本机显示偏好，改动立刻生效 -->
           <template v-if="panel === 'basic'">
+            <section class="section">
+              <h3>账号安全</h3>
+              <p class="field-note">修改密码后，当前会话会自动续期，其他设备上的登录会立即失效。</p>
+              <div class="set-row">
+                <span class="set-label">当前密码</span>
+                <input
+                  v-model="currentPassword"
+                  class="input set-control input-wide"
+                  type="password"
+                  autocomplete="current-password"
+                />
+              </div>
+              <div class="set-row">
+                <span class="set-label">新密码</span>
+                <input
+                  v-model="newPassword"
+                  class="input set-control input-wide"
+                  type="password"
+                  autocomplete="new-password"
+                />
+              </div>
+              <div class="set-row">
+                <span class="set-label">确认新密码</span>
+                <input
+                  v-model="confirmPassword"
+                  class="input set-control input-wide"
+                  type="password"
+                  autocomplete="new-password"
+                />
+              </div>
+              <div class="set-row">
+                <span class="set-label"></span>
+                <div class="set-control">
+                  <button class="btn" type="button" :disabled="passwordBusy" @click="savePassword">
+                    {{ passwordBusy ? '修改中…' : '修改密码' }}
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <section class="section">
+              <h3>代码平台</h3>
+              <p class="field-note">
+                凭据仅用于当前账号的仓库访问、代码缓存和 PR 操作。打开设置页时令牌显示掩码；
+                保存后不再回显。清空输入框再保存会删除令牌，已有会话会在下一轮同步。
+              </p>
+              <div class="set-row">
+                <span class="set-label">访问令牌（Gitee）</span>
+                <div class="set-control settings-secret-row">
+                  <input
+                    v-model="myDraft.gitee_access_token"
+                    class="input input-wide"
+                    type="password"
+                    autocomplete="off"
+                    :placeholder="
+                      mySettings?.gitee_access_token_configured
+                        ? '已配置；输入新令牌可替换'
+                        : '未配置；公开仓库可留空'
+                    "
+                  />
+                  <button
+                    v-if="mySettings?.gitee_access_token_configured"
+                    class="btn btn-small"
+                    type="button"
+                    @click="clearMyTokens.gitee = true; myDraft.gitee_access_token = ''"
+                  >
+                    {{ clearMyTokens.gitee ? '保存后删除' : '删除令牌' }}
+                  </button>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-label">git 用户名（Gitee）</span>
+                <input
+                  v-model="myDraft.gitee_username"
+                  class="input set-control input-wide"
+                  autocomplete="off"
+                  placeholder="留空使用平台默认 oauth2"
+                />
+              </div>
+              <div class="set-row">
+                <span class="set-label">访问令牌（GitHub）</span>
+                <div class="set-control settings-secret-row">
+                  <input
+                    v-model="myDraft.github_access_token"
+                    class="input input-wide"
+                    type="password"
+                    autocomplete="off"
+                    :placeholder="
+                      mySettings?.github_access_token_configured
+                        ? '已配置；输入新令牌可替换'
+                        : '未配置；公开仓库可留空'
+                    "
+                  />
+                  <button
+                    v-if="mySettings?.github_access_token_configured"
+                    class="btn btn-small"
+                    type="button"
+                    @click="clearMyTokens.github = true; myDraft.github_access_token = ''"
+                  >
+                    {{ clearMyTokens.github ? '保存后删除' : '删除令牌' }}
+                  </button>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-label">git 用户名（GitHub）</span>
+                <input
+                  v-model="myDraft.github_username"
+                  class="input set-control input-wide"
+                  autocomplete="off"
+                  placeholder="留空使用平台默认 x-access-token"
+                />
+              </div>
+            </section>
+
+            <section class="section">
+              <h3>代码缓存</h3>
+              <p class="field-note">
+                每个用户使用独立缓存。留空或填写默认路径时，使用
+                <code>{{ mySettings?.repo_view_dir_default || '个人默认目录' }}</code>。
+              </p>
+              <div class="set-row">
+                <span class="set-label">缓存根目录</span>
+                <input
+                  v-model="myDraft.repo_view_dir"
+                  class="input set-control input-wide"
+                  placeholder="/absolute/path/to/repo_cache"
+                />
+              </div>
+              <div class="set-row">
+                <span class="set-label">默认分支（Gitee）</span>
+                <input
+                  v-model="myDraft.gitee_base_branch"
+                  class="input set-control input-wide"
+                  placeholder="留空＝按远程默认分支探测"
+                />
+              </div>
+              <div class="set-row">
+                <span class="set-label">默认分支（GitHub）</span>
+                <input
+                  v-model="myDraft.github_base_branch"
+                  class="input set-control input-wide"
+                  placeholder="留空＝按远程默认分支探测"
+                />
+              </div>
+            </section>
+
             <section class="section">
               <h3>界面</h3>
               <div class="set-row">
@@ -703,30 +967,32 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </section>
 
             <!-- 运行期配置：存后端库、**改完立刻生效**（主智能体每轮现建，不缓存） -->
-            <section v-for="group in runtimeGroups" :key="group.name" class="section">
-              <h3>{{ group.name }}</h3>
-              <div v-for="item in group.items" :key="item.key" class="set-row">
-                <span class="set-label">
-                  {{ item.label }}
-                  <span v-if="item.source === 'db'" class="set-tag">已改过</span>
-                </span>
-                <input
-                  class="input set-control"
-                  :class="item.kind === 'int' || item.kind === 'float' ? 'input-num' : 'input-wide'"
-                  :type="item.kind === 'secret' ? 'password' : 'text'"
-                  :placeholder="
-                    item.kind === 'secret'
-                      ? item.has_value
-                        ? '已配置（不动就留空；把掩码删空再保存＝清除）'
-                        : '未配置'
-                      : ''
-                  "
-                  autocomplete="off"
-                  :value="runtimeValue(item)"
-                  @input="runtimeDrafts[item.key] = ($event.target as HTMLInputElement).value"
-                />
-              </div>
-            </section>
+            <template v-if="role === 'admin'">
+              <section v-for="group in runtimeGroups" :key="group.name" class="section">
+                <h3>{{ group.name }}</h3>
+                <div v-for="item in group.items" :key="item.key" class="set-row">
+                  <span class="set-label">
+                    {{ item.label }}
+                    <span v-if="item.source === 'db'" class="set-tag">已改过</span>
+                  </span>
+                  <input
+                    class="input set-control"
+                    :class="item.kind === 'int' || item.kind === 'float' ? 'input-num' : 'input-wide'"
+                    :type="item.kind === 'secret' ? 'password' : 'text'"
+                    :placeholder="
+                      item.kind === 'secret'
+                        ? item.has_value
+                          ? '已配置（不动就留空；把掩码删空再保存＝清除）'
+                          : '未配置'
+                        : ''
+                    "
+                    autocomplete="off"
+                    :value="runtimeValue(item)"
+                    @input="runtimeDrafts[item.key] = ($event.target as HTMLInputElement).value"
+                  />
+                </div>
+              </section>
+            </template>
           </template>
 
           <!-- 外观：主题 / 代码字号 / 对话列宽，都是立刻生效 -->
@@ -783,6 +1049,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               </div>
             </section>
           </template>
+
+          <UserAdminPanel
+            v-else-if="panel === 'users' && role === 'admin'"
+            :current-user-id="userId"
+          />
 
           <!-- 模型配置：按智能体配，存后端库；改完要保存 + 重启后端 -->
           <template v-else-if="panel === 'models'">
@@ -882,10 +1153,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
           </template>
 
-          <!-- 提供商目录：改完刷新界面即生效（目录是每条请求现读库的） -->
-          <template v-else>
+          <template v-else-if="panel === 'providers' && role === 'admin'">
             <ProvidersPanel />
           </template>
+
         </div>
       </div>
     </div>
@@ -897,8 +1168,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       :draft="draftOf(editing)"
       :providers="providers"
       :known-models="modelsByProvider[draftOf(editing).provider] ?? []"
-      :has-key="editing.has_key"
-      :masked-key="editing.api_key_masked"
+      :has-key="editing.has_key && !draftOf(editing).clear_key"
+      :masked-key="draftOf(editing).clear_key ? '' : editing.api_key_masked"
       :refreshing="refreshing === draftOf(editing).provider"
       :busy="busy"
       :error="dialogError"

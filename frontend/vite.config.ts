@@ -12,6 +12,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      '/auth': BACKEND,
+      '/users': BACKEND,
+      '/me': BACKEND,
       '/sessions': BACKEND,
       '/chat': BACKEND,
       '/health': BACKEND,

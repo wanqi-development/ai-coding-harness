@@ -16,6 +16,7 @@ from ai_coding_harness.db.models import (
     ModelProvider,
     ProviderModel,
     Repository,
+    UserSetting,
 )
 
 if TYPE_CHECKING:  # 只为标注：真 import 会把 config 拖进来，DAO 不该依赖它
@@ -23,18 +24,27 @@ if TYPE_CHECKING:  # 只为标注：真 import 会把 config 拖进来，DAO 不
 
 from ._common import _now
 
+UNSET = object()
+
 # --------------------------------------------------------------------------- 模型连接（2026-10-13）
 
 
-async def list_model_endpoints(db: AsyncSession) -> list[ModelEndpoint]:
-    """模型连接表的全部行（键排序，便于逐行对照界面）。"""
-    rows = await db.scalars(select(ModelEndpoint).order_by(ModelEndpoint.agent))
-    return list(rows)
+async def list_model_endpoints(
+    db: AsyncSession, *, user_id: int | None = None
+) -> list[ModelEndpoint]:
+    """模型连接行；给 ``user_id`` 时只读该用户自己的配置。"""
+    query = select(ModelEndpoint).order_by(
+        ModelEndpoint.user_id, ModelEndpoint.agent
+    )
+    if user_id is not None:
+        query = query.where(ModelEndpoint.user_id == user_id)
+    return list(await db.scalars(query))
 
 
 async def upsert_model_endpoint(
     db: AsyncSession,
     *,
+    user_id: int,
     agent: str,
     base_url: str | None = None,
     model_name: str | None = None,
@@ -46,9 +56,14 @@ async def upsert_model_endpoint(
     ``None`` ＝ **不动这一格**（界面上留空就是不改、也不会把已有的 key 抹掉）；
     空串是合法值（用户想清掉 base_url / 模型名时传空串）。
     """
-    row = await db.scalar(select(ModelEndpoint).where(ModelEndpoint.agent == agent))
+    row = await db.scalar(
+        select(ModelEndpoint).where(
+            ModelEndpoint.user_id == user_id,
+            ModelEndpoint.agent == agent,
+        )
+    )
     if row is None:
-        row = ModelEndpoint(agent=agent)
+        row = ModelEndpoint(user_id=user_id, agent=agent)
         db.add(row)
     for field, value in (
         ("base_url", base_url),
@@ -61,10 +76,55 @@ async def upsert_model_endpoint(
     row.updated_at = _now()
 
 
-async def delete_model_endpoint(db: AsyncSession, *, agent: str) -> bool:
+async def delete_model_endpoint(
+    db: AsyncSession, *, user_id: int, agent: str
+) -> bool:
     """删掉一行的覆盖值（＝恢复出厂默认），返回是否真删了。"""
-    result = await db.execute(delete(ModelEndpoint).where(ModelEndpoint.agent == agent))
+    result = await db.execute(
+        delete(ModelEndpoint).where(
+            ModelEndpoint.user_id == user_id,
+            ModelEndpoint.agent == agent,
+        )
+    )
     return bool(result.rowcount)
+
+
+async def get_user_settings(
+    db: AsyncSession, *, user_id: int
+) -> UserSetting | None:
+    return await db.get(UserSetting, user_id)
+
+
+async def upsert_user_settings(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    repo_view_dir: str | None | object = UNSET,
+    gitee_base_branch: str | None | object = UNSET,
+    github_base_branch: str | None | object = UNSET,
+    gitee_access_token: str | None | object = UNSET,
+    gitee_username: str | None | object = UNSET,
+    github_access_token: str | None | object = UNSET,
+    github_username: str | None | object = UNSET,
+) -> UserSetting:
+    row = await db.get(UserSetting, user_id)
+    if row is None:
+        row = UserSetting(user_id=user_id)
+        db.add(row)
+    for field, value in (
+        ("repo_view_dir", repo_view_dir),
+        ("gitee_base_branch", gitee_base_branch),
+        ("github_base_branch", github_base_branch),
+        ("gitee_access_token", gitee_access_token),
+        ("gitee_username", gitee_username),
+        ("github_access_token", github_access_token),
+        ("github_username", github_username),
+    ):
+        if value is not UNSET:
+            setattr(row, field, value)
+    row.updated_at = _now()
+    await db.flush()
+    return row
 
 
 # ------------------------------------------------------------------- 运行期配置（2026-10-14）

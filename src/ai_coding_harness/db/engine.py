@@ -17,6 +17,9 @@ class Database:
         self._engine = create_async_engine(
             settings.postgres_async_url,
             pool_pre_ping=True,
+            connect_args={
+                "connect_timeout": max(1, settings.postgres_connect_timeout_seconds)
+            },
         )
         self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
 

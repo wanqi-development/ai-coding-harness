@@ -34,6 +34,7 @@ class FakeSandbox:
         self.run_delay = run_delay
         self.health_calls = 0
         self.run_calls: list[str] = []
+        self.run_envs: list[dict[str, str] | None] = []
         self.files: dict[str, str] = {}
         self.raise_on_run: Exception | None = None
         self.renew_calls: list[timedelta] = []
@@ -51,10 +52,11 @@ class FakeSandbox:
             raise self.renew_error
         return datetime(2026, 9, 25, 12, 0, tzinfo=UTC) + timeout
 
-    async def run(self, command, *, cwd=None, timeout=None) -> CommandResult:
+    async def run(self, command, *, cwd=None, timeout=None, envs=None) -> CommandResult:
         if self.raise_on_run is not None:
             raise self.raise_on_run
         self.run_calls.append(command)
+        self.run_envs.append(envs)
         if self.run_delay:
             await asyncio.sleep(self.run_delay)  # 模拟一次长调用
         return CommandResult(

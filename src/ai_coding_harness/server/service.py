@@ -71,8 +71,10 @@ class HarnessService(
         #: 判定瀑布的第二关（口令 → **JEV** → 大模型 → 关键字口径）。``None`` ＝ 没配 / SDK
         #: 装不上，这一关直接跳过 —— 判定器缺一层不该影响服务可用性。
         self._intent_jev = intent_jev
+        self._intent_jev_by_user: dict[int, IntentDecider] = {}
         # 分类模型懒建一次即可：每会话每轮都建一个新实例会攒下未关闭的连接
         self._classifier: BaseChatModel | None = None
+        self._classifiers_by_user: dict[int, BaseChatModel] = {}
         #: 本轮意图判定的 token 累加器（``{"input":…, "output":…, "calls":…}``）。
         #: 判定跑在事件流之外，用量没法从 ``AgentRunLog`` 里拿到，所以在这里攒、
         #: 轮末并进本轮那份账（归类名 ``INTENT_ACTOR``，单独一项而不是并进主控）。
@@ -97,7 +99,29 @@ class HarnessService(
             else None
         )
         #: 新 PR 批量摘要模型；只在新 PR 出现时懒建 / 调用。
-        self._memory_model: BaseChatModel | None = None
+        self._memory_models: dict[int, BaseChatModel] = {}
+
+    async def aclose(self) -> None:
+        """Release per-user JEV clients and any legacy decider."""
+        deciders = list(self._intent_jev_by_user.values())
+        if self._intent_jev is not None:
+            deciders.append(self._intent_jev)
+        seen: set[int] = set()
+        for decider in deciders:
+            if id(decider) in seen:
+                continue
+            seen.add(id(decider))
+            close = getattr(decider, "aclose", None)
+            if close is not None:
+                await close()
+        self._intent_jev_by_user.clear()
+
+    async def invalidate_model_cache(self, user_id: int) -> None:
+        """Drop models cached for one user after their model configuration changes."""
+        self._classifiers_by_user.pop(user_id, None)
+        decider = self._intent_jev_by_user.pop(user_id, None)
+        if decider is not None:
+            await decider.aclose()
 
 
 __all__ = [

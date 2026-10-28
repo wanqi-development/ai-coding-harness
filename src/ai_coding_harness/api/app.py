@@ -11,12 +11,18 @@ from ai_coding_harness.agent.llm import build_fallback, build_model
 from ai_coding_harness.api.middleware import ApiLogMiddleware
 from ai_coding_harness.api.routes import (
     app_settings,
+    auth,
     chat,
     health,
+    me,
     model_config,
     repo,
     sessions,
+    users,
 )
+from ai_coding_harness.auth.middleware import AuthMiddleware
+from ai_coding_harness.auth.service import AuthService
+from ai_coding_harness.auth.user_service import UserAdminService
 from ai_coding_harness.config import (
     PROVIDER_SEED_PATH,
     ModelConfig,
@@ -31,11 +37,11 @@ from ai_coding_harness.infra.circuit import RedisCircuitStore
 from ai_coding_harness.infra.redis_cache import build_redis, command_guard_seconds
 from ai_coding_harness.observability.logging import setup_logging
 from ai_coding_harness.observability.tracing import setup_tracing
-from ai_coding_harness.server.intent import build_jev_decider
 from ai_coding_harness.server.run_store import RedisRunBuffer, RedisRunLock
 from ai_coding_harness.server.runs import RunHub
 from ai_coding_harness.server.service import HarnessService
-from ai_coding_harness.session.manager import Session, SessionManager
+from ai_coding_harness.session.manager import SessionManager
+from ai_coding_harness.session.session_cache import build_session_cache
 from ai_coding_harness.session.state import build_checkpointer, build_store
 from ai_coding_harness.tools.web_search import build_web_search_tool
 
@@ -50,9 +56,9 @@ async def apply_model_endpoints(settings: Settings, database: Database) -> None:
     **先清空再落**：只增不清的话，「恢复默认」（删掉库里那一行）在内存里会留下幽灵
     （旧连接照旧生效），而且新写入的那几行也看不出来。所以这里是一份完整刷新。
 
-    ``intent_mode`` 那一行不装连接，只装「意图识别走 JEV 还是大模型」（``jev`` / ``llm``）；
-    ``jev`` 那一行的 base_url / api_key / 模型名装到 ``typesafe_*`` 上（JEV 走 SDK，不建
-    ``BaseChatModel``，所以不进 ``agent_models``）；其余行只有**有模型名**的才算配了。
+    ``intent_mode`` 那一行只记「意图识别走 JEV 还是大模型」；其余行按 ``user_id``
+    装进各自的 ``user_agent_models``，绝不跨用户回落。``user_id`` 为空的行只保留给
+    无用户的老测试夹具。
 
     **什么时候调**：启动时一次；界面上保存/恢复默认之后**再调一次** —— 主智能体每轮现建
     （``session/manager.py::get_agent``），所以下一轮就用新连接了，不用重启后端（2026-10-14）。
@@ -68,34 +74,51 @@ async def apply_model_endpoints(settings: Settings, database: Database) -> None:
         return
     # 读成功才清空：读库失败时保留上一份（清空等于把上一份配置也弄没了）
     settings.agent_models = {}
+    settings.user_agent_models = {}
+    settings.user_intent_modes = {}
     settings.intent_mode = "jev"
     settings.typesafe_api_key = ""
     settings.typesafe_base_url = ""
     settings.typesafe_model_name = "jev-latest"
     for row in rows:
+        user_id = getattr(row, "user_id", None)
+        if user_id is None:
+            if row.agent == "intent_mode":
+                mode = (row.model_name or "").strip().lower()
+                if mode in ("jev", "llm"):
+                    settings.intent_mode = mode
+                continue
+            if row.agent == "jev":
+                settings.typesafe_api_key = row.api_key or ""
+                settings.typesafe_base_url = row.base_url or ""
+                settings.typesafe_model_name = (row.model_name or "").strip() or "jev-latest"
+                continue
+            if not (row.model_name or "").strip():
+                continue
+            settings.agent_models[row.agent] = ModelConfig(
+                model=row.model_name or "",
+                api_key=row.api_key or "",
+                base_url=row.base_url or "",
+                context_window=int(row.context_window or 0),
+            )
+            continue
         if row.agent == "intent_mode":
             mode = (row.model_name or "").strip().lower()
             if mode in ("jev", "llm"):
-                settings.intent_mode = mode
+                settings.user_intent_modes[int(user_id)] = mode
             continue
-        if row.agent == "jev":
-            # JEV 只需要地址 + key（模型名留空 = SDK 默认的 jev-latest）
-            settings.typesafe_api_key = row.api_key or ""
-            settings.typesafe_base_url = row.base_url or ""
-            settings.typesafe_model_name = (row.model_name or "").strip() or "jev-latest"
+        if row.agent != "jev" and not (row.model_name or "").strip():
             continue
-        if not (row.model_name or "").strip():
-            continue
-        settings.agent_models[row.agent] = ModelConfig(
-            model=row.model_name or "",
+        settings.user_agent_models.setdefault(int(user_id), {})[row.agent] = ModelConfig(
+            model=(row.model_name or "").strip()
+            or ("jev-latest" if row.agent == "jev" else ""),
             api_key=row.api_key or "",
             base_url=row.base_url or "",
             context_window=int(row.context_window or 0),
         )
     logger.info(
-        "模型连接已从库里加载：%s；意图识别走 %s",
-        "、".join(sorted(settings.agent_models)) or "（空，全用 .env）",
-        settings.intent_mode,
+        "模型连接已从库里加载：%d 个用户各自一份配置",
+        len(settings.user_agent_models),
     )
 
 
@@ -214,10 +237,15 @@ def create_app(settings: Settings) -> FastAPI:
         # 同一会话会被两个 worker 同时跑。
         redis = await build_redis(settings)
         app.state.redis = redis
+        app.state.session_cache = build_session_cache(redis, settings)
         app.state.manager = SessionManager(
             settings=settings,
-            model_for=lambda role: build_model(settings, role=role),
-            fallback_for=lambda role: build_fallback(settings, role=role),
+            model_for=lambda role, user_id: build_model(
+                settings, role=role, user_id=user_id
+            ),
+            fallback_for=lambda role, user_id: build_fallback(
+                settings, role=role, user_id=user_id
+            ),
             web_search_tool=web_search,
             store=store,
             checkpointer=checkpointer,
@@ -233,12 +261,16 @@ def create_app(settings: Settings) -> FastAPI:
                 else None
             ),
         )
-        app.state.sessions: dict[str, Session] = {}
         app.state.store = store
         app.state.checkpointer = checkpointer
         app.state.database = database
-        # 意图判定的第二关（JEV）：构造失败/没配 key 时是 None，判定自动退到下一关
-        app.state.intent_jev = build_jev_decider(settings)
+        app.state.auth_service = AuthService(
+            settings=settings,
+            database=database,
+        )
+        app.state.user_admin_service = UserAdminService(database=database)
+        # JEV 是用户级模型配置，按轮从 user_agent_models 懒建；这里不再放全局实例。
+        app.state.intent_jev = None
         app.state.service = HarnessService(
             settings=settings,
             manager=app.state.manager,
@@ -276,23 +308,22 @@ def create_app(settings: Settings) -> FastAPI:
         yield
         # 清理：先收掉在跑的轮次（否则它们会在连接池拆掉之后还去写库），再销毁会话。
         await app.state.runs.shutdown()
+        await app.state.service.aclose()
         manager: SessionManager = app.state.manager
-        for session in list(app.state.sessions.values()):
-            await manager.destroy_session(
-                public_id=session.public_id, db_id=session.db_id
-            )
-        app.state.sessions.clear()
+        await manager.close_local_runtimes()
         await database.dispose()
         await store.conn.close()
         await checkpointer.conn.close()
         if app.state.redis is not None:
             await app.state.redis.aclose()
-        if app.state.intent_jev is not None:
-            await app.state.intent_jev.aclose()
 
     app = FastAPI(title="ai-coding-harness", lifespan=lifespan)
+    app.add_middleware(AuthMiddleware)
     app.add_middleware(ApiLogMiddleware)
     app.include_router(health.router)
+    app.include_router(auth.router)
+    app.include_router(users.router)
+    app.include_router(me.router)
     app.include_router(sessions.router)
     app.include_router(chat.router)
     app.include_router(repo.router)

@@ -21,6 +21,7 @@ async def create_session(
     db: AsyncSession,
     *,
     public_id: uuid.UUID,
+    user_id: int | None = None,
     gitee_token: str | None = None,
     gitee_username: str | None = None,
     git_platform: str | None = None,
@@ -28,6 +29,7 @@ async def create_session(
 ) -> AgentSession:
     row = AgentSession(
         public_id=public_id,
+        user_id=user_id,
         gitee_token=gitee_token,
         gitee_username=gitee_username,
         # 认不出的取值一律回落 Gitee（与 Platform.of 同一口径），列本身非空
@@ -55,17 +57,62 @@ async def list_sessions(db: AsyncSession, *, limit: int = 50) -> list[AgentSessi
 
 
 async def list_sessions_with_repo(
-    db: AsyncSession, *, limit: int = 50
+    db: AsyncSession, *, limit: int = 50, user_id: int | None = None
 ) -> list[tuple[AgentSession, Repository | None]]:
     """会话列表（左连仓库），用于前端历史侧栏。
 
     删除是软删除（状态置 destroyed，保留记录供审计），故列表按状态排除已删除会话。
     """
-    rows = await db.execute(
+    query = (
         select(AgentSession, Repository)
         .outerjoin(Repository, Repository.session_id == AgentSession.id)
         .where(AgentSession.status != "destroyed")
         .order_by(AgentSession.created_at.desc())
         .limit(limit)
     )
+    if user_id is not None:
+        query = query.where(AgentSession.user_id == user_id)
+    rows = await db.execute(query)
     return list(rows.all())
+
+
+async def list_active_sessions_with_repo_for_user(
+    db: AsyncSession, *, user_id: int
+) -> list[tuple[AgentSession, Repository]]:
+    """当前用户所有活跃业务会话及其仓库（凭据变更校验/缓存刷新用）。"""
+    rows = await db.execute(
+        select(AgentSession, Repository)
+        .join(Repository, Repository.session_id == AgentSession.id)
+        .where(
+            AgentSession.user_id == user_id,
+            AgentSession.status == "active",
+        )
+        .order_by(AgentSession.id)
+    )
+    return list(rows.all())
+
+
+async def bump_user_session_credentials(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    platform: str,
+    token: str,
+    git_username: str,
+) -> list[AgentSession]:
+    """把某一平台的用户凭据写进该用户全部活跃会话并递增版本。"""
+    rows = await db.scalars(
+        select(AgentSession).where(
+            AgentSession.user_id == user_id,
+            AgentSession.status == "active",
+            AgentSession.git_platform == Platform.of(platform).value,
+        )
+    )
+    out = list(rows)
+    for row in out:
+        row.gitee_token = token or None
+        row.gitee_username = git_username
+        row.credential_version = int(row.credential_version or 0) + 1
+        row.session_version = int(row.session_version or 0) + 1
+    await db.flush()
+    return out

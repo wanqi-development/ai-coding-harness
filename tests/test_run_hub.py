@@ -12,6 +12,7 @@ group，而运行原来直接挂在那个请求上 —— **浏览器一刷新�
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -317,6 +318,7 @@ def _cancel_app(service: Any) -> FastAPI:
     app = FastAPI()
     app.include_router(sessions_route.router)
     app.state.runs = RunHub(service)
+    app.state.sessions = {"s": SimpleNamespace()}
     return app
 
 

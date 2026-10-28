@@ -52,9 +52,10 @@ class SandboxClient:
         *,
         cwd: str | None = None,
         timeout: timedelta | None = None,
+        envs: dict[str, str] | None = None,
     ) -> CommandResult:
         """Run a shell command in the sandbox and return a normalized result."""
-        opts = RunCommandOpts(working_directory=cwd, timeout=timeout)
+        opts = RunCommandOpts(working_directory=cwd, timeout=timeout, envs=envs)
         execution = await self._sandbox.commands.run(command, opts=opts)
         stdout = "\n".join(m.text.rstrip("\n") for m in execution.logs.stdout)
         stderr = "\n".join(m.text.rstrip("\n") for m in execution.logs.stderr)

@@ -31,6 +31,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ai_coding_harness.db.base import Base
 
+_AUTO_BIGINT = BigInteger().with_variant(Integer, "sqlite")
+
 
 class AgentSession(Base):
     """会话表：一次用户会话，关联一个仓库、一个沙箱。"""
@@ -46,6 +48,13 @@ class AgentSession(Base):
         nullable=False,
         unique=True,
         comment="对外会话 ID（uuid，应用生成，用于 API / 卷名 / 线程名）",
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="所属登录用户；旧会话在认证迁移后由 owner 认领",
     )
     status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default="active", comment="状态：active / destroyed / expired"
@@ -63,6 +72,18 @@ class AgentSession(Base):
         nullable=False,
         server_default="gitee",
         comment="代码平台：gitee / github（见 codeplatform.Platform）",
+    )
+    credential_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="用户代码平台凭据版本；沙箱与 Session 缓存按它做懒同步",
+    )
+    session_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="会话快照版本；每次会话元数据或凭据变化时递增",
     )
     sandbox_id: Mapped[str | None] = mapped_column(
         Text, nullable=True, comment="OpenSandbox 沙箱 ID"
@@ -123,11 +144,183 @@ class Repository(Base):
     owner: Mapped[str] = mapped_column(Text, nullable=False, comment="仓库所属者")
     name: Mapped[str] = mapped_column(Text, nullable=False, comment="仓库名")
     url: Mapped[str] = mapped_column(Text, nullable=False, comment="仓库地址")
+    platform: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="gitee",
+        comment="代码平台：gitee / github；仓库长期数据按平台 + owner + name 共享",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
     )
 
     session: Mapped[AgentSession] = relationship(back_populates="repository")
+
+
+class User(Base):
+    """平台用户主体；认证标识与角色由平台维护。"""
+
+    __tablename__ = "users"
+    __table_args__ = (
+        Index("users_active_role_idx", "is_active", "role"),
+        {"comment": "平台用户：登录主体、角色与启停状态"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
+    )
+    username: Mapped[str] = mapped_column(
+        Text, nullable=False, unique=True, comment="归一化后的登录名"
+    )
+    display_name: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="显示名"
+    )
+    role: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="admin", comment="角色：admin / member"
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa_true(), comment="是否允许登录"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class LocalCredential(Base):
+    """本地密码凭据；未来切外部 IdP 时可以不参与认证。"""
+
+    __tablename__ = "local_credentials"
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "本地用户名密码凭据"}
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="用户主键（1:1）",
+    )
+    password_hash: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="scrypt 密码哈希"
+    )
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", comment="下次登录是否强制改密"
+    )
+    failed_login_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="连续登录失败次数"
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="短时锁定截止时间"
+    )
+    password_changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment="密码最近修改时间",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class UserIdentity(Base):
+    """外部身份映射；本地登录不需要写这张表。"""
+
+    __tablename__ = "user_identities"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_key",
+            "issuer",
+            "subject",
+            name="user_identities_provider_subject_uq",
+        ),
+        Index("user_identities_user_idx", "user_id"),
+        {"comment": "用户与 OIDC / SAML 等外部身份提供商的映射"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="平台用户",
+    )
+    provider_key: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="提供商标识"
+    )
+    issuer: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="外部 issuer"
+    )
+    subject: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="外部稳定 subject"
+    )
+    username: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="外部登录名"
+    )
+    email: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="外部邮箱"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="最近登录时间"
+    )
+
+
+class AuthSession(Base):
+    """平台登录会话；Cookie 只保存随机 token，表中只存哈希。"""
+
+    __tablename__ = "auth_sessions"
+    __table_args__ = (
+        Index("auth_sessions_user_active_idx", "user_id", "revoked_at", "expires_at"),
+        {"comment": "平台登录会话（多 worker 共享）"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, comment="会话主键"
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属用户",
+    )
+    token_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, comment="登录 token 的 SHA-256"
+    )
+    csrf_token_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="CSRF token 的 SHA-256"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="最近访问时间"
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, comment="绝对过期时间"
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="撤销时间"
+    )
+    ip: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="登录 IP"
+    )
+    user_agent: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="登录 User-Agent"
+    )
 
 
 class Plan(Base):
@@ -364,9 +557,16 @@ class ModelEndpoint(Base):
     __tablename__ = "model_endpoints"
     # 用元组包一层：与 ``plans`` 那张表同形，也免得 dict 默认值引出 RUF012（既有告警别新增）
     __table_args__ = (
+        Index("model_endpoints_user_idx", "user_id"),
         {"comment": "模型连接表：按智能体存 base_url / 模型 / key / 窗口"},
     )
 
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="所属用户",
+    )
     agent: Mapped[str] = mapped_column(
         String(32), primary_key=True, comment="智能体键（形态名 / unified / fallback / …）"
     )
@@ -384,6 +584,50 @@ class ModelEndpoint(Base):
         nullable=False,
         server_default="0",
         comment="上下文窗口（tokens）；0 ＝ 没填，按「读到 / 128k」兜",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class UserSetting(Base):
+    """用户级运行配置：代码缓存、默认分支与代码平台凭据。"""
+
+    __tablename__ = "user_settings"
+    __table_args__ = ({"comment": "用户级代码缓存、默认分支与代码平台凭据"},)
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="所属用户",
+    )
+    repo_view_dir: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="代码缓存根目录；空＝~/.ai-coding-harness/users/<user_id>/repo_cache",
+    )
+    gitee_base_branch: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="Gitee 默认分支；空＝按远程探测"
+    )
+    github_base_branch: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="GitHub 默认分支；空＝按远程探测"
+    )
+    gitee_access_token: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="当前用户的 Gitee access token"
+    )
+    gitee_username: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="当前用户的 Gitee git 用户名"
+    )
+    github_access_token: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="当前用户的 GitHub access token"
+    )
+    github_username: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="当前用户的 GitHub git 用户名"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

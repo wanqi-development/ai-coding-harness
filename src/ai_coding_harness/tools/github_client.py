@@ -55,6 +55,15 @@ class GitHubClient:
             "X-GitHub-Api-Version": API_VERSION,
         }
 
+    def _optional_auth_headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": API_VERSION,
+        }
+        if self._repo.token:
+            headers["Authorization"] = f"Bearer {self._repo.token}"
+        return headers
+
     def _check_configured(self) -> str | None:
         if not self._repo.token:
             return missing_token_message(self._repo)
@@ -131,6 +140,26 @@ class GitHubClient:
         url = f"{self._base_url}/repos/{owner}/{repo}/pulls/{number}"
         async with self._client() as client:
             resp = await client.get(url, headers=self._auth_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_repo(self, *, owner: str, repo: str) -> dict:
+        """Check repository visibility/access using the caller's token when present."""
+        url = f"{self._base_url}/repos/{owner}/{repo}"
+        async with self._client() as client:
+            resp = await client.get(url, headers=self._optional_auth_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_user(self) -> dict:
+        """Check that the configured token itself is valid."""
+        err = self._check_configured()
+        if err:
+            return {"error": err}
+        async with self._client() as client:
+            resp = await client.get(
+                f"{self._base_url}/user", headers=self._auth_headers()
+            )
         resp.raise_for_status()
         return resp.json()
 

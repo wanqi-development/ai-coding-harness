@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from ai_coding_harness.server.pr_workspace import (
     pull_head,
+    pull_refs,
     sync_command,
     sync_pull_workspace,
     target_pull,
@@ -43,6 +44,19 @@ def test_sync_command_quotes_user_controlled_branch_names() -> None:
 def test_pull_head_tolerates_missing_payload() -> None:
     assert pull_head({"head": None}) == ("", "")
     assert pull_head(_pull(1)) == ("feature/x", "a" * 40)
+
+
+def test_pull_refs_prefers_branches_and_falls_back_to_shas() -> None:
+    pull = {
+        "base": {"ref": "main", "sha": "b" * 40},
+        "head": {"ref": "feature/x", "sha": "a" * 40},
+    }
+
+    assert pull_refs(pull) == {"base": "main", "head": "feature/x"}
+    assert pull_refs(
+        {"base": {"sha": "b" * 40}, "head": {"sha": "a" * 40}}
+    ) == {"base": "b" * 40, "head": "a" * 40}
+    assert pull_refs({"base": None, "head": {"ref": "x"}}) is None
 
 
 async def test_sync_reports_dirty_worktree_without_entering_agent() -> None:

@@ -3,6 +3,12 @@
 # 密码取会话令牌文件。
 # 与平台无关 —— 令牌来自 Gitee 还是 GitHub 由会话注入，脚本不关心。
 case "$1" in
-  Username*) echo "${GIT_USERNAME:-oauth2}" ;;
-  Password*) cat /ai_coding/.secrets/git_token ;;
+  Username*)
+    if [ -r /ai_coding/.secrets/git_username ]; then
+      cat /ai_coding/.secrets/git_username
+    else
+      echo "${GIT_USERNAME:-oauth2}"
+    fi
+    ;;
+  Password*) cat /ai_coding/.secrets/git_token 2>/dev/null || true ;;
 esac

@@ -39,14 +39,19 @@ class TurnChangesMixin:
         if not base or not head:
             return None
         spec = RepoSpec.from_session(session)
+        settings = (
+            self._manager.settings_for(session)
+            if hasattr(self._manager, "settings_for")
+            else self._settings
+        )
         try:
-            if not repo_cache.is_cloned(self._settings, spec):
+            if not repo_cache.is_cloned(settings, spec):
                 return None
             try:
-                files = await repo_cache.compare(self._settings, spec, base=base, head=head)
+                files = await repo_cache.compare(settings, spec, base=base, head=head)
             except RepoViewError:
-                await repo_cache.sync(self._settings, spec)
-                files = await repo_cache.compare(self._settings, spec, base=base, head=head)
+                await repo_cache.sync(settings, spec)
+                files = await repo_cache.compare(settings, spec, base=base, head=head)
         except Exception:
             logger.exception("算这一轮的改动失败（本轮照常收尾）")
             return None

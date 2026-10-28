@@ -195,3 +195,28 @@ async def test_a_round_without_a_pull_request_has_no_changes_frame(monkeypatch):
 
     assert [e for e in out if e["type"] == "changes"] == []
     assert called["n"] == 0, "没建 PR 就不该去算"
+
+
+async def test_rework_uses_the_target_pull_refs_for_changes(monkeypatch):
+    """rework 不建 PR，但目标 PR 的 base/head 同样能定位这一轮的改动。"""
+    from tests.test_plan_events import _run
+
+    async def fake_changes(self, session, pr_refs):
+        assert pr_refs == {"base": "main", "head": "feature/rework"}
+        return {
+            "base": "main",
+            "head": "feature/rework",
+            "files": [{"path": "b.py", "added": 2, "deleted": 1, "status": "M"}],
+        }
+
+    monkeypatch.setattr(HarnessService, "_changes_for_round", fake_changes)
+
+    out = await _run(
+        [],
+        intent="rework",
+        initial_pr_refs={"base": "main", "head": "feature/rework"},
+    )
+
+    changes = [e for e in out if e["type"] == "changes"]
+    assert len(changes) == 1
+    assert changes[0]["changes"]["files"][0]["path"] == "b.py"

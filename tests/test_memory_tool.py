@@ -23,7 +23,7 @@ from ai_coding_harness.tools.git import GiteeRepo
 from ai_coding_harness.tools.register import build_main_tools
 
 REPO = GiteeRepo(owner="acme", repo="demo", token="test-token")
-PATH = "/memories/acme/demo.md"
+PATH = "/memories/gitee/acme/demo.md"
 
 #: 钉住的写盘时刻：落盘时的时间戳由平台现取，不钉住就断言不了。
 STAMP = "2026-10-20 09:41"
@@ -335,7 +335,7 @@ async def test_legacy_tables_are_dropped_on_write():
 
 
 def test_path_comes_from_the_shared_helper():
-    assert memory_path("acme", "demo") == PATH
+    assert memory_path("gitee", "acme", "demo") == PATH
 
 
 def test_the_tool_description_documents_the_sections():

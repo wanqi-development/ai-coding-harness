@@ -111,8 +111,11 @@ class OpenSandboxProxy:
         *,
         cwd: str | None = None,
         timeout: timedelta | None = None,
+        envs: dict[str, str] | None = None,
     ) -> CommandResult:
-        return await self._call(lambda c: c.run(command, cwd=cwd, timeout=timeout))
+        return await self._call(
+            lambda c: c.run(command, cwd=cwd, timeout=timeout, envs=envs)
+        )
 
     async def write_file(self, path: str, content: str) -> None:
         await self._call(lambda c: c.write_file(path, content))

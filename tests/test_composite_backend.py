@@ -61,14 +61,23 @@ class TestTheRepoMemoryIsReadableBack:
         store = InMemoryStore()
         backend = _build(store)
 
-        asyncio.run(backend.awrite(memory_path(MEM_OWNER, MEM_REPO), MEMORY))
+        asyncio.run(backend.awrite(memory_path("gitee", MEM_OWNER, MEM_REPO), MEMORY))
 
-        assert memory_store_key(MEM_OWNER, MEM_REPO) == f"/{MEM_OWNER}/{MEM_REPO}.md"
-        assert store.get(MEMORIES_NAMESPACE, memory_store_key(MEM_OWNER, MEM_REPO)) is not None
-        assert asyncio.run(read_memory(store, MEM_OWNER, MEM_REPO)) == MEMORY
+        assert (
+            memory_store_key("gitee", MEM_OWNER, MEM_REPO)
+            == f"/gitee/{MEM_OWNER}/{MEM_REPO}.md"
+        )
+        assert (
+            store.get(MEMORIES_NAMESPACE, memory_store_key("gitee", MEM_OWNER, MEM_REPO))
+            is not None
+        )
+        assert asyncio.run(read_memory(store, "gitee", MEM_OWNER, MEM_REPO)) == MEMORY
 
     def test_a_repo_without_memory_reads_as_none(self):
-        assert asyncio.run(read_memory(InMemoryStore(), "nobody", "nothing")) is None
+        assert (
+            asyncio.run(read_memory(InMemoryStore(), "gitee", "nobody", "nothing"))
+            is None
+        )
 
 
 class TestTheTwoOverflowPrefixesArePersistent:

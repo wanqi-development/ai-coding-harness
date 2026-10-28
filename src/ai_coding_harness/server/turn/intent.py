@@ -6,12 +6,13 @@ from collections.abc import Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
-from ai_coding_harness.agent.llm import build_classifier_model
+from ai_coding_harness.agent.llm import build_classifier_model, intent_mode_for
 from ai_coding_harness.db import dao
 from ai_coding_harness.server.intent import (
     PREVIOUS_REPLY_CHARS,
     PREVIOUS_REPLY_SLACK,
     IntentDecision,
+    build_jev_decider,
     detect_intent,
     tail_excerpt,
 )
@@ -30,23 +31,46 @@ logger = logging.getLogger(__name__)
 class TurnIntentMixin:
     """intent 相关方法（由 HarnessService 组合）。"""
 
-    def _classifier_for(self) -> BaseChatModel | None:
+    def _classifier_for(self, user_id: int | None) -> BaseChatModel | None:
         """分类模型实例；未启用或构建失败时返回 None（退回纯关键字判定）。"""
         if not self._settings.intent_llm_enabled:
             return None
-        if self._classifier is None:
+        if user_id is None:
+            if self._classifier is None:
+                try:
+                    self._classifier = build_classifier_model(self._settings)
+                except Exception:
+                    logger.exception("意图分类模型构建失败，退回关键字判定")
+                    return None
+            return self._classifier
+        cached = self._classifiers_by_user.get(user_id)
+        if cached is None:
             try:
-                self._classifier = build_classifier_model(self._settings)
+                cached = build_classifier_model(self._settings, user_id=user_id)
+                self._classifiers_by_user[user_id] = cached
             except Exception:
                 logger.exception("意图分类模型构建失败，退回关键字判定")
                 return None
-        return self._classifier
+        return cached
+
+    def _jev_for(self, user_id: int | None):
+        if self._intent_jev is not None:
+            return self._intent_jev
+        if user_id is None:
+            return None
+        cached = self._intent_jev_by_user.get(user_id)
+        if cached is None:
+            cached = build_jev_decider(self._settings, user_id=user_id)
+            if cached is not None:
+                self._intent_jev_by_user[user_id] = cached
+        return cached
 
     async def _repo_snapshot(self, session: Session) -> PullSnapshot | None:
         """每轮实时查一次 PR 列表；失败时只保留只读问答候选。"""
         try:
+            settings = self._manager.settings_for(session)
             return await load_pull_snapshot(
-                self._settings,
+                settings,
                 session.repo,
                 database=self._db,
                 session_id=session.db_id,
@@ -146,6 +170,7 @@ class TurnIntentMixin:
         dialogue: Sequence[Mapping[str, str]] = (),
         allowed_intents: Sequence[str] | None = None,
         repo_state: str | None = None,
+        user_id: int | None = None,
     ) -> IntentDecision:
         """判定本轮意图：口令 → JEV → 大模型（都带最近几轮用户消息）→ 关键字口径。
 
@@ -155,8 +180,8 @@ class TurnIntentMixin:
         return await detect_intent(
             message,
             history=history,
-            jev=self._intent_jev,
-            model=self._classifier_for(),
+            jev=self._jev_for(user_id),
+            model=self._classifier_for(user_id),
             timeout=self._settings.intent_timeout_seconds,
             usage=self._intent_usage,
             previous_reply=previous_reply,
@@ -165,7 +190,7 @@ class TurnIntentMixin:
             allowed_intents=allowed_intents,
             repo_state=repo_state,
             # 意图识别走哪一关：jev（三关，默认）/ llm（三关，不碰 JEV）—— 见 intent.detect_intent
-            mode=self._settings.intent_mode,
+            mode=intent_mode_for(self._settings, user_id),
         )
 
     async def _rejudge_intent(
@@ -200,11 +225,12 @@ class TurnIntentMixin:
             previous_intent = await self._last_intent(session)
         if dialogue is None and session is not None:
             dialogue = await self._dialogue(session)
+        user_id = getattr(session, "user_id", None) if session is not None else None
         return await detect_intent(
             message,
             history=history,
-            jev=self._intent_jev,
-            model=self._classifier_for(),
+            jev=self._jev_for(user_id),
+            model=self._classifier_for(user_id),
             timeout=self._settings.intent_timeout_seconds,
             force_llm=True,
             usage=self._intent_usage,
@@ -213,4 +239,5 @@ class TurnIntentMixin:
             dialogue=dialogue or (),
             allowed_intents=allowed_intents,
             repo_state=repo_state,
+            mode=intent_mode_for(self._settings, user_id),
         )

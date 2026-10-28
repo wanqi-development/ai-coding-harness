@@ -49,6 +49,20 @@ def make_session() -> Session:
 class FakeClient:
     def __init__(self, client_id: str) -> None:
         self.id = client_id
+        self.healthy = True
+        self.run_calls: list[tuple[str, dict[str, str] | None]] = []
+        self.renewed = 0
+
+    async def is_healthy(self) -> bool:
+        return self.healthy
+
+    async def renew(self, timeout):
+        self.renewed += 1
+        return SimpleNamespace(expires_at=None)
+
+    async def run(self, command, *, cwd=None, timeout=None, envs=None):
+        self.run_calls.append((command, envs))
+        return SimpleNamespace(ok=True, stderr="", text="")
 
 
 class _NullSession:
@@ -91,6 +105,7 @@ class FakeProvider:
         self.delay = delay
         self.gate: asyncio.Event | None = None
         self.created: list[str] = []
+        self.clients: list[FakeClient] = []
         self.created_with: list[tuple] = []
         self.reconnected: list[str] = []
         self.destroyed: list[str] = []
@@ -110,20 +125,27 @@ class FakeProvider:
         if self.fail_times > 0:
             self.fail_times -= 1
             raise RuntimeError("opensandbox 503")
-        return FakeClient(client_id)
+        client = FakeClient(client_id)
+        self.clients.append(client)
+        return client
 
     async def reconnect(self, sandbox_id: str | None):
         if sandbox_id is None or not self.reconnectable:
             return None
         self.reconnected.append(sandbox_id)
         await self._blocking_point()
-        return FakeClient(sandbox_id)
+        client = FakeClient(sandbox_id)
+        self.clients.append(client)
+        return client
 
     async def destroy(self, client) -> None:
         self.destroyed.append(client.id)
 
     async def terminate(self, sandbox_id: str) -> None:
         self.terminated.append(sandbox_id)
+
+    async def install_runtime_assets(self, client) -> None:
+        pass
 
 
 @pytest.fixture
@@ -210,6 +232,34 @@ async def test_ensure_reuses_ready_runtime(recorder: Recorder) -> None:
     await mgr.ensure_runtime(session)
 
     assert provider.created == ["sb-new-1"], "已有运行时不该再建一次"
+
+
+async def test_changed_credentials_refresh_the_existing_sandbox(recorder: Recorder) -> None:
+    provider = FakeProvider()
+    mgr = make_manager(provider)
+    original = Session(
+        public_id=PUBLIC_ID,
+        db_id=DB_ID,
+        repo=GiteeRepo(owner="owner", repo="repo", token="old", git_username="alice"),
+        repo_url="https://gitee.com/owner/repo.git",
+        credential_version=1,
+    )
+    runtime = await mgr.ensure_runtime(original)
+    updated = Session(
+        public_id=PUBLIC_ID,
+        db_id=DB_ID,
+        repo=GiteeRepo(owner="owner", repo="repo", token="new", git_username="alice2"),
+        repo_url=original.repo_url,
+        credential_version=2,
+    )
+
+    assert await mgr.ensure_runtime(updated) is runtime
+
+    assert provider.created == ["sb-new-1"], "凭据刷新不该重建沙箱"
+    assert provider.clients[0].run_calls == [
+        (mgr._settings.sandbox_setup_command, {"GIT_TOKEN": "new", "GIT_USERNAME": "alice2"})
+    ]
+    assert runtime.credential_version == 2
 
 
 async def test_the_dependency_cache_volumes_ride_along(recorder: Recorder) -> None:

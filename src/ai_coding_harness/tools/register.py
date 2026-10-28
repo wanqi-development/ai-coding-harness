@@ -118,6 +118,7 @@ def build_main_tools(
                 t.name: t
                 for t in build_memory_tools(
                     MemoryContext(
+                        platform=repo.platform.value,
                         owner=repo.owner,
                         repo=repo.repo,
                         backend=backend,

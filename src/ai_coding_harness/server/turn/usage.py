@@ -57,7 +57,8 @@ class TurnUsageMixin:
             compressions += run_log.compressions
         if commit:
             self._context_state[key] = [latest, compressions]
-        window = _main_window(self._settings, intent)
+        user_id = getattr(session, "user_id", None)
+        window = _main_window(self._settings, intent, user_id)
         return {
             # ``input`` 是**最近一次主控调用**的输入；老记录里这一格叫 ``max_input``，
             # 前端读 ``input ?? max_input`` 兼容它们。
@@ -92,7 +93,9 @@ class TurnUsageMixin:
             interrupted=interrupted,
             context=self._turn_context(session, intent, run_log, commit=commit_context),
         )
-        snapshot["model"] = _main_model(self._settings, intent)
+        snapshot["model"] = _main_model(
+            self._settings, intent, getattr(session, "user_id", None)
+        )
         if self._intent_usage.get("calls"):
             call = {
                 "input": int(self._intent_usage.get("input", 0)),

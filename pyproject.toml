@@ -25,6 +25,7 @@ dependencies = [
     # 多 worker 时的跨进程旁路状态（运行缓冲 / 会话运行权 / 熔断状态）。
     # 不配 REDIS_URL 时用不到它 —— 代码里是懒 import，单 worker 部署照旧跑。
     "redis>=5.0",
+    "cryptography>=42",
     "sqlalchemy[asyncio]",
     "alembic",
     "fastapi",

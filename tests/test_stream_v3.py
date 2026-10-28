@@ -593,8 +593,8 @@ def test_a_longer_title_still_matches_by_prefix() -> None:
     assert out[0]["items"][0]["children"] == [T("写码")]
 
 
-def test_the_attachment_survives_a_full_rewrite_of_the_parent_title() -> None:
-    """挂上之后锚定那一项：标题被整句改写、清单条数没变时沿用原位，不漂到树尾。"""
+def test_a_removed_parent_drops_the_child_progress() -> None:
+    """主控把“实施”改成“核对反馈”后，旧 coder 清单没有当前落点，直接丢掉。"""
     tr = V3Translator()
     tr.feed(todo_start())
     tr.feed(todo_finish([{"content": "实施用户资料编辑代码并提 PR", "status": "in_progress"}]))
@@ -603,14 +603,14 @@ def test_the_attachment_survives_a_full_rewrite_of_the_parent_title() -> None:
     tr.feed(todo_start(ns=ns, agent="coder"))
     tr.feed(todo_finish([T("写码")], ns=ns, agent="coder"))
 
-    out = tr.feed(todo_finish([{"content": "编码：用户资料编辑（PR #9）", "status": "completed"}]))
+    out = tr.feed(todo_finish([{"content": "核对 coder 的反馈", "status": "in_progress"}]))
     items = out[0]["items"]
-    assert len(items) == 1, "整句改写后仍挂原项，不许多出容器"
-    assert items[0]["children"] == [T("写码")]
+    assert items == [T("核对 coder 的反馈", "in_progress")]
+    assert "children" not in items[0]
 
 
 def test_an_ambiguous_title_does_not_get_guessed() -> None:
-    """两串归一到同一个键时不硬认：宁可落树尾容器，也不能挂到别的父项下面。"""
+    """两串归一到同一个键时不硬认：宁可丢掉子清单，也不能挂到别的父项下面。"""
     tr = V3Translator()
     tr.feed(todo_start())
     tr.feed(todo_finish([{"content": "实施用户资料编辑代码并提 PR", "status": "in_progress"}]))
@@ -627,11 +627,11 @@ def test_an_ambiguous_title_does_not_get_guessed() -> None:
     tr.feed(todo_start(ns=ns, agent="coder"))
     items = tr.feed(todo_finish([T("写码")], ns=ns, agent="coder"))[0]["items"]
     assert items[0].get("children") is None
-    assert items[-1]["content"] == "编码子任务"
+    assert len(items) == 2, "不额外生成历史容器"
 
 
 def test_a_short_title_is_not_prefix_matched() -> None:
-    """短标题不走前缀认亲：`改代码` 与 `改代码并提交` 可能是两件事，宁可落容器。"""
+    """短标题不走前缀认亲：`改代码` 与 `改代码并提交` 可能是两件事，宁可丢子清单。"""
     tr = V3Translator()
     tr.feed(todo_start())
     tr.feed(todo_finish([{"content": "改代码", "status": "in_progress"}]))
@@ -641,7 +641,7 @@ def test_a_short_title_is_not_prefix_matched() -> None:
     tr.feed(todo_start(ns=ns, agent="coder"))
     items = tr.feed(todo_finish([T("写码")], ns=ns, agent="coder"))[0]["items"]
     assert items[0].get("children") is None
-    assert items[-1]["content"] == "编码子任务"
+    assert len(items) == 1
 
 
 def test_falls_back_to_the_last_unfinished_item() -> None:
@@ -657,8 +657,8 @@ def test_falls_back_to_the_last_unfinished_item() -> None:
     assert out[0]["items"][1]["children"] == [T("子")]
 
 
-def test_child_todos_without_a_parent_get_a_container() -> None:
-    """主清单为空（本轮压根没建）时不再整份丢弃：树尾补容器项兜住子清单。"""
+def test_child_todos_without_a_parent_are_dropped() -> None:
+    """主清单为空时没有当前进度落点，子清单不显示。"""
     tr = V3Translator()
     tr.note_delegation(tool_start("task", call_id="t1", input={"subagent_type": "coder"}))
     ns = sub_ns("t1")
@@ -666,51 +666,29 @@ def test_child_todos_without_a_parent_get_a_container() -> None:
     out = tr.feed(
         todo_finish([T("写码"), T("测试")], ns=ns, agent="coder")
     )
-    assert out == [
-        {
-            "type": "todos",
-            "items": [
-                {
-                    "content": "编码子任务",
-                    "status": "pending",
-                    "children": [T("写码"), T("测试")],
-                }
-            ],
-        }
-    ]
-    # 前端与历史回放吃的是 parts，容器也要落进那一份
-    assert tr.parts.data[-1]["items"] == out[0]["items"]
-    assert tr.parts.has_todos is True
+    assert out == []
+    assert tr.parts.data == []
+    assert tr.parts.has_todos is False
 
 
-def test_container_name_falls_back_when_task_args_are_unusable() -> None:
-    """两处都取不到名字时才用兜底名，容器不能没名字。
-
-    名字有两个来源：``task`` 入参的 ``subagent_type``，与子智能体自报的
-    ``lc_agent_name``（见 ``_note_child_agent``）。这里把**两个**都弄坏 —— 入参不是 dict、
-    子事件也不带名字（``agent="None"`` 是主控那份占位值）。
-    """
+def test_an_unusable_delegation_without_a_parent_produces_nothing() -> None:
+    """委派与父项都认不出时不造兜底容器。"""
     tr = V3Translator()
     tr.note_delegation(tool_start("task", call_id="t1", input="not-a-dict"))
     ns = sub_ns("t1")
     tr.feed(todo_start(ns=ns, agent="None"))
-    out = tr.feed(todo_finish([T("子")], ns=ns, agent="None"))
-    assert out[0]["items"][0]["content"] == "子智能体任务"
+    assert tr.feed(todo_finish([T("子")], ns=ns, agent="None")) == []
 
 
-def test_the_child_name_comes_from_the_child_itself() -> None:
-    """真机上两套 id 对不上（namespace 是 langgraph 的 task id，``task`` 入参那串是
-    ``call_xxx``），所以名字必须从**子智能体自报的** ``lc_agent_name`` 取 —— 它和子清单
-    用的是同一个 namespace 键，天然对得上。"""
+def test_a_child_without_a_current_parent_produces_nothing() -> None:
+    """真机两套 id 不同时，只要父清单不存在，子清单也不产生独立节点。"""
     tr = V3Translator()
     # 委派那帧的 call_id 与子智能体的 namespace id **故意不同**（真机就是这样）
     tr.note_delegation(tool_start("task", call_id="call_abc", input={"subagent_type": "coder"}))
     ns = sub_ns("uuid-1234")
 
     tr.feed(todo_start(ns=ns, agent="coder"))
-    out = tr.feed(todo_finish([T("写码")], ns=ns, agent="coder"))
-
-    assert out[0]["items"][0]["content"] == "编码子任务"
+    assert tr.feed(todo_finish([T("写码")], ns=ns, agent="coder")) == []
 
 
 def test_the_child_list_attaches_even_when_the_ids_differ() -> None:
@@ -767,8 +745,8 @@ def test_two_delegations_of_the_same_role_are_claimed_in_order() -> None:
     ]
 
 
-def test_a_role_without_a_matching_delegation_gets_a_container() -> None:
-    """没有对应委派（角色对不上）就不硬认领：照旧在树尾补容器，名字仍是它自己的角色名。"""
+def test_a_role_without_a_matching_delegation_is_not_attached() -> None:
+    """没有对应委派（角色对不上）就不硬认领，也不另造容器。"""
     tr = V3Translator()
     tr.feed(todo_start())
     tr.feed(todo_finish([{"content": "第一步", "status": "in_progress"}]))
@@ -780,45 +758,11 @@ def test_a_role_without_a_matching_delegation_gets_a_container() -> None:
 
     items = out[0]["items"]
     assert items[0].get("children") is None, "没认领到就不挂靠"
-    assert items[-1]["content"] == "评审子任务"
-    assert items[-1]["children"] == [T("审出来的")]
+    assert len(items) == 1
 
 
-def test_container_name_is_the_chinese_role_label() -> None:
-    """容器那行是给用户看的，三个角色翻成中文，不摊 ``coder`` 这种内部名。"""
-
-    def title_for(role: str) -> str:
-        tr = V3Translator()
-        tr.note_delegation(tool_start("task", call_id="t1", input={"subagent_type": role}))
-        ns = sub_ns("t1")
-        tr.feed(todo_start(ns=ns, agent=role))
-        return tr.feed(todo_finish([T("子")], ns=ns, agent=role))[0]["items"][0]["content"]
-
-    assert title_for("planner") == "规划子任务"
-    assert title_for("coder") == "编码子任务"
-    assert title_for("reviewer") == "评审子任务"
-    # 表里还没写的角色不能塌成兜底话：名字照旧带上，看得出是什么
-    assert title_for("changelog-writer") == "「changelog-writer」子任务"
-
-
-def test_container_status_follows_its_children() -> None:
-    """容器是展示壳，状态由子项汇总 —— 不写死 in_progress，免得收尾时永久停住。"""
-    tr = V3Translator()
-    tr.note_delegation(tool_start("task", call_id="t1", input={"subagent_type": "coder"}))
-    ns = sub_ns("t1")
-    tr.feed(todo_start(ns=ns, agent="coder"))
-
-    def status_of(items: list[dict]) -> str:
-        return tr.feed(todo_finish(items, ns=ns, agent="coder"))[0]["items"][0]["status"]
-
-    assert status_of([T("甲"), T("乙")]) == "pending"
-    assert status_of([T("甲", "in_progress"), T("乙")]) == "in_progress"
-    assert status_of([T("甲", "completed"), T("乙")]) == "pending"
-    assert status_of([T("甲", "completed"), T("乙", "completed")]) == "completed"
-
-
-def test_container_coexists_with_the_main_list() -> None:
-    """主清单已全部完成之后才委派：容器与主清单并存，且排在主清单后面。"""
+def test_no_parent_means_only_the_current_main_list_is_shown() -> None:
+    """主清单全部完成后再出现无落点的子清单，只展示主清单本身。"""
     tr = V3Translator()
     tr.feed(todo_start())
     tr.feed(todo_finish([T("都做完了", "completed")]))
@@ -826,19 +770,11 @@ def test_container_coexists_with_the_main_list() -> None:
     ns = sub_ns("t1")
     tr.feed(todo_start(ns=ns, agent="coder"))
     out = tr.feed(todo_finish([T("子")], ns=ns, agent="coder"))
-    assert out[0]["items"] == [
-        T("都做完了", "completed"),
-        {"content": "编码子任务", "status": "pending", "children": [T("子")]},
-    ]
+    assert out[0]["items"] == [T("都做完了", "completed")]
 
 
-def test_a_renamed_main_item_keeps_its_children() -> None:
-    """主项被整句改写：挂上过就锚在这一项上，别再漂到树尾。
-
-    旧口径是「文字认不出就落容器」，于是主控每改写一次标题子树就漂一次（2026-09-27 实见）。
-    现在只要主清单**条数没变**就沿用挂上时的位置 —— 模型改的通常是措辞，不是把这一项删了；
-    条数变了（项被拆开 / 删掉）就不敢猜，照旧走容器兜底。
-    """
+def test_a_fully_rewritten_main_item_drops_its_children() -> None:
+    """主项完全改写且没有等价文字线索时视为已取消，旧子清单不再沿用原位。"""
     tr = V3Translator()
     tr.feed(todo_start())
     tr.feed(todo_finish([T("改代码", "in_progress")]))
@@ -848,19 +784,17 @@ def test_a_renamed_main_item_keeps_its_children() -> None:
     tr.feed(todo_finish([T("子")], ns=ns, agent="coder"))
 
     out = tr.feed(todo_finish([T("重构代码", "in_progress")]))
-    assert out[0]["items"] == [
-        {**T("重构代码", "in_progress"), "children": [T("子")]},
-    ]
+    assert out[0]["items"] == [T("重构代码", "in_progress")]
 
 
-def test_an_empty_sub_list_gets_no_container() -> None:
-    """子清单为空（参数还没流全、或模型给了空数组）：不补空壳容器。"""
+def test_an_empty_sub_list_produces_nothing_without_a_main_list() -> None:
+    """子清单为空且没有主清单：不造空树或空壳容器。"""
     tr = V3Translator()
     tr.note_delegation(tool_start("task", call_id="t1", input={"subagent_type": "coder"}))
     ns = sub_ns("t1")
     tr.feed(todo_start(ns=ns, agent="coder"))
-    assert tr.feed(todo_finish([], ns=ns, agent="coder"))[0]["items"] == []
-    assert tr.parts.has_todos is True
+    assert tr.feed(todo_finish([], ns=ns, agent="coder")) == []
+    assert tr.parts.has_todos is False
 
 
 def test_deeply_nested_child_todos_are_still_dropped() -> None:
@@ -875,7 +809,7 @@ def test_deeply_nested_child_todos_are_still_dropped() -> None:
 def test_note_delegation_ignores_other_tools_and_nested_agents() -> None:
     """只认主智能体发的 ``task``；别的工具、子智能体自己发的 task 都不记。
 
-    没记 = 没有落点，这份子清单于是走容器兜底 —— 关键是它**不会**挂到「做」下面。
+    没记 = 没有落点，这份子清单直接丢弃 —— 关键是它**不会**挂到「做」下面。
     """
     tr = V3Translator()
     tr.feed(todo_start())
@@ -885,13 +819,7 @@ def test_note_delegation_ignores_other_tools_and_nested_agents() -> None:
     tr.feed(todo_start(ns=sub_ns("t1"), agent="coder"))
     out = tr.feed(todo_finish([{"content": "子"}], ns=sub_ns("t1"), agent="coder"))
     assert out[0]["items"][0] == {"content": "做", "status": "in_progress"}
-    assert out[0]["items"][1] == {
-        # 名字取自子智能体自报的 lc_agent_name（这一轮它没认领到委派 —— 那次 task 是
-        # 在子智能体里发的，note_delegation 按设计忽略它 —— 所以仍走容器兜底）
-        "content": "编码子任务",
-        "status": "pending",
-        "children": [{"content": "子", "status": "pending"}],
-    }
+    assert len(out[0]["items"]) == 1
 
 
 def test_message_start_resets_block_index() -> None:

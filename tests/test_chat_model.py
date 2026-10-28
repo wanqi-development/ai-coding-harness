@@ -160,6 +160,26 @@ def test_an_existing_reasoning_block_is_not_duplicated() -> None:
     assert len(reasoning) == 1
 
 
+def test_responses_reasoning_summary_block_is_already_protocol_ready() -> None:
+    """Responses API 直接给 reasoning block；不要再把它改写成第三方 kwargs 形状。"""
+    message = ReasoningAIMessageChunk(
+        content=[
+            {
+                "type": "reasoning",
+                "reasoning": "先定位依赖版本，再检查 Timeout 构造参数。",
+            }
+        ],
+        response_metadata={"model_provider": "openai", "output_version": "v1"},
+    )
+
+    assert message.content_blocks == [
+        {
+            "type": "reasoning",
+            "reasoning": "先定位依赖版本，再检查 Timeout 构造参数。",
+        }
+    ]
+
+
 def test_build_model_uses_the_reasoning_client() -> None:
     settings = Settings(
         _env_file=None,

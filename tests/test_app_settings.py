@@ -46,8 +46,6 @@ class TestTheKeyTable:
 
         assert len(set(keys)) == len(keys), "键是表主键"
         assert {item.group for item in RUNTIME_SETTINGS} == {
-            "代码缓存配置",
-            "代码平台",
             "上下文窗口配置",
             "上下文压缩配置",
             "意图识别",
@@ -59,22 +57,10 @@ class TestTheKeyTable:
     def test_only_the_four_kinds_are_used(self):
         assert {item.kind for item in RUNTIME_SETTINGS} <= {"str", "int", "float", "secret"}
 
-    def test_the_platform_tokens_are_secrets(self):
-        for key in ("gitee_access_token", "github_access_token"):
-            assert RUNTIME_SETTING_BY_KEY[key].kind == "secret", key
-
-
 # -- 二、类型转换与落值 --------------------------------------------------------
 
 
 class TestCoercion:
-    def test_strings_are_stripped_and_empty_is_legal(self):
-        """空串对字符串是合法值：默认分支留空＝按远程探测。"""
-        item = RUNTIME_SETTING_BY_KEY["gitee_base_branch"]
-
-        assert coerce_runtime_setting(item, "  dev  ") == "dev"
-        assert coerce_runtime_setting(item, "") == ""
-
     def test_numbers_are_cast_and_bad_values_raise(self):
         assert coerce_runtime_setting(RUNTIME_SETTING_BY_KEY["context_warn_ratio"], "0.75") == 0.75
         assert coerce_runtime_setting(RUNTIME_SETTING_BY_KEY["context_warn_ratio"], 0.7) == 0.7
@@ -88,11 +74,10 @@ class TestApplying:
 
         apply_runtime_settings(
             settings,
-            {"context_alert_ratio": 0.9, "repo_view_dir": "/x", "context_warn_ratio": 0.5},
+            {"context_alert_ratio": 0.9, "context_warn_ratio": 0.5},
         )
 
         assert settings.context_alert_ratio == 0.9
-        assert settings.repo_view_dir == "/x"
         assert settings.context_warn_ratio == 0.5
 
     def test_a_broken_row_does_not_take_the_others_down(self):
@@ -100,10 +85,9 @@ class TestApplying:
 
         apply_runtime_settings(
             settings,
-            {"nope": 1, "context_alert_ratio": "坏值", "repo_view_dir": "/keep"},
+            {"nope": 1, "context_alert_ratio": "坏值"},
         )
 
-        assert settings.repo_view_dir == "/keep"
         assert settings.context_alert_ratio == _settings().context_alert_ratio, "坏值跳过，保留原值"
 
 
@@ -160,8 +144,8 @@ class TestApi:
         assert set(by_key) == {item.key for item in RUNTIME_SETTINGS}
         assert by_key["context_warn_ratio"]["source"] == "default"
         assert by_key["context_warn_ratio"]["group"] == "上下文窗口配置"
-        assert by_key["repo_view_dir"]["kind"] == "str"
-        assert [item["group"] for item in body["items"]].count("代码缓存配置") == 3
+        assert "repo_view_dir" not in by_key
+        assert "gitee_base_branch" not in by_key
         assert [item["group"] for item in body["items"]].count("上下文窗口配置") == 2, (
             "上下文那一组**只留两条阈值**（窗口本身按模型查，2026-10-14 用户口径）"
         )
@@ -190,13 +174,13 @@ class TestApi:
 
     async def test_a_stored_value_is_applied_on_read(self, monkeypatch):
         """直接改库之后打开这一页也是新的：GET 会把库里的值重新落一遍。"""
-        store: dict[str, Any] = {"repo_view_dir": "/tmp/别处"}
+        store: dict[str, Any] = {"context_warn_ratio": 0.66}
         settings = _settings()
         _patch_dao(monkeypatch, store)
 
         await _call(_app(settings, store), "GET", "/app-settings")
 
-        assert settings.repo_view_dir == "/tmp/别处"
+        assert settings.context_warn_ratio == 0.66
 
     async def test_an_unknown_key_or_a_bad_value_is_a_400_and_writes_nothing(self, monkeypatch):
         store: dict[str, Any] = {}
@@ -210,84 +194,6 @@ class TestApi:
 
         assert unknown.status_code == 400 and bad.status_code == 400
         assert store == {}, "坏请求不落半格"
-
-    async def test_an_empty_string_clears_the_override(self, monkeypatch):
-        """默认分支那类：填空串＝回到「按远程探测」（这也是合法值，不能当没填）。"""
-        store: dict[str, Any] = {"gitee_base_branch": "dev"}
-        settings = _settings(gitee_base_branch="dev")
-        _patch_dao(monkeypatch, store)
-
-        body = (
-            await _call(
-                _app(settings, store),
-                "PUT",
-                "/app-settings",
-                json={"items": {"gitee_base_branch": ""}},
-            )
-        ).json()
-
-        assert store["gitee_base_branch"] == ""
-        assert settings.gitee_base_branch == ""
-        assert {i["key"]: i for i in body["items"]}["gitee_base_branch"]["source"] == "db"
-
-
-class TestSecrets:
-    """令牌那两格（2026-10-20 用户口径）：打开设置页回掩码，保存之后不再回显。"""
-
-    def _app_with_token(self, monkeypatch, token: str = "ghp_0123456789abcdef"):
-        store: dict[str, Any] = {}
-        settings = _settings(github_access_token=token)
-        _patch_dao(monkeypatch, store)
-        return _app(settings, store), settings, store
-
-    async def test_get_echoes_a_mask_not_the_value(self, monkeypatch):
-        app = self._app_with_token(monkeypatch)[0]
-
-        body = (await _call(app, "GET", "/app-settings")).json()
-
-        item = {i["key"]: i for i in body["items"]}["github_access_token"]
-        assert item["kind"] == "secret"
-        assert item["value"] == "ghp…cdef"
-        assert item["has_value"] is True
-        assert "0123456789abcdef" not in str(body), "明文一个字节都不该出现在响应里"
-
-    async def test_put_does_not_echo_the_token(self, monkeypatch):
-        app, settings_, store = self._app_with_token(monkeypatch, token="")
-
-        body = (
-            await _call(
-                app,
-                "PUT",
-                "/app-settings",
-                json={"items": {"github_access_token": "ghp_0123456789abcdef"}},
-            )
-        ).json()
-
-        item = {i["key"]: i for i in body["items"]}["github_access_token"]
-        assert settings_.github_access_token == "ghp_0123456789abcdef", "当场生效"
-        assert store["github_access_token"] == "ghp_0123456789abcdef"
-        assert item["value"] == "", "保存之后不再回显"
-        assert item["has_value"] is True, "但要能说「配过了」"
-
-    async def test_a_mask_sent_back_unchanged_is_not_a_write(self, monkeypatch):
-        """界面上那串掩码只是提示：原样提交回来不等于把令牌改成了掩码本身。"""
-        token = "ghp_0123456789abcdef"
-        app, settings_, store = self._app_with_token(monkeypatch, token=token)
-
-        await _call(app, "PUT", "/app-settings", json={"items": {"github_access_token": "ghp…cdef"}})
-
-        assert settings_.github_access_token == token
-        assert store == {}
-
-    async def test_an_empty_value_clears_it(self, monkeypatch):
-        """把掩码删空再保存＝清除（这是界面上唯一能触发清空的动作）。"""
-        app, settings_, store = self._app_with_token(monkeypatch)
-
-        await _call(app, "PUT", "/app-settings", json={"items": {"github_access_token": ""}})
-
-        assert settings_.github_access_token == ""
-        assert store["github_access_token"] == ""
-
 
 # -- 四、这几格真的被读到（不然「能配」是假的）--------------------------------
 

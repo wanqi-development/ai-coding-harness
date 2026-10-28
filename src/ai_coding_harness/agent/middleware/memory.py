@@ -165,6 +165,8 @@ def build_memory_middleware(
     再建一个不会与记忆工具那个冲突。路径统一走 ``backends.composite.memory_path`` ——
     记忆路径只有那一个口径，自己拼一份就会写到没人读的 key 上。
     """
-    path = memory_path(repo.owner, repo.repo, settings.memories_prefix)
+    path = memory_path(
+        repo.platform.value, repo.owner, repo.repo, settings.memories_prefix
+    )
     sections = memory_sections_for(form=form, role=role)
     return MemoryMiddleware(backend=backend, path=path, platform=repo, sections=sections)

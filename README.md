@@ -14,23 +14,27 @@
   rework 工作区同步水位持久化在 `pull_requests` 表。
 - 上下文工程：中英混合 token 估算、在线校准、持久化工具裁剪事件、到线摘要与完整历史 offload。
 - 流式可观测：正文、reasoning、待办、工具、方案、token、文件 diff、handoff 内层 run 树。
+- Markdown 图表：完整回复里的 Mermaid 流程图与状态图渲染为可缩放 SVG，支持源码、复制、
+  下载和全屏查看。
 - 本地工作台：聊天、代码、记忆、PR、日志、Token，以及整页设置。
+- 多用户与 RBAC：管理员维护账号与角色；PostgreSQL-backed 不透明会话、HttpOnly Cookie、
+  CSRF、强制首次改密和会话归属隔离。
 
 ## 总体架构
 
 - **接口**：FastAPI + SSE。`POST /chat/{session_id}` 起一轮并订阅，`GET /chat/{session_id}/stream?after=<帧号>` 刷新后接回；运行与 HTTP 请求生命周期解耦，终止必须调用 cancel。
-- **模型路由**：按智能体角色选择设置页里的模型行。主智能体不缓存，每轮现建，因此模型配置下一轮生效。
+- **模型路由**：按当前用户和智能体角色选择设置页里的模型行。主智能体不缓存，每轮现建，因此模型配置下一轮生效。
 - **意图判定**：轮首先取 PR 快照和仓库记忆状态，再按候选集、口令、JEV 或大模型、关键字兜底依次判定。外部 / 归属未知的 open PR 在分类前直接停止；PR 状态不一致时再由纯函数闸门拦截写操作。
 - **装配轴**：`agent/profiles.py` 决定主形态挂哪些工具、子智能体和提示词，避免多套分支漂移。
 - **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
-- **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机自己 `git clone --bare` 一份只读缓存（按 `owner/repo`，`REPO_VIEW_DIR` 默认 **`~/.ai-coding-harness/repo_cache`**，即用户个人目录，不写进项目目录），切分支只是换个 ref，读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
-- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流。令牌与 git 用户名在设置页「代码平台」那一栏配（`.env` 的同名键只是初始值），**建会话时快照进库**，之后改配置不影响已有会话。OAuth 登录已删（2026-10-20）。
-- **安全**：危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
+- **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机的只读缓存按平台用户隔离，默认 **`~/.ai-coding-harness/users/<user_id>/repo_cache`**，每个用户可在基本设置里改自己的路径和默认分支；读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
+- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流。令牌与 git 用户名按用户在设置页「代码平台」配置；建会话前先用当前用户凭据验证仓库访问权，失败不落会话。用户换令牌时会重写自己的活跃会话，并在下一轮把新凭据同步进沙箱。OAuth 登录已删（2026-10-20）。
+- **认证与安全**：所有业务 API 先经过数据库-backed 登录认证，写请求校验 CSRF；业务会话按用户隔离。沙箱侧另有危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
 - **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（到压缩线后的应急裁剪：剪了几条、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。
 - **思考展示**：模型思考以 `reasoning` 帧单独下发，主控与子智能体按角色分段显示；它只存在于前端与 RunHub 的临时帧缓冲，**不落业务库**。流式期间正文按纯文本显示，任务结束后一次性 Markdown 化。
 - **文件后端**：CompositeBackend 将普通文件、`/memories/`、`/conversation_history/`、`/large_tool_results/` 路由到沙箱或持久 StoreBackend。
-- **持久化**：PostgreSQL 保存会话、仓库、方案、PR 映射、记录、澄清、模型配置和运行配置；LangGraph checkpoint 保存会话状态。
-- **Redis（可选）**：多 worker 时保存运行帧缓冲、会话运行权与模型熔断状态；未配置或连接失败时退回进程内实现。
+- **持久化**：PostgreSQL 保存会话、仓库、方案、PR 映射、记录、澄清、模型配置和运行配置；LangGraph checkpoint 保存会话状态。Session 使用 5 分钟版本化快照缓存，Redis 中的快照以 AES-256-GCM 加密。
+- **Redis（可选）**：多 worker 时保存运行帧缓冲、会话运行权、模型熔断状态与 Session 快照；启用 Redis 时必须配置 `SESSION_CACHE_ENCRYPTION_KEY`，否则拒绝启动。单 worker 未配置 Redis 时使用 5 分钟进程内快照。
 
 ## 意图与形态
 
@@ -56,6 +60,11 @@
   `executing` 方案按 PR 状态收口；coder 正常结束也会兜底。存在 PR 时方案记为 `done`，
   没有 PR 时恢复 `pending`。用户终止或异常未执行 `after_agent` 时，由下一轮
   `before_agent` 修复。
+- **当前进度只保留一份**：`write_todos` 是当前清单快照，父任务被主控删除后其子清单
+  同步消失；新方案落库会替代最新的 `pending/failed` 方案，旧方案标记为 `superseded`，
+  不再出现在当前方案和聊天回放中。
+- **本轮改动与耗时**：coding 按 `create_pr` 的 base/head、rework 按目标 PR 的 base/head
+  在本地代码缓存里计算文件清单；执行耗时写入 assistant 记录，实时与刷新回放都显示同一份。
 - **纯文档直做**：任务只新增 / 修改 `AGENTS.md`、README、`docs/` 或其他 `.md` / `.mdx` /
   `.rst` / `.adoc`，且不涉及源码、测试、配置、依赖或构建文件时，coding 主控只维护任务清单并
   直接派 coder；不查询或创建方案，不派 planner，也不派 reviewer。
@@ -164,12 +173,14 @@
 - 日志面板支持关键字、级别、HTTP 噪声开关和 run 树视图；
 - “本轮改动”只在本轮创建 PR 时出现。
 
-设置页是整页工作台，入口在左栏品牌行的齿轮：
+设置页是整页工作台，入口在左栏左下角的设置图标；同一行左侧的用户名点击后展开账号详情，
+不会直接退出。详情显示显示名、用户名、角色、用户 ID、账号时间与当前登录会话信息，
+并提供“修改密码 / 退出登录”两个操作：
 
 - 基本设置；
 - 外观；
 - 模型配置；
-- 提供商目录。
+- 提供商目录（仅管理员）。
 
 基本设置与外观存本机 localStorage；模型配置和运行期参数存 PostgreSQL。
 
@@ -179,12 +190,30 @@
 
 - PR 创建、评论、关闭、状态查询走统一接口，内部按平台分流；
 - 不提供 OAuth 登录入口；
-- 新会话使用 `.env` 中配置的 `GITEE_ACCESS_TOKEN` / `GITHUB_ACCESS_TOKEN`；
+- 每个用户在「基本设置 → 代码平台」维护自己的 token 与 git 用户名，不跨用户兜底；
+- 创建会话前先校验当前用户是否有仓库访问权，无权限或仓库不存在时弹窗提示；
+- token 更新会同步该用户的活跃会话，当前轮保持旧凭据，下一轮刷新沙箱凭据；
 - token 通过 git askpass/环境变量注入，不写进 URL、不写进 `.git/config`。
 
 ## API
 
 ```text
+GET    /auth/config
+POST   /auth/login
+GET    /auth/me
+GET    /me/profile
+POST   /auth/logout
+POST   /auth/change-password
+
+GET    /me/settings
+PUT    /me/settings
+
+GET    /users
+POST   /users
+PATCH  /users/{id}
+POST   /users/{id}/reset-password
+POST   /users/{id}/revoke-sessions
+
 POST   /sessions
        {"repo_url":"..."}
 GET    /sessions?limit=50
@@ -234,11 +263,15 @@ GET    /health
 
 意图由服务端自动判定，客户端不传 `task_type`。
 
+权限边界：`/users`、`/app-settings` 和提供商目录写接口仅管理员；`/model-config`
+按当前用户读写自己的模型行；`/me/settings` 维护当前用户自己的缓存路径和默认分支。
+
 ## 主要目录
 
 ```text
 src/ai_coding_harness/
-├── api/                 # FastAPI、SSE、schemas、routes；model_config 按职责分包
+├── api/                 # FastAPI、SSE、认证与业务路由；model_config 按职责分包
+├── auth/                # 密码、Opaque Token、认证中间件与数据库会话
 ├── server/              # 意图、业务编排、RunHub、PR 状态与记忆同步
 │   └── turn/            # runner / intent / clarify / records / usage / changes mixin
 ├── agent/               # graph、llm、profiles、prompts、subagents、chat_model
@@ -261,9 +294,11 @@ frontend/src/
 └── App.vue
 
 sandbox/                 # 建会话时推入沙箱的 policies / skills / deploy 资产
-docs/                    # 设计、目录权限、PR API、评测、backlog
+docs/                    # 设计、目录权限、PR API、认证与评测
 alembic/                 # 数据库迁移
-start.sh / start.bat     # 一键启动
+scripts/windows/         # Windows 合并 / 前后端独立启动脚本
+scripts/linux/           # Linux 合并 / 前后端独立启动脚本
+start.bat                # Windows 兼容入口
 ```
 
 ## 环境与启动
@@ -274,39 +309,64 @@ start.sh / start.bat     # 一键启动
 cp .env.example .env
 pip install -e ".[dev]"
 alembic upgrade head
+python -m ai_coding_harness.manage create-admin --username admin --claim-existing
 npm --prefix frontend install
 ```
 
 一键启动：
 
 ```bash
-./start.sh
-start.bat
+bash scripts/linux/start.sh     # Linux
+start.bat                       # Windows（也可直接运行 scripts\windows\start.bat）
 ```
 
 分别启动：
 
 ```bash
-python -m ai_coding_harness.main
-npm --prefix frontend run dev
+# Windows
+scripts\windows\start-backend.bat
+scripts\windows\start-frontend.bat
+
+# Linux
+bash scripts/linux/start-backend.sh
+bash scripts/linux/start-frontend.sh
+```
+
+Linux 脚本默认使用当前环境里的 `python3`；conda 环境未激活时可这样覆盖：
+
+```bash
+PYTHON=/path/to/aicoding/bin/python bash scripts/linux/start.sh
 ```
 
 后端：`http://127.0.0.1:8000`
 
 前端：`http://localhost:5173`
 
+首次启动必须先执行迁移并交互式创建管理员；已有历史会话可通过 `--claim-existing`
+归给该账号。之后由管理员在设置页创建其他用户。详细流程见 `docs/auth-design.md`。
+
 ## 关键配置
+
+### 登录认证
+
+```env
+AUTH_SESSION_COOKIE=harness_session
+AUTH_CSRF_COOKIE=harness_csrf
+AUTH_COOKIE_SECURE=false
+AUTH_SESSION_TTL_HOURS=168
+AUTH_IDLE_TIMEOUT_HOURS=24
+AUTH_LOGIN_MAX_FAILURES=5
+AUTH_LOGIN_LOCK_SECONDS=60
+```
+
+登录会话存 PostgreSQL，多 worker 不需要 sticky session。HTTPS 部署必须设置
+`AUTH_COOKIE_SECURE=true`。
 
 ### 代码平台
 
-```env
-GITEE_ACCESS_TOKEN=
-GITEE_USERNAME=
-GITHUB_ACCESS_TOKEN=
-GITHUB_USERNAME=
-```
-
-不再使用 OAuth client id/secret，也不接受创建会话时临时传入 token。
+不再使用 OAuth client id/secret，也不从 `.env` 提供全局 token。进入「基本设置 →
+代码平台」为当前账号配置 Gitee / GitHub token 和 git 用户名；打开设置页时 token
+只回掩码，保存后不再回显，清空输入框再保存即删除。
 
 ### 模型
 
@@ -318,7 +378,8 @@ GITHUB_USERNAME=
 
 ### 运行期参数
 
-上下文告警线、默认分支、代码缓存路径等存 `app_settings`，通过设置页或 `/app-settings` 修改，立即生效。
+上下文告警线和意图澄清阈值等全局参数存 `app_settings`，仅管理员可改。
+代码缓存路径、默认分支和模型配置按用户独立存储；提供商栏仅管理员可见，同时作为模型配置弹窗的只读目录。
 
 ### 沙箱与持久化
 
@@ -326,8 +387,19 @@ GITHUB_USERNAME=
 OPENSANDBOX_*
 SANDBOX_*
 POSTGRES_*
+POSTGRES_CONNECT_TIMEOUT_SECONDS=5
 REDIS_URL=
+SESSION_CACHE_ENCRYPTION_KEY=
+SESSION_CACHE_KEY_VERSION=1
+REDIS_SESSION_CACHE_TTL_SECONDS=300
 ```
+
+`POSTGRES_CONNECT_TIMEOUT_SECONDS` 控制建立数据库连接的最长等待时间，避免地址不可达时
+CLI 或服务长时间无响应。
+
+`SESSION_CACHE_ENCRYPTION_KEY` 接受 32 字节 base64 或 64 位十六进制。启用 Redis
+但没有有效密钥时服务直接启动失败，避免 token 明文进入 Redis 或多 worker 静默退回本地缓存。
+可用 `python -m ai_coding_harness.manage generate-session-cache-key` 生成。
 
 Redis 留空时使用进程内状态；生产多 worker 建议配置 Redis。
 
@@ -346,6 +418,7 @@ npm.cmd --prefix frontend run build
 
 - `CHANGELOG.md`：逐次改动、动机、验证与遗留。
 - `docs/config-page-design.md`：设置页与模型配置设计。
+- `docs/auth-design.md`：多用户、RBAC、多 worker 会话与外部 IdP 扩展边界。
 - `docs/context-trim-event.md`：持久化裁剪事件。
 - `docs/workspace-directories.md`：工作区目录与权限。
 - `docs/code-platform-pr-api.md`：Gitee/GitHub PR API 差异。
