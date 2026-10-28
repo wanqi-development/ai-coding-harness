@@ -1,6 +1,6 @@
 # ai-coding-harness
 
-基于 [deepagents](https://github.com/langchain-ai/deepagents) + [OpenSandbox](https://open-sandbox.ai/) 的本地优先、单租户 coding agent harness。
+基于 [deepagents](https://github.com/langchain-ai/deepagents) + [OpenSandbox](https://open-sandbox.ai/) 的本地优先、单部署多用户 coding agent harness。
 
 ## 是什么
 
@@ -28,7 +28,7 @@
 - **装配轴**：`agent/profiles.py` 决定主形态挂哪些工具、子智能体和提示词，避免多套分支漂移。
 - **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
 - **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机的只读缓存按平台用户隔离，默认 **`~/.ai-coding-harness/users/<user_id>/repo_cache`**，每个用户可在基本设置里改自己的路径和默认分支；读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
-- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流。令牌与 git 用户名按用户在设置页「代码平台」配置；建会话前先用当前用户凭据验证仓库访问权，失败不落会话。用户换令牌时会重写自己的活跃会话，并在下一轮把新凭据同步进沙箱。OAuth 登录已删（2026-10-20）。
+- **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流。令牌与 git 用户名按用户在设置页「代码平台」配置；建会话前先用当前用户凭据验证仓库访问权，失败不落会话。用户换令牌时会重写自己的活跃会话，并在下一轮把新凭据同步进沙箱。平台登录使用本地账号密码。
 - **认证与安全**：所有业务 API 先经过数据库-backed 登录认证，写请求校验 CSRF；业务会话按用户隔离。沙箱侧另有危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
 - **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（到压缩线后的应急裁剪：剪了几条、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。
 - **思考展示**：模型思考以 `reasoning` 帧单独下发，主控与子智能体按角色分段显示；它只存在于前端与 RunHub 的临时帧缓冲，**不落业务库**。流式期间正文按纯文本显示，任务结束后一次性 Markdown 化。
@@ -49,12 +49,12 @@
 
 - 有 open PR 时，`coding` / `plan` 会被状态闸门拦截，写操作只能走 `rework`。
 - 非本 Harness 创建或归属无法确认的 open PR 会在意图分类前硬拦截，提示用户先处理；
-  历史 PR 的归属通过一次 commit 作者核验后写入 `pull_requests`，之后不再重复猜。
+  历史 PR 首次纳管时按 commit 作者核验归属，核验结果写入 `pull_requests`。
 - 例外：open PR **全部没有评论**时，说明 coder 可能已建 PR 但 reviewer 还没完成；
   此时 `coding` 继续可用，用于收尾同一任务；没有审查评论时 `rework` 暂不可用。
   任一 open PR 已有评论后，coding 才被拦回 `rework`。
 - 没有 open PR 时不能进入 `rework`。
-- `review` 不再是独立主控形态；reviewer 是 coding/rework 的内部子智能体。
+- 当前没有独立 `review` 主形态；reviewer 是 coding/rework 的内部子智能体。
 - `qa` 和 `plan` 不写仓库记忆；仓库记忆正文只在 coding/rework 收尾写回。
 - **方案执行状态自动恢复**：coding 主控、planner、coder 进入时会把上一轮遗留的
   `executing` 方案按 PR 状态收口；coder 正常结束也会兜底。存在 PR 时方案记为 `done`，
@@ -94,7 +94,7 @@
 | `LoopGuardMiddleware` | 同一工具同一参数重复调用时先劝、再中止 |
 | `ToolCallIdMiddleware` | 补空 tool-call id；invalid tool call 带错误原因最多重试 3 次，仍失败则降级成正文 |
 | `ToolErrorGuardMiddleware` | 工具异常转换成错误 ToolMessage，不掀翻整个 superstep |
-| `HistoryRepairMiddleware` | 修复空 id、孤儿工具调用、旧 invalid content block |
+| `HistoryRepairMiddleware` | 修复历史消息中的空 id、孤儿工具调用与畸形内容块 |
 | `IntentMiddleware` | 注入本轮形态、实际可用工具和澄清块；不允许模型沿用上一轮能力结论 |
 | `RedactionMiddleware` | 工具返回与模型输出脱敏 |
 | `HarnessSummarizationMiddleware` | 上下文裁剪事件、摘要、角色化触发线和历史 offload |
@@ -149,7 +149,7 @@
 
 ## Handoff 内嵌 Run 树
 
-`handoffTask` 的内层运行与外层上下文隔离，但不再完全隐形：
+`handoffTask` 的内层运行与外层上下文隔离，内层过程以内嵌 Run 树展示：
 
 - 内层模型正文、reasoning、工具、待办和生命周期通过 `harness-run` 事件回传；
 - 每个节点带 `run_id / parent_run_id / root_run_id`；
@@ -364,7 +364,7 @@ AUTH_LOGIN_LOCK_SECONDS=60
 
 ### 代码平台
 
-不再使用 OAuth client id/secret，也不从 `.env` 提供全局 token。进入「基本设置 →
+代码平台认证使用用户级 access token，不从 `.env` 提供全局 token。进入「基本设置 →
 代码平台」为当前账号配置 Gitee / GitHub token 和 git 用户名；打开设置页时 token
 只回掩码，保存后不再回显，清空输入框再保存即删除。
 
