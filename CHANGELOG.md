@@ -44,6 +44,131 @@
   - 改动 Python 文件 `ruff check` 通过。
   - 全量 `pytest` **1352 passed, 2 warnings**（均为既有第三方告警）。
 
+#### standalone 增加可独立关闭前后端的 stop 入口
+
+- **动机**：关闭 PowerShell 启动窗口不会可靠终止 `Start-Process` 拉起的 WSL 后端与
+  Windows Vite，用户只能手工找 PID；旧后端不退出还会继续运行修改前的代码。
+- **改动**：
+  - 根目录新增 `stop-standalone.bat`，Windows 编排在
+    `scripts/windows/stop-standalone.ps1`，WSL 停止逻辑在
+    `scripts/wsl/stop-standalone.sh`。
+  - WSL 端按后端端口查 PID，并核对 `/proc/<pid>/cmdline` 包含
+    `ai_coding_harness.main` 后才停止；宽限期后仍未退出才强制停止。
+  - Windows 端按前端端口查监听进程，并核对命令行同时包含 `vite` 与本仓库路径后才停止，
+    避免误杀占用同一端口的其他服务。
+  - README、standalone 文档与本机规则补充 stop 用法和“不能靠关闭窗口清理”的事实。
+- **验证**：
+  - 在真实运行实例上执行 stop：WSL 后端 PID 656、Windows 前端 PID 587500 均被停止；
+    随后 8000 / 5173 均无监听，WSL 内无 `ai_coding_harness.main` 残留。
+  - PowerShell 脚本通过 AST 语法解析，BAT 为 ASCII + CRLF；Shell 脚本通过 `bash -n`。
+- **遗留**：stop 使用默认 8000 / 5173；启动时改过端口，也需要通过相同参数调用 stop。
+
+#### standalone 自动生成初始管理员凭据
+
+- **动机**：standalone 是单机自助部署，首次启动不应要求用户另开终端交互创建管理员；
+  multi 是多 worker 生产部署，管理员凭据必须继续由具体运维人员控制。
+- **改动**：
+  - 新增 `manage ensure-standalone-admin`：仅在 standalone、且数据库没有用户时生成
+    `admin` 的 32 字符随机密码并创建账号。
+  - 自动创建的管理员设置 `must_change_password=true`，首次登录后强制修改密码。
+  - 用户名与密码同时输出到控制台，并原子写入
+    `~/.ai-coding-harness/logs/initial-admin.txt`，文件权限 `0600`。
+  - `bootstrap.sh` 与 `start-standalone.sh` 改为调用该命令；请求不再需要 TTY，也不再
+    交互式读取密码。
+  - 如果数据库已有用户，只提示“管理员已存在”，不覆盖旧凭据文件；multi 调用该命令直接
+    返回非零，并提示运维人员使用原有交互式 `create-admin`。
+  - README、standalone 文档与本机协作规则同步两档凭据口径。
+- **关键决策**：密码在 Python 内生成并直接哈希，不经命令行参数或环境变量传递；凭据文件
+  放在 standalone 用户目录的 `logs` 下，而不是业务日志或数据库明文列中。
+- **验证**：
+  - 新增定向测试：自动密码强度、控制台输出、`0600` 文件、数据库哈希、强制改密、重复执行
+    不覆盖，以及 multi 拒绝自动创建；定向测试 **8 passed**，`ruff check` 通过。
+  - 在真实 WSL2 临时 SQLite 上执行 `ensure-standalone-admin`：控制台显示用户名/密码/路径；
+    文件权限为 `600`；数据库记录 `admin|1`；multi 模式返回 2 并拒绝生成。
+  - 用临时 SQLite 直接运行 `start-standalone.sh`：自动生成管理员后成功启动后端，临时端口
+    18000 的 `/health` 返回 `{"status":"ok"}`；测试后目录和后端均已清理。
+  - 全量 `pytest` **1350 passed, 2 warnings**（均为既有第三方告警）。
+- **遗留**：自动生成的临时密码会保留在凭据文件里；首次登录改密后该密码失效，但文件本身
+  需要用户自行删除或由后续清理策略处理。
+
+#### standalone 增加根目录一键启动入口
+
+- **动机**：WSL standalone 已有底层启动脚本，但首次使用仍需手工确认发行版、执行
+  Bootstrap 和安装 Windows 前端依赖，入口过于分散。
+- **改动**：
+  - 根目录新增 `start-standalone.bat`，支持双击运行，也可从终端直接启动。
+  - 新增 `scripts/windows/start-standalone.ps1` 作为自动编排层：优先读取
+    `WSL_DISTRO`，否则依次选择 `Ubuntu-24.04`、`Ubuntu-22.04`、`Ubuntu` 或首个发行版。
+  - 自动检查 harness 虚拟环境、WSL 工具链和首个管理员；任一缺失时调用现有
+    `start-wsl-standalone.ps1 -Bootstrap`。
+  - Windows `frontend/node_modules` 缺失时自动执行 `npm install`。
+  - `start-wsl-standalone.ps1` 改用 root 解析 Windows 仓库在 WSL 下的路径，修复首次
+    Bootstrap 时尚不存在 `harness` 用户导致 `wslpath` 先失败的问题。
+  - 传给 `wslpath` 的仓库路径统一转成正斜杠；实测 Windows 反斜杠会被 WSL 启动器吞掉，
+    使 `D:\...` 变成无效的 `D:...`。
+  - 首次预检改为由 root 查询 `getent passwd`，不再主动以尚不存在的 `harness` 用户启动
+    WSL 进程，避免显示预期的 `WSL_E_USER_NOT_FOUND`。
+  - WSL 原生调用的 stderr 改为临时捕获并按退出码判定；WSL 的 localhost 代理提示不会再被
+    Windows PowerShell 当成终止错误。
+  - README 与 `docs/standalone-wsl.md` 的用户入口统一为 `start-standalone.bat`。
+- **关键决策**：一键入口只负责自动检测和编排，实际后端/前端启动仍由原
+  `start-wsl-standalone.ps1` 承担；显式高级参数仍可直接调用底层脚本。
+- **验证**：
+  - 两个 PowerShell 启动脚本通过 PowerShell AST 语法解析。
+  - `start-standalone.bat` 保持 ASCII 内容与 CRLF，可由 cmd 直接执行。
+  - 使用 Windows PowerShell 5.1 验证原生 stderr 警告不会中断脚本，且退出码仍可正确读取。
+  - 全量 `pytest` **1348 passed, 2 warnings**（均为既有第三方告警）。
+  - 在真实 WSL2 `Ubuntu` 上完整执行 `start-standalone.bat`：首次 Bootstrap 成功；
+    Python 3.14.4、Node 22.23.4、Java 21.0.12.1、Maven 3.9.12、Go 1.26.8、
+    bubblewrap 0.11.1 全部通过；管理员创建成功；SQLite 中 `users` 为
+    `1|admin|admin`；后端 `/health` 返回 `{"status":"ok"}`；Windows 前端
+    `http://localhost:5173/` 返回 200；停止后 8000 / 5173 均已释放。
+- **遗留**：WSL 的 localhost 代理提示仍可能出现在后台日志中，但已确认不会影响退出码或启动；
+  如果 WSL 需要访问 Windows 本机代理，应另行启用 mirrored networking 或给 WSL 配置独立代理。
+
+### 2026-10-29
+
+#### 增加 WSL2 + SQLite standalone 部署档位
+
+- **动机**：单机使用时不应强制依赖 PostgreSQL、Redis、Docker 与 OpenSandbox；同时多 worker
+  部署又需要这些外部依赖真正成为硬要求，不能因连接失败静默退回进程内状态。
+- **改动**：
+  - 新增 `DEPLOYMENT_MODE=standalone|multi`。standalone 使用单个 SQLite 文件、进程内运行
+    状态与 WSL2/bubblewrap；multi 继续使用 PostgreSQL、Redis 与 OpenSandbox。
+  - 业务 ORM 增加 SQLite 方言适配：自增主键、JSON/JSONB、仓库锁与方案步骤原子更新按方言
+    分流；SQLite 启用 WAL、外键、`busy_timeout=5000` 与 `synchronous=NORMAL`。
+  - LangGraph checkpointer 与 Store 在 standalone 共用同一个 SQLite 文件和连接；
+    PostgreSQL 路径保持不变，应用退出时统一关闭持久化连接。
+  - 新增 `WslSandboxProvider` / `WslSandboxClient`：会话目录落在 WSL ext4，文件工具直接
+    读写；命令经 bubblewrap 隔离 PID/IPC/UTS，会话资产按读写边界挂载，不暴露真实 WSL home
+    或 Windows 盘。
+  - `SessionManager` 通过 provider factory 选择 OpenSandbox 或 WSL，并向 provider 传递
+    `session_id`；WSL 会话不创建 Docker volume。
+  - 新增 WSL bootstrap、工具链检查、后端启动与 Windows 启动入口，首次初始化安装
+    Python/Node/Java/Maven/Go/Git/ripgrep/sqlite3/bubblewrap，并创建虚拟环境、数据目录、
+    `.env` 与首个管理员。
+  - `.env.example`、README 与 `docs/standalone-wsl.md` 补充两档部署方式、数据流、边界与
+    排错说明。
+- **关键决策**：
+  - standalone 明确只支持单 worker；业务表、checkpoint 与 Store 必须共用一个 SQLite 文件，
+    显式同时配置 `DATABASE_URL` 和 `SQLITE_PATH` 时校验二者指向同一路径。
+  - multi 强制 PostgreSQL、`REDIS_URL` 与 `REDIS_REQUIRED=true`，并只允许 OpenSandbox；
+    standalone 强制 SQLite + WSL，忽略 Redis。
+  - Windows 只负责启动 WSL 内后端和打开界面；standalone 后端本身必须在 WSL/Linux 中运行。
+  - 第一版保留普通网络访问；网络 allowlist 代理后续单独接入。
+- **验证**：
+  - 定向测试 **127 passed**，覆盖两档配置解析、单 SQLite 文件、SQLite/LangGraph 表初始化、
+    WSL 路径越界防护、bubblewrap 挂载与网络开关、二进制文件上传和 provider 接口。
+  - 全量 `pytest` **1348 passed, 2 warnings**（两条均为既有第三方弃用告警）。
+  - 改动文件 `ruff check`、`git diff --check`、三份 WSL Shell 脚本 `bash -n`、Windows
+    PowerShell 语法解析与前端生产构建全部通过。
+- **遗留**：
+  - 当前开发环境没有可启动的 WSL 发行版，因此本次未完成 `start-wsl-standalone.ps1` 的
+    真机前后端端到端启动；首次启用时仍需在目标 WSL2 发行版执行 `-Bootstrap` 验证。
+  - standalone 首次建库使用 ORM `create_all`，后续 schema 演进仍需补独立迁移策略。
+  - bubblewrap 当前只隔离进程与文件挂载，尚未实现网络 allowlist。
+  - 现有 PostgreSQL 数据不会自动迁移到新的 SQLite 文件；切换档位视为新建实例。
+
 ### 2026-10-28
 
 #### README 改为只描述当前产品状态

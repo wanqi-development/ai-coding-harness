@@ -1,6 +1,6 @@
 # ai-coding-harness
 
-基于 [deepagents](https://github.com/langchain-ai/deepagents) + [OpenSandbox](https://open-sandbox.ai/) 的本地优先、单部署多用户 coding agent harness。
+基于 [deepagents](https://github.com/langchain-ai/deepagents) 的本地优先、单部署多用户 coding agent harness。支持 WSL2 + SQLite 的 standalone 单 worker 部署，以及 PostgreSQL + Redis + OpenSandbox 的 multi 多 worker 部署。
 
 ## 是什么
 
@@ -17,7 +17,7 @@
 - Markdown 图表：完整回复里的 Mermaid 流程图与状态图渲染为可缩放 SVG，支持源码、复制、
   下载和全屏查看。
 - 本地工作台：聊天、代码、记忆、PR、日志、Token，以及整页设置。
-- 多用户与 RBAC：管理员维护账号与角色；PostgreSQL-backed 不透明会话、HttpOnly Cookie、
+- 多用户与 RBAC：管理员维护账号与角色；数据库-backed 不透明会话、HttpOnly Cookie、
   CSRF、强制首次改密和会话归属隔离。
 
 ## 总体架构
@@ -26,15 +26,16 @@
 - **模型路由**：按当前用户和智能体角色选择设置页里的模型行。主智能体不缓存，每轮现建，因此模型配置下一轮生效。
 - **意图判定**：轮首先取 PR 快照和仓库记忆状态，再按候选集、口令、JEV 或大模型、关键字兜底依次判定。外部 / 归属未知的 open PR 在分类前直接停止；PR 状态不一致时再由纯函数闸门拦截写操作。
 - **装配轴**：`agent/profiles.py` 决定主形态挂哪些工具、子智能体和提示词，避免多套分支漂移。
-- **沙箱**：Docker + OpenSandbox（`opensandbox` SDK），每会话新建；镜像 `opensandbox/code-interpreter:v1.1.0`，沙箱根 `/ai_coding`（含 `project/`、`policies/`、`skills/`、`output/`、`review/`、`tmp/`）。沙箱需要的资产（askpass / setup.sh、policies、skills）集中在仓库 `sandbox/` 下，建会话时整棵推入。
+- **部署档位**：`standalone` 在 WSL2 内运行，使用单个 SQLite 文件、进程内运行状态和 bubblewrap 命令沙箱；`multi` 使用 PostgreSQL、Redis 与 OpenSandbox，可运行多个 worker。两套档位共用业务代码、工具和前端。
+- **沙箱**：standalone 每会话在 WSL ext4 建立隔离目录，文件工具直接操作该目录，Shell 命令经 bubblewrap 限制挂载与 namespace；multi 使用 Docker + OpenSandbox，每会话新建镜像 `opensandbox/code-interpreter:v1.1.0`。两套 provider 都使用 `/ai_coding` 虚拟根与会话资产。
 - **右侧栏「代码」面板**（`infra/repo_cache.py`）：界面看代码**不经沙箱** —— 宿主机的只读缓存按平台用户隔离，默认 **`~/.ai-coding-harness/users/<user_id>/repo_cache`**，每个用户可在基本设置里改自己的路径和默认分支；读文件走 `git ls-tree` / `git cat-file`。沙箱没建好、已被回收、甚至建失败，代码照样看得到；令牌经环境里的 git 配置注入，不进 URL、也不落 `.git/config`。
 - **代码平台**：Gitee（码云）与 GitHub。**平台由仓库地址判定**（`gitee.com` / `github.com`），PR 创建 / 评论 / 关闭走同一套 `create_pr` / `comment_pr` / `close_pr` 工具，内部按平台分流。令牌与 git 用户名按用户在设置页「代码平台」配置；建会话前先用当前用户凭据验证仓库访问权，失败不落会话。用户换令牌时会重写自己的活跃会话，并在下一轮把新凭据同步进沙箱。平台登录使用本地账号密码。
 - **认证与安全**：所有业务 API 先经过数据库-backed 登录认证，写请求校验 CSRF；业务会话按用户隔离。沙箱侧另有危险命令 denylist（`rm -rf /`、`mkfs`、`dd` 写盘、`shutdown` 等）+ 按角色的边界中间件（越界工具直接不给）+ 凭据脱敏覆盖四条出口（工具返回值、模型输出、SSE、落库与日志）。
 - **可观测**：日志记录会话 / 沙箱 / 智能体生命周期；trace 预留（LangSmith / OTel）。每次模型调用一行 `LLM 调用完成：输入 X / 输出 Y`（供应商真值，按执行主角归账）；上下文那两层各省了多少各有 grep 关键字 —— `CONTEXT_PRETRIM`（到压缩线后的应急裁剪：剪了几条、剪前剪后、免压还是继续压）与 `CONTEXT_SUMMARY`（压前压后 tokens、消息条数、摘要字数、逐出原文落盘路径）；两行同口径（含系统提示与工具 schema），可以直接对着看。压缩那次的摘要调用记成 `internal`（`摘要调用完成：…`）。
 - **思考展示**：模型思考以 `reasoning` 帧单独下发，主控与子智能体按角色分段显示；它只存在于前端与 RunHub 的临时帧缓冲，**不落业务库**。流式期间正文按纯文本显示，任务结束后一次性 Markdown 化。
 - **文件后端**：CompositeBackend 将普通文件、`/memories/`、`/conversation_history/`、`/large_tool_results/` 路由到沙箱或持久 StoreBackend。
-- **持久化**：PostgreSQL 保存会话、仓库、方案、PR 映射、记录、澄清、模型配置和运行配置；LangGraph checkpoint 保存会话状态。Session 使用 5 分钟版本化快照缓存，Redis 中的快照以 AES-256-GCM 加密。
-- **Redis（可选）**：多 worker 时保存运行帧缓冲、会话运行权、模型熔断状态与 Session 快照；启用 Redis 时必须配置 `SESSION_CACHE_ENCRYPTION_KEY`，否则拒绝启动。单 worker 未配置 Redis 时使用 5 分钟进程内快照。
+- **持久化**：standalone 用同一个 SQLite 文件保存业务表、LangGraph checkpoint 与 Store；multi 用 PostgreSQL 保存业务数据，并使用 PostgreSQL checkpoint/store。Session 使用 5 分钟版本化快照缓存。
+- **Redis**：multi 必须配置 Redis，用于运行帧缓冲、会话运行权、模型熔断状态与加密 Session 快照，并要求 `REDIS_REQUIRED=true`；standalone 固定使用进程内运行状态，不连接 Redis。
 
 ## 意图与形态
 
@@ -276,7 +277,7 @@ src/ai_coding_harness/
 │   └── turn/            # runner / intent / clarify / records / usage / changes mixin
 ├── agent/               # graph、llm、profiles、prompts、subagents、chat_model
 │   └── middleware/      # 边界、上下文、记忆、工具完整性、循环守卫等
-├── backends/            # OpenSandbox 后端与 CompositeBackend
+├── backends/            # 沙箱文件 / Shell 后端与 CompositeBackend
 ├── db/                  # ORM、engine、按表拆分的 dao
 ├── infra/               # Redis、本地只读 repo_cache、熔断
 ├── observability/       # 日志、run log、日志筛选、tracing
@@ -298,12 +299,13 @@ docs/                    # 设计、目录权限、PR API、认证与评测
 alembic/                 # 数据库迁移
 scripts/windows/         # Windows 合并 / 前后端独立启动脚本
 scripts/linux/           # Linux 合并 / 前后端独立启动脚本
+scripts/wsl/             # WSL 独立版初始化、工具链检查与后端启动
 start.bat                # Windows 兼容入口
 ```
 
 ## 环境与启动
 
-推荐 Python 3.11+ 和 conda 环境 `aicoding`：
+multi 模式或手工部署推荐 Python 3.11+ 和 conda 环境 `aicoding`：
 
 ```bash
 cp .env.example .env
@@ -319,6 +321,33 @@ npm --prefix frontend install
 bash scripts/linux/start.sh     # Linux
 start.bat                       # Windows（也可直接运行 scripts\windows\start.bat）
 ```
+
+WSL2 standalone（后端运行在 WSL，Windows 只负责启动和打开界面）：
+
+```text
+双击根目录 start-standalone.bat
+```
+
+也可以从终端执行：
+
+```powershell
+.\start-standalone.bat
+```
+
+入口会自动选择已安装的 Ubuntu WSL 发行版，并在首次运行时完成工具链初始化、管理员创建与
+Windows 前端依赖安装。需要指定发行版时设置 `WSL_DISTRO` 或传入
+`-Distro <发行版名称>`。
+
+停止 standalone 前后端：
+
+```text
+双击根目录 stop-standalone.bat
+```
+
+或执行 `.\stop-standalone.bat`。直接关闭启动窗口不会可靠终止后台子进程，应使用 stop 入口。
+
+standalone 首次没有用户时会自动创建 `admin`，随机密码同时显示在控制台并写入
+`~/.ai-coding-harness/logs/initial-admin.txt`（权限 `0600`）。首次登录后必须修改密码。
 
 分别启动：
 
@@ -342,8 +371,9 @@ PYTHON=/path/to/aicoding/bin/python bash scripts/linux/start.sh
 
 前端：`http://localhost:5173`
 
-首次启动必须先执行迁移并交互式创建管理员；已有历史会话可通过 `--claim-existing`
-归给该账号。之后由管理员在设置页创建其他用户。详细流程见 `docs/auth-design.md`。
+multi 模式必须由运维人员先执行迁移并交互式创建管理员；已有历史会话可通过
+`--claim-existing` 归给该账号。之后由管理员在设置页创建其他用户。multi 不会自动生成
+密码，也不会把管理员凭据写入日志。详细流程见 `docs/auth-design.md`。
 
 ## 关键配置
 
@@ -359,7 +389,7 @@ AUTH_LOGIN_MAX_FAILURES=5
 AUTH_LOGIN_LOCK_SECONDS=60
 ```
 
-登录会话存 PostgreSQL，多 worker 不需要 sticky session。HTTPS 部署必须设置
+登录会话存业务数据库；multi 多 worker 不需要 sticky session。HTTPS 部署必须设置
 `AUTH_COOKIE_SECURE=true`。
 
 ### 代码平台
@@ -385,27 +415,48 @@ AUTH_LOGIN_LOCK_SECONDS=60
 上下文告警线和意图澄清阈值等全局参数存 `app_settings`，仅管理员可改。
 代码缓存路径、默认分支和模型配置按用户独立存储；提供商栏仅管理员可见，同时作为模型配置弹窗的只读目录。
 
-### 沙箱与持久化
+### 部署档位
 
 ```env
+DEPLOYMENT_MODE=standalone
+SQLITE_PATH=/home/harness/.ai-coding-harness/harness.sqlite3
+SANDBOX_PROVIDER=wsl
+WSL_DISTRO=ai-coding-harness
+WSL_USER=harness
+WSL_ROOT=/home/harness/.ai-coding-harness/sessions
+WSL_BWRAP=/usr/bin/bwrap
+WSL_ALLOW_NETWORK=true
+```
+
+standalone 只支持单 worker，业务表、checkpoint 与 Store 共用一个 SQLite 文件；Windows
+不能直接运行该档位的后端。首次安装、目录布局与排错见
+[`docs/standalone-wsl.md`](docs/standalone-wsl.md)。
+
+multi 部署：
+
+```env
+DEPLOYMENT_MODE=multi
 OPENSANDBOX_*
 SANDBOX_*
 POSTGRES_*
 POSTGRES_CONNECT_TIMEOUT_SECONDS=5
-REDIS_URL=
+REDIS_URL=redis://127.0.0.1:6379/0
 SESSION_CACHE_ENCRYPTION_KEY=
 SESSION_CACHE_KEY_VERSION=1
 REDIS_SESSION_CACHE_TTL_SECONDS=300
+REDIS_REQUIRED=true
+SANDBOX_PROVIDER=opensandbox
 ```
 
 `POSTGRES_CONNECT_TIMEOUT_SECONDS` 控制建立数据库连接的最长等待时间，避免地址不可达时
 CLI 或服务长时间无响应。
 
-`SESSION_CACHE_ENCRYPTION_KEY` 接受 32 字节 base64 或 64 位十六进制。启用 Redis
+`SESSION_CACHE_ENCRYPTION_KEY` 接受 32 字节 base64 或 64 位十六进制。multi 启用 Redis
 但没有有效密钥时服务直接启动失败，避免 token 明文进入 Redis 或多 worker 静默退回本地缓存。
 可用 `python -m ai_coding_harness.manage generate-session-cache-key` 生成。
 
-Redis 留空时使用进程内状态；生产多 worker 建议配置 Redis。
+multi 模式必须同时具备 PostgreSQL、Redis 和 OpenSandbox，启动时会拒绝静默退回单 worker
+或进程内状态。
 
 ## 验证
 
@@ -423,6 +474,7 @@ npm.cmd --prefix frontend run build
 - `CHANGELOG.md`：逐次改动、动机、验证与遗留。
 - `docs/config-page-design.md`：设置页与模型配置设计。
 - `docs/auth-design.md`：多用户、RBAC、多 worker 会话与外部 IdP 扩展边界。
+- `docs/standalone-wsl.md`：WSL2 + SQLite standalone 的安装、目录、配置与安全边界。
 - `docs/context-trim-event.md`：持久化裁剪事件。
 - `docs/workspace-directories.md`：工作区目录与权限。
 - `docs/code-platform-pr-api.md`：Gitee/GitHub PR API 差异。

@@ -12,12 +12,16 @@ from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 from ai_coding_harness.core.codeplatform import Platform
 from ai_coding_harness.safety.redact import secret_terms
 from ai_coding_harness.utils.path_util import ROOT_DIR
 
 logger = logging.getLogger(__name__)
+
+DEPLOYMENT_MODES: tuple[str, ...] = ("multi", "standalone")
+SANDBOX_PROVIDERS: tuple[str, ...] = ("opensandbox", "wsl")
 
 
 def _default_repo_view_dir() -> str:
@@ -618,6 +622,29 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
+    # 部署档位。默认 multi 保持现有 PostgreSQL + Redis + OpenSandbox 行为。
+    deployment_mode: str = os.getenv("DEPLOYMENT_MODE", "multi").strip().lower()
+    #: 空＝按 deployment_mode 推导。standalone 默认 SQLite，multi 默认 PostgreSQL。
+    database_url: str = os.getenv("DATABASE_URL", "").strip()
+    #: standalone 未显式给 DATABASE_URL 时的统一 SQLite 文件。
+    sqlite_path: str = os.getenv("SQLITE_PATH", "").strip()
+    #: 空＝standalone 使用 wsl，multi 使用 opensandbox。
+    sandbox_provider: str = os.getenv("SANDBOX_PROVIDER", "").strip().lower()
+
+    # WSL 本地沙箱（standalone）。后端在 WSL 内运行时这些路径就是 Linux 原生路径。
+    wsl_distro: str = os.getenv("WSL_DISTRO", "ai-coding-harness")
+    wsl_user: str = os.getenv("WSL_USER", "harness")
+    wsl_root: str = os.getenv("WSL_ROOT", "/home/harness/.ai-coding-harness/sessions")
+    wsl_bwrap: str = os.getenv("WSL_BWRAP", "/usr/bin/bwrap")
+    wsl_command_timeout_seconds: int = int(
+        os.getenv("WSL_COMMAND_TIMEOUT_SECONDS", "600")
+    )
+    #: 第一版先保留普通网络；后续网络 allowlist 代理接好后可切换。
+    wsl_allow_network: bool = (
+        os.getenv("WSL_ALLOW_NETWORK", "true").strip().lower()
+        in ("1", "true", "yes")
+    )
+
     # 主智能体图的最大超级步数（LangGraph recursion_limit）。
     # deepagents 给自己绑定的是 9999，但该绑定在 astream_events 路径下不生效，
     # 不显式传入就退化为 LangGraph 默认的 25 —— 主控光探查仓库就能用掉 8 轮，
@@ -922,6 +949,73 @@ class Settings(BaseSettings):
     def postgres_async_url(self) -> str:
         """SQLAlchemy 异步连接串（psycopg3 驱动，用于业务库 ORM / Alembic）。"""
         return self.postgres_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    @property
+    def is_standalone(self) -> bool:
+        return self.deployment_mode == "standalone"
+
+    @property
+    def effective_sandbox_provider(self) -> str:
+        if self.sandbox_provider:
+            return self.sandbox_provider
+        return "wsl" if self.is_standalone else "opensandbox"
+
+    @property
+    def standalone_database_path(self) -> Path:
+        raw = self.sqlite_path
+        if not raw and self.database_url.startswith("sqlite"):
+            database = make_url(self.database_url).database
+            if database and database != ":memory:":
+                raw = database
+        if not raw:
+            raw = str(Path.home() / ".ai-coding-harness" / "harness.sqlite3")
+        return Path(raw).expanduser().resolve()
+
+    @property
+    def resolved_database_url(self) -> str:
+        """当前部署实际使用的 SQLAlchemy URL。"""
+        if self.database_url:
+            return self.database_url
+        if self.is_standalone:
+            return f"sqlite+aiosqlite:///{self.standalone_database_path.as_posix()}"
+        return self.postgres_async_url
+
+    def validate_deployment(self) -> None:
+        """启动前校验部署档位，避免多 worker 静默退回单进程语义。"""
+        if self.deployment_mode not in DEPLOYMENT_MODES:
+            raise ValueError(
+                f"DEPLOYMENT_MODE 只能是 {' / '.join(DEPLOYMENT_MODES)}"
+            )
+        provider = self.effective_sandbox_provider
+        if provider not in SANDBOX_PROVIDERS:
+            raise ValueError(
+                f"SANDBOX_PROVIDER 只能是 {' / '.join(SANDBOX_PROVIDERS)}"
+            )
+        url = self.resolved_database_url
+        if self.is_standalone:
+            if not url.startswith("sqlite"):
+                raise ValueError("standalone 必须使用 SQLite DATABASE_URL")
+            if url.rstrip("/").endswith(":memory:"):
+                raise ValueError("standalone 必须使用单一 SQLite 文件，不能使用 :memory:")
+            if provider != "wsl":
+                raise ValueError("standalone 当前只支持 SANDBOX_PROVIDER=wsl")
+            if self.redis_required:
+                raise ValueError("standalone 不能开启 REDIS_REQUIRED")
+            if self.database_url and self.sqlite_path:
+                database_path = make_url(self.database_url).database
+                if database_path and Path(database_path).expanduser().resolve() != (
+                    self.standalone_database_path
+                ):
+                    raise ValueError(
+                        "DATABASE_URL 与 SQLITE_PATH 必须指向同一个 SQLite 文件"
+                    )
+            return
+        if not url.startswith("postgresql"):
+            raise ValueError("multi 必须使用 PostgreSQL DATABASE_URL")
+        if not self.redis_url or not self.redis_required:
+            raise ValueError("multi 必须配置 REDIS_URL 且设置 REDIS_REQUIRED=true")
+        if provider != "opensandbox":
+            raise ValueError("multi 当前只支持 SANDBOX_PROVIDER=opensandbox")
 
 @lru_cache
 def get_settings() -> Settings:

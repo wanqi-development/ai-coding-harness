@@ -42,7 +42,11 @@ from ai_coding_harness.server.runs import RunHub
 from ai_coding_harness.server.service import HarnessService
 from ai_coding_harness.session.manager import SessionManager
 from ai_coding_harness.session.session_cache import build_session_cache
-from ai_coding_harness.session.state import build_checkpointer, build_store
+from ai_coding_harness.session.state import (
+    build_checkpointer,
+    build_store,
+    close_persistence,
+)
 from ai_coding_harness.tools.web_search import build_web_search_tool
 
 logger = logging.getLogger(__name__)
@@ -221,13 +225,14 @@ def create_app(settings: Settings) -> FastAPI:
         setup_logging(settings)
         setup_tracing(settings)
         app.state.settings = settings
+        database = Database(settings)
+        await database.prepare()
         # 模型按**角色**现取（路由表见 agent/llm.py），不再是启动时建一个大家共用：
         # 主智能体按形态取、子智能体按角色取，两者共用一套角色名。兜底模型同理现取
         # （`None` ＝ 该角色没有兜底）。
         web_search = build_web_search_tool(settings)
         store = await build_store(settings)
         checkpointer = await build_checkpointer(settings)
-        database = Database(settings)
         await apply_model_endpoints(settings, database)
         await apply_model_providers(settings, database)
         await apply_provider_models(settings, database)
@@ -311,9 +316,8 @@ def create_app(settings: Settings) -> FastAPI:
         await app.state.service.aclose()
         manager: SessionManager = app.state.manager
         await manager.close_local_runtimes()
+        await close_persistence(store, checkpointer)
         await database.dispose()
-        await store.conn.close()
-        await checkpointer.conn.close()
         if app.state.redis is not None:
             await app.state.redis.aclose()
 

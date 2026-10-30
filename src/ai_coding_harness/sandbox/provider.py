@@ -52,6 +52,8 @@ class SandboxProvider:
         self,
         volumes: list[Volume] | None = None,
         env: dict[str, str] | None = None,
+        *,
+        session_id: str | None = None,
     ) -> SandboxClient:
         """Create a sandbox and initialize it.
 
@@ -59,6 +61,7 @@ class SandboxProvider:
         hooks，故镜像的初始化逻辑改由**创建后经 `execute` 执行 setup 脚本**
         （``sandbox_setup_command``，读沙箱内 ``$GIT_TOKEN`` 写 ``.secrets``）完成。
         """
+        del session_id
         sandbox = await Sandbox.create(
             self._settings.sandbox_image,
             connection_config=self._connection_config,
@@ -74,12 +77,19 @@ class SandboxProvider:
             raise
         return client
 
-    async def reconnect(self, sandbox_id: str) -> SandboxClient | None:
+    async def reconnect(
+        self,
+        sandbox_id: str,
+        *,
+        session_id: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> SandboxClient | None:
         """按 id 重连到仍在运行的沙箱；沙箱已不存在或不可用时返回 ``None``。
 
         重连比重建便宜得多：容器与容器内文件系统原样保留。但容器若被重启过，
         ``.secrets`` 等非卷内容会丢失，故重连成功后仍重跑一次初始化（幂等）。
         """
+        del session_id, env
         try:
             sandbox = await Sandbox.connect(
                 sandbox_id,

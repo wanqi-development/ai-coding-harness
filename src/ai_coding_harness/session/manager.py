@@ -24,7 +24,6 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
-from opensandbox.models.sandboxes import Volume
 
 from ai_coding_harness.agent.graph import build_agent
 from ai_coding_harness.agent.middleware import (
@@ -45,8 +44,7 @@ from ai_coding_harness.infra.circuit import CircuitStore
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.safety.permissions import CommandSafety
 from ai_coding_harness.safety.policy import policy_for
-from ai_coding_harness.sandbox.client import SandboxClient
-from ai_coding_harness.sandbox.provider import SandboxProvider
+from ai_coding_harness.sandbox.factory import build_sandbox_provider
 from ai_coding_harness.sandbox.proxy import OpenSandboxProxy
 from ai_coding_harness.sandbox.volumes import (
     build_maven_cache_volume,
@@ -144,7 +142,7 @@ class SessionRuntime:
     改成每轮现建之后，改完下一轮就是新的（代价是每轮多一次装配，实测这点开销换来的是「热生效」）。
     """
 
-    sandbox: OpenSandboxProxy
+    sandbox: Any
     backend: BackendProtocol
     credential_version: int = 0
 
@@ -206,7 +204,7 @@ class SessionManager:
         self._checkpointer = checkpointer
         self._db = database
         self._circuit_store = circuit_store
-        self._provider = SandboxProvider(settings)
+        self._provider = build_sandbox_provider(settings)
         self._safety = CommandSafety()
         self._runtimes: dict[str, SessionRuntime] = {}
         self._pending: dict[str, _Pending] = {}
@@ -673,11 +671,23 @@ class SessionManager:
         stored = await self._stored_sandbox_id(session.db_id)
         volumes, volume_name, env = self._runtime_inputs(session)
 
-        client = await self._provider.reconnect(stored) if stored else None
+        client = (
+            await self._provider.reconnect(
+                stored,
+                session_id=session.public_id,
+                env=env,
+            )
+            if stored
+            else None
+        )
         if client is not None:
             logger.info("工作区重连成功：public_id=%s sandbox=%s", session.public_id, client.id)
         else:
-            client = await self._provider.create(volumes, env)
+            client = await self._provider.create(
+                volumes,
+                env,
+                session_id=session.public_id,
+            )
             logger.info("工作区创建完成：public_id=%s sandbox=%s", session.public_id, client.id)
 
         if pending.cancelled:
@@ -717,7 +727,7 @@ class SessionManager:
 
     def _runtime_inputs(
         self, session: Session
-    ) -> tuple[list[Volume] | None, str | None, dict[str, str]]:
+    ) -> tuple[list[Any] | None, str | None, dict[str, str]]:
         """建/重连沙箱的入参：工作区卷（挂 public_id 名下，重建可复用）+ 环境变量。
 
         环境变量里带沙箱 git 凭据：git 经 GIT_ASKPASS 取（脚本由 provider 推入），令牌
@@ -726,9 +736,16 @@ class SessionManager:
         Maven 本地仓库另挂一个缓存卷（``/ai_coding/.m2``）：默认跨会话共享，让「每次构建
         都重新下依赖」变成最多只下一次（见 ``sandbox/volumes.py``）。
         """
-        volumes: list[Volume] = []
-        volume_name = None
-        if self._settings.sandbox_volume_enabled:
+        volumes: list[Any] = []
+        volume_name = (
+            f"wsl-{session.public_id}"
+            if self._settings.effective_sandbox_provider == "wsl"
+            else None
+        )
+        if (
+            self._settings.effective_sandbox_provider == "opensandbox"
+            and self._settings.sandbox_volume_enabled
+        ):
             volume = build_workspace_volume(self._settings, session.public_id)
             if volume is not None:
                 volumes.append(volume)
@@ -742,6 +759,7 @@ class SessionManager:
         }
         env[self._settings.sandbox_git_token_env] = session.repo.token
         env[self._settings.sandbox_git_username_env] = session.repo.git_username
+        env["HARNESS_SESSION_ID"] = session.public_id
         return (volumes or None), volume_name, env
 
     async def _refresh_sandbox_credentials(
@@ -773,7 +791,7 @@ class SessionManager:
         """Drop local handles without destroying shared sandbox containers."""
         self._runtimes.clear()
 
-    async def _destroy_quietly_proxy(self, sandbox: OpenSandboxProxy) -> None:
+    async def _destroy_quietly_proxy(self, sandbox: Any) -> None:
         try:
             await sandbox.destroy()
         except Exception:
@@ -801,7 +819,7 @@ class SessionManager:
             return None
         return row.sandbox_id if row is not None else None
 
-    async def _destroy_quietly(self, client: SandboxClient) -> None:
+    async def _destroy_quietly(self, client: Any) -> None:
         """回收半成品容器；失败只记账 —— 它不能盖掉真正的失败原因。"""
         try:
             await self._provider.destroy(client)
@@ -810,18 +828,21 @@ class SessionManager:
 
     def _wrap_sandbox(
         self,
-        client: SandboxClient,
+        client: Any,
         *,
         public_id: str,
         db_id: int,
-        volumes: list[Volume] | None,
+        volumes: list[Any] | None,
         env: dict[str, str] | None,
         volume_name: str | None,
-    ) -> OpenSandboxProxy:
+    ) -> Any:
         """把裸沙箱包成可用性代理；重建后把新 sandbox_id 回填库。
 
         卷名由 ``public_id`` 决定、重建时不变，故回填时原样写回 ``volume_name``。
         """
+
+        if self._settings.effective_sandbox_provider == "wsl":
+            return client
 
         async def on_rebuild(new_sandbox_id: str) -> None:
             async with self._db.session() as db:
