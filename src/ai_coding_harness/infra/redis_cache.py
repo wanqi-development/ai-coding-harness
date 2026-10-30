@@ -237,6 +237,9 @@ async def build_redis(
     ``None`` 的语义是「这次没有 Redis」：调用方据此用进程内实现。连接在这里就验一次
     （``ping``），免得把「配了个错的地址」拖到用户点下第一轮对话时才炸。
     """
+    if settings.is_standalone:
+        logger.info("standalone 模式固定使用进程内运行状态，忽略 Redis 配置")
+        return None
     if not settings.redis_url:
         return None
 

@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, ClassVar
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     DateTime,
@@ -32,6 +33,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from ai_coding_harness.db.base import Base
 
 _AUTO_BIGINT = BigInteger().with_variant(Integer, "sqlite")
+_JSON = JSON().with_variant(JSONB(), "postgresql")
 
 
 class AgentSession(Base):
@@ -41,7 +43,7 @@ class AgentSession(Base):
     __table_args__: ClassVar[dict[str, str]] = {"comment": "会话表：一次用户会话"}
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True, comment="内部主键（自增）"
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="内部主键（自增）"
     )
     public_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -132,7 +134,7 @@ class Repository(Base):
     }
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
     )
     session_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -333,7 +335,7 @@ class Plan(Base):
     )
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
     )
     session_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -348,7 +350,7 @@ class Plan(Base):
         Text, nullable=False, comment="方案全文（Markdown，含分步骤）"
     )
     steps: Mapped[list | None] = mapped_column(
-        JSONB,
+        _JSON,
         nullable=True,
         comment="结构化步骤数组：[{index, goal, files, done_criteria}]",
     )
@@ -398,7 +400,7 @@ class PullRequest(Base):
     )
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
     )
     session_id: Mapped[int | None] = mapped_column(
         BigInteger,
@@ -487,7 +489,7 @@ class SessionRecord(Base):
     )
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
     )
     session_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -529,7 +531,7 @@ class SessionRecordDetail(Base):
         Text, nullable=True, comment="完整内容（聊天文本 / 方案全文 / 审查报告）"
     )
     extra: Mapped[dict | list | None] = mapped_column(
-        JSONB, nullable=True, comment="结构化附加（方案步骤 / findings / PR 链接等）"
+        _JSON, nullable=True, comment="结构化附加（方案步骤 / findings / PR 链接等）"
     )
 
 
@@ -683,7 +685,7 @@ class ModelProvider(Base):
         Text, nullable=True, comment="鉴权头前缀（默认 'Bearer '）"
     )
     default_models: Mapped[list | None] = mapped_column(
-        JSONB,
+        _JSON,
         nullable=True,
         comment="**已废弃**（2026-10-15）：内置候选清单不再被读写，列留着免得迁移（模型名以「刷新清单」拉到的那份为准）",
     )
@@ -713,7 +715,7 @@ class AppSetting(Base):
         String(64), primary_key=True, comment="稳定键（见 config.RUNTIME_SETTINGS）"
     )
     value: Mapped[Any | None] = mapped_column(
-        JSONB, nullable=True, comment="值（字符串 / 整数 / 小数；类型由键的定义决定）"
+        _JSON, nullable=True, comment="值（字符串 / 整数 / 小数；类型由键的定义决定）"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -806,10 +808,10 @@ class Clarification(Base):
     )
     question: Mapped[str] = mapped_column(Text, nullable=False, comment="qa 生成的澄清问题")
     options: Mapped[list] = mapped_column(
-        JSONB, nullable=False, comment="候选：[{intent,label,description}]，顺序即展示顺序"
+        _JSON, nullable=False, comment="候选：[{intent,label,description}]，顺序即展示顺序"
     )
     steps: Mapped[list] = mapped_column(
-        JSONB,
+        _JSON,
         nullable=False,
         server_default="[]",
         comment="多步澄清：[{id,question,options}]；旧记录为空，读取时回退 question/options",
