@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import posixpath
 from datetime import timedelta
+from typing import Any
 
 from deepagents.backends.protocol import (
     ExecuteResponse,
@@ -20,7 +21,6 @@ from deepagents.backends.protocol import (
 from deepagents.backends.sandbox import BaseSandbox
 
 from ai_coding_harness.safety.permissions import CommandSafety
-from ai_coding_harness.sandbox.proxy import OpenSandboxProxy
 
 
 class OpenSandboxBackend(BaseSandbox):
@@ -28,7 +28,7 @@ class OpenSandboxBackend(BaseSandbox):
 
     def __init__(
         self,
-        sandbox: OpenSandboxProxy,
+        sandbox: Any,
         safety: CommandSafety | None = None,
     ) -> None:
         self._sandbox = sandbox

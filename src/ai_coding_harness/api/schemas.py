@@ -422,6 +422,8 @@ class ModelConfigRowUpdate(BaseModel):
     base_url: str | None = None
     model: str | None = None
     api_key: str | None = None
+    #: 复用另一行已保存的 Key（不传明文；只允许同一用户、同一供应商与同一 base_url）
+    api_key_from: str | None = None
     context_window: int | None = None
 
 

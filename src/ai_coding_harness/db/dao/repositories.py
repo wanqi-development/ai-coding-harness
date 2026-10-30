@@ -86,6 +86,11 @@ async def lock_repo(
     事务结束自动释放，不必显式解锁；锁**必须在查之前**拿，拿晚了查的还是旧快照。
     ``hashtext`` 撞了只是让不相干的仓库偶发排一下队，不影响正确性。
     """
+    bind = db.get_bind()
+    if bind.dialect.name == "sqlite":
+        # standalone 固定单 worker；进程内同一会话的并发由 RunHub 收口。
+        # SQLite 没有 advisory lock，也不该为一个本地单用户部署引入额外锁服务。
+        return
     scope = f"{Platform.of(platform).value}:{owner}/{name}".lower()
     if user_id is not None:
         scope = f"user:{user_id}:{scope}"

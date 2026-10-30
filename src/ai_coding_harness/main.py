@@ -22,6 +22,7 @@ def selector_loop_factory() -> asyncio.AbstractEventLoop:
 
 def main() -> None:
     settings = get_settings()
+    settings.validate_deployment()
     app = create_app(settings)
     loop = "ai_coding_harness.main:selector_loop_factory" if sys.platform == "win32" else "auto"
     uvicorn.run(app, host=settings.host, port=settings.port, loop=loop)

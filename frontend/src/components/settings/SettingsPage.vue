@@ -514,6 +514,35 @@ function draftOf(row: ModelConfigRow): Draft {
   return drafts.value[row.key]
 }
 
+function normalizedBaseUrl(value: string): string {
+  return value.trim().replace(/\/+$/, '')
+}
+
+function hasOwnKey(row: ModelConfigRow, draft: Draft): boolean {
+  return (
+    row.has_key &&
+    !draft.clear_key &&
+    draft.provider === draft.original_provider
+  )
+}
+
+/**
+ * 已保存 Key 的复用范围严格是「同一供应商 + 同一 base_url」。
+ * 前端只拿得到掩码；真正复制在 PUT /model-config 的后端完成。
+ */
+function sharedKeyFor(row: ModelConfigRow, draft: Draft): ModelConfigRow | undefined {
+  if (hasOwnKey(row, draft)) return undefined
+  const baseUrl = normalizedBaseUrl(draft.base_url)
+  if (!draft.provider || !baseUrl) return undefined
+  return (data.value?.rows ?? []).find(
+    (candidate) =>
+      candidate.key !== row.key &&
+      candidate.has_key &&
+      candidate.provider === draft.provider &&
+      normalizedBaseUrl(candidate.base_url) === baseUrl,
+  )
+}
+
 /**
  * 一行的初始草稿。
 
@@ -597,6 +626,7 @@ async function load() {
 
 async function probe(row: ModelConfigRow) {
   const draft = draftOf(row)
+  const shared = sharedKeyFor(row, draft)
   draft.probe = '连接中…'
   draft.models = []
   draft.dirty = true
@@ -604,7 +634,9 @@ async function probe(row: ModelConfigRow) {
     const result = await probeProvider(
       draft.base_url,
       draft.api_key || null,
-      draft.clear_key ? undefined : row.key,
+      !draft.api_key && shared
+        ? shared.key
+        : (draft.clear_key ? undefined : row.key),
       draft.provider,
     )
     // 只有**实时**清单才进候选框（2026-10-15 起没有"内置候选"这回事了）
@@ -637,10 +669,12 @@ async function probe(row: ModelConfigRow) {
 async function saveRow(row: ModelConfigRow) {
   const draft = drafts.value[row.key]
   if (!draft) return
+  const shared = sharedKeyFor(row, draft)
   const item: Record<string, unknown> = {}
   if (draft.base_url !== row.base_url) item.base_url = draft.base_url
   if (draft.model !== row.model) item.model = draft.model
   if (draft.api_key) item.api_key = draft.api_key
+  else if (shared) item.api_key_from = shared.key
   else if (draft.clear_key && row.has_key) item.api_key = ''  // 显式清掉（留空＝不改）
   // 窗口那一格：**回显**（`window_auto`）时一个字都不写 —— 那一格显示的是后端解析出来的值
   // （行内 → 按模型查 → 兜底值），把它存下来等于给这一行加一个覆盖值，之后换模型就成了脏数据。
@@ -1168,8 +1202,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       :draft="draftOf(editing)"
       :providers="providers"
       :known-models="modelsByProvider[draftOf(editing).provider] ?? []"
-      :has-key="editing.has_key && !draftOf(editing).clear_key"
-      :masked-key="draftOf(editing).clear_key ? '' : editing.api_key_masked"
+      :has-key="hasOwnKey(editing, draftOf(editing)) || !!sharedKeyFor(editing, draftOf(editing))"
+      :masked-key="hasOwnKey(editing, draftOf(editing)) ? editing.api_key_masked : (sharedKeyFor(editing, draftOf(editing))?.api_key_masked ?? '')"
       :refreshing="refreshing === draftOf(editing).provider"
       :busy="busy"
       :error="dialogError"

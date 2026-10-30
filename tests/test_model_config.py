@@ -1005,6 +1005,71 @@ class TestApi:
 
         assert settings.agent_models["plan"].model == "new-model"
 
+    async def test_saving_automatically_reuses_a_key_from_the_same_endpoint(
+        self, monkeypatch
+    ):
+        store: dict[str, Any] = {
+            "qa": SimpleNamespace(
+                agent="qa",
+                base_url="https://api.deepseek.com/v1",
+                model_name="qa-model",
+                api_key="sk-shared-secret",
+                context_window=0,
+            )
+        }
+        _patch_dao(monkeypatch, store)
+
+        response = await _call(
+            _app(_settings()),
+            "PUT",
+            "/model-config",
+            json={
+                "rows": {
+                    "plan": {
+                        "model": "plan-model",
+                        "base_url": "https://api.deepseek.com/v1",
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        assert store["plan"].api_key == "sk-shared-secret"
+        rows = {row["key"]: row for row in response.json()["rows"]}
+        assert rows["plan"]["has_key"] is True
+        assert "sk-shared-secret" not in response.text
+
+    async def test_key_reuse_requires_the_same_endpoint(self, monkeypatch):
+        store: dict[str, Any] = {
+            "qa": SimpleNamespace(
+                agent="qa",
+                base_url="https://api.deepseek.com/v1",
+                model_name="qa-model",
+                api_key="sk-shared-secret",
+                context_window=0,
+            )
+        }
+        _patch_dao(monkeypatch, store)
+
+        response = await _call(
+            _app(_settings()),
+            "PUT",
+            "/model-config",
+            json={
+                "rows": {
+                    "plan": {
+                        "model": "plan-model",
+                        "base_url": "https://other.example/v1",
+                        "api_key_from": "qa",
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 400
+        assert "同一供应商、同一 base_url" in response.json()["detail"]
+        assert "plan" not in store
+
     async def test_restoring_a_row_also_clears_it_from_memory(self, monkeypatch):
         """恢复默认之后内存里不能留幽灵：`apply_model_endpoints` 是**先清空再落**的。"""
         store: dict[str, Any] = {"plan": SimpleNamespace(

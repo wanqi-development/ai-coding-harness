@@ -815,7 +815,16 @@ export async function getModelConfig(): Promise<ModelConfigSnapshot> {
 
 /** 保存：只提交**改过**的字段（不传＝不改；`api_key` 传空串＝清掉）。 */
 export async function putModelConfig(
-  rows: Record<string, { base_url?: string; model?: string; api_key?: string; context_window?: number }>,
+  rows: Record<
+    string,
+    {
+      base_url?: string
+      model?: string
+      api_key?: string
+      api_key_from?: string
+      context_window?: number
+    }
+  >,
   intentMode?: string,
 ): Promise<ModelConfigSnapshot> {
   const r = await fetch('/model-config', {
