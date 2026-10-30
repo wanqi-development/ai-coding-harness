@@ -98,7 +98,9 @@ const canSave = computed(
 )
 
 function markKeyTyped() {
-  if (props.draft.api_key.trim()) keyInvalid.value = false
+  if (props.draft.api_key.trim()) {
+    keyInvalid.value = false
+  }
 }
 
 function testConnection() {
