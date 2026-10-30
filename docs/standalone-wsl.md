@@ -180,9 +180,10 @@ REDIS_REQUIRED=true
 SANDBOX_PROVIDER=opensandbox
 ```
 
-PostgreSQL 地址继续由 `POSTGRES_*` 或 `DATABASE_URL` 提供。multi 模式启动时强制要求
-PostgreSQL、Redis 与 OpenSandbox，不允许静默退回单 worker 或进程内状态。multi 的管理员
-创建由具体运维人员执行 `create-admin`，不会自动生成密码，也不会把凭据写入文件。
+PostgreSQL 地址继续由 `POSTGRES_*` 或 `DATABASE_URL` 提供。multi 模式要求
+PostgreSQL、Redis URL 与 OpenSandbox；`REDIS_REQUIRED=true` 用于要求 Redis 故障时
+直接阻止启动，存量部署只配置 `REDIS_URL` 也能运行。multi 的管理员创建由具体运维人员
+执行 `create-admin`，不会自动生成密码，也不会把凭据写入文件。
 
 ## 数据库
 

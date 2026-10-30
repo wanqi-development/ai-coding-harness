@@ -1012,8 +1012,8 @@ class Settings(BaseSettings):
             return
         if not url.startswith("postgresql"):
             raise ValueError("multi 必须使用 PostgreSQL DATABASE_URL")
-        if not self.redis_url or not self.redis_required:
-            raise ValueError("multi 必须配置 REDIS_URL 且设置 REDIS_REQUIRED=true")
+        if not self.redis_url:
+            raise ValueError("multi 必须配置 REDIS_URL")
         if provider != "opensandbox":
             raise ValueError("multi 当前只支持 SANDBOX_PROVIDER=opensandbox")
 

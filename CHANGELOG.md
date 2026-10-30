@@ -25,6 +25,21 @@
 
 ### 2026-10-30
 
+#### 恢复旧 start.bat 的 multi 配置兼容性
+
+- **动机**：standalone 合并后新增的部署校验要求 `REDIS_REQUIRED=true`，导致已有只配置
+  `REDIS_URL` 的 `.env` 在原 `start.bat` 上直接启动失败。
+- **改动**：
+  - multi 模式只强制要求 `REDIS_URL`；`REDIS_REQUIRED=true` 恢复为可选的 fail-closed
+    开关，不再是旧部署升级的必填项。
+  - 新增回归测试，覆盖“已有 REDIS_URL、没有 REDIS_REQUIRED”的兼容启动场景。
+  - `.env.example`、README 与 standalone 文档同步说明该开关的语义。
+- **关键决策**：保留 Redis 故障降级的旧行为；希望多 worker 生产部署拒绝降级的实例仍可
+  显式设置 `REDIS_REQUIRED=true`。
+- **验证**：
+  - `tests/test_deployment_profiles.py` 通过。
+  - 原 `scripts/windows/start-backend.bat` 使用现有 `.env` 启动验证。
+
 #### 模型配置支持复用同端点 API Key
 
 - **动机**：同一用户给多个 Agent 配置同一供应商时，重复粘贴 API Key 既繁琐也容易造成

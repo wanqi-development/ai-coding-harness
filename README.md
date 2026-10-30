@@ -448,6 +448,9 @@ REDIS_REQUIRED=true
 SANDBOX_PROVIDER=opensandbox
 ```
 
+`REDIS_REQUIRED` 是 fail-closed 开关：存量部署只配置 `REDIS_URL` 仍可启动；生产多
+worker 建议设为 `true`，避免 Redis 故障时静默退回进程内状态。
+
 `POSTGRES_CONNECT_TIMEOUT_SECONDS` 控制建立数据库连接的最长等待时间，避免地址不可达时
 CLI 或服务长时间无响应。
 
@@ -455,8 +458,8 @@ CLI 或服务长时间无响应。
 但没有有效密钥时服务直接启动失败，避免 token 明文进入 Redis 或多 worker 静默退回本地缓存。
 可用 `python -m ai_coding_harness.manage generate-session-cache-key` 生成。
 
-multi 模式必须同时具备 PostgreSQL、Redis 和 OpenSandbox，启动时会拒绝静默退回单 worker
-或进程内状态。
+multi 模式必须同时具备 PostgreSQL、Redis 和 OpenSandbox。设置
+`REDIS_REQUIRED=true` 后，Redis 故障会直接阻止启动。
 
 ## 验证
 
