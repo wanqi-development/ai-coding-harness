@@ -13,6 +13,9 @@ if not defined HARNESS_SKIP_PREFLIGHT (
   if errorlevel 1 exit /b 1
 )
 
+set "HOST=%BACKEND_HOST%"
+set "PORT=%BACKEND_PORT%"
+
 cd /d "%REPO_ROOT%"
 echo [∫Û∂À] %BACKEND_HOST%:%BACKEND_PORT%
 echo         π”√ %PYTHON%

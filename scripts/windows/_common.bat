@@ -6,13 +6,14 @@ for %%I in ("%~dp0..\..") do set "REPO_ROOT=%%~fI"
 rem ---- 可按需修改 ----
 rem 项目运行环境 = conda 环境 aicoding；换环境时改这一行
 set "PYTHON=D:\developmentBinary\miniconda3\envs\aicoding\python.exe"
-set "BACKEND_HOST=127.0.0.1"
-set "BACKEND_PORT=8000"
-set "FRONTEND_PORT=5173"
-set "FRONTEND_URL=http://localhost:%FRONTEND_PORT%"
+if not defined BACKEND_HOST set "BACKEND_HOST=127.0.0.1"
+if not defined BACKEND_PORT set "BACKEND_PORT=8000"
+if not defined FRONTEND_PORT set "FRONTEND_PORT=5173"
+if not defined FRONTEND_URL set "FRONTEND_URL=http://localhost:%FRONTEND_PORT%"
 set "CURL=%SystemRoot%\System32\curl.exe"
-set "BACKEND_TRIES=30"
-set "FRONTEND_TRIES=15"
+set "PING=%SystemRoot%\System32\ping.exe"
+if not defined BACKEND_TRIES set "BACKEND_TRIES=30"
+if not defined FRONTEND_TRIES set "FRONTEND_TRIES=15"
 set "PYTHONPATH=src"
 rem --------------------
 
@@ -63,7 +64,7 @@ set /p "ans=      是否结束该进程并继续？(y/N) "
 if /i "!ans!"=="y" (
   taskkill /F /PID !found! >nul 2>&1
   echo       已结束占用进程：!found!
-  ping -n 2 127.0.0.1 >nul
+  "%PING%" -n 2 127.0.0.1 >nul
   exit /b 0
 )
 echo 取消启动。
@@ -82,7 +83,7 @@ set /a "waited=0"
 if not errorlevel 1 goto :wait_http_ok
 if !waited! geq !tries! goto :wait_http_timeout
 <nul set /p "=."
-ping -n 2 127.0.0.1 >nul
+"%PING%" -n 2 127.0.0.1 >nul
 set /a "waited+=1"
 goto :wait_http_loop
 

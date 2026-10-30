@@ -33,12 +33,16 @@
   - multi 模式只强制要求 `REDIS_URL`；`REDIS_REQUIRED=true` 恢复为可选的 fail-closed
     开关，不再是旧部署升级的必填项。
   - 新增回归测试，覆盖“已有 REDIS_URL、没有 REDIS_REQUIRED”的兼容启动场景。
+  - Windows 启动脚本现在把 `BACKEND_PORT` / `FRONTEND_PORT` 显式传给后端和 Vite，
+    避免继承外部 `PORT`；公共等待逻辑改为显式调用系统 `ping.exe`。
+  - `BACKEND_HOST` / `BACKEND_PORT` / `FRONTEND_PORT` / 探测次数允许通过环境变量覆盖。
   - `.env.example`、README 与 standalone 文档同步说明该开关的语义。
 - **关键决策**：保留 Redis 故障降级的旧行为；希望多 worker 生产部署拒绝降级的实例仍可
   显式设置 `REDIS_REQUIRED=true`。
 - **验证**：
   - `tests/test_deployment_profiles.py` 通过。
   - 原 `scripts/windows/start-backend.bat` 使用现有 `.env` 启动验证。
+  - 模拟外部 `PORT=5173` 启动后端，服务仍正确监听 8000，`/health` 返回 200。
 
 #### 模型配置支持复用同端点 API Key
 

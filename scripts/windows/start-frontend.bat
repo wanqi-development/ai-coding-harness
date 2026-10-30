@@ -13,6 +13,9 @@ if not defined HARNESS_SKIP_PREFLIGHT (
   if errorlevel 1 exit /b 1
 )
 
+set "HARNESS_FRONTEND_PORT=%FRONTEND_PORT%"
+set "HARNESS_BACKEND_URL=http://%BACKEND_HOST%:%BACKEND_PORT%"
+
 cd /d "%REPO_ROOT%"
 echo [Ç°¶Ë] %FRONTEND_URL%
 npm --prefix frontend run dev
