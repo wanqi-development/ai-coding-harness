@@ -18,6 +18,8 @@ const selected = ref('')
 const cache = ref<Record<string, { text: string; truncated: boolean }>>({})
 const loading = ref(false)
 const error = ref('')
+const treeCollapsed = ref(false)
+const expandedDirs = ref<Set<string>>(new Set())
 
 const files = computed(() => props.changes.files)
 const added = computed(() => files.value.reduce((sum, f) => sum + f.added, 0))
@@ -26,6 +28,142 @@ const total = computed(() => props.changes.total ?? files.value.length)
 
 const current = computed(() => cache.value[selected.value] ?? null)
 const rows = computed(() => (current.value ? sideBySide(current.value.text) : []))
+
+interface TreeFileNode {
+  kind: 'file'
+  name: string
+  path: string
+  file: FileChange
+  added: number
+  deleted: number
+  fileCount: number
+}
+
+interface TreeDirectoryNode {
+  kind: 'dir'
+  name: string
+  path: string
+  children: ChangeTreeNode[]
+  added: number
+  deleted: number
+  fileCount: number
+}
+
+type ChangeTreeNode = TreeFileNode | TreeDirectoryNode
+
+interface VisibleTreeNode {
+  node: ChangeTreeNode
+  depth: number
+  expanded: boolean
+}
+
+function aggregateTree(node: ChangeTreeNode): { added: number; deleted: number; count: number } {
+  if (node.kind === 'file') {
+    return { added: node.added, deleted: node.deleted, count: 1 }
+  }
+  let added = 0
+  let deleted = 0
+  let count = 0
+  for (const child of node.children) {
+    const totals = aggregateTree(child)
+    added += totals.added
+    deleted += totals.deleted
+    count += totals.count
+  }
+  node.added = added
+  node.deleted = deleted
+  node.fileCount = count
+  return { added, deleted, count }
+}
+
+function sortTree(nodes: ChangeTreeNode[]): void {
+  nodes.sort((left, right) => {
+    if (left.kind !== right.kind) return left.kind === 'dir' ? -1 : 1
+    return left.name.localeCompare(right.name)
+  })
+  for (const node of nodes) {
+    if (node.kind === 'dir') sortTree(node.children)
+  }
+}
+
+function buildChangeTree(changes: FileChange[]): ChangeTreeNode[] {
+  const roots: ChangeTreeNode[] = []
+  const folders = new Map<string, TreeDirectoryNode>()
+  for (const file of changes) {
+    const parts = file.path.split('/').filter(Boolean)
+    let children = roots
+    let currentPath = ''
+    for (const part of parts.slice(0, -1)) {
+      currentPath = currentPath ? `${currentPath}/${part}` : part
+      let folder = folders.get(currentPath)
+      if (!folder) {
+        folder = {
+          kind: 'dir',
+          name: part,
+          path: currentPath,
+          children: [],
+          added: 0,
+          deleted: 0,
+          fileCount: 0,
+        }
+        folders.set(currentPath, folder)
+        children.push(folder)
+      }
+      children = folder.children
+    }
+    children.push({
+      kind: 'file',
+      name: parts.at(-1) ?? file.path,
+      path: file.path,
+      file,
+      added: file.added,
+      deleted: file.deleted,
+      fileCount: 1,
+    })
+  }
+  sortTree(roots)
+  for (const root of roots) aggregateTree(root)
+  return roots
+}
+
+function collectDirectoryPaths(nodes: ChangeTreeNode[]): string[] {
+  const paths: string[] = []
+  for (const node of nodes) {
+    if (node.kind !== 'dir') continue
+    paths.push(node.path, ...collectDirectoryPaths(node.children))
+  }
+  return paths
+}
+
+const treeNodes = ref<ChangeTreeNode[]>(buildChangeTree(files.value))
+
+const visibleTreeNodes = computed<VisibleTreeNode[]>(() => {
+  const out: VisibleTreeNode[] = []
+  const visit = (nodes: ChangeTreeNode[], depth: number) => {
+    for (const node of nodes) {
+      const expanded = node.kind === 'dir' && expandedDirs.value.has(node.path)
+      out.push({ node, depth, expanded })
+      if (node.kind === 'dir' && expanded) visit(node.children, depth + 1)
+    }
+  }
+  visit(treeNodes.value, 0)
+  return out
+})
+
+function toggleDirectory(node: TreeDirectoryNode): void {
+  const next = new Set(expandedDirs.value)
+  if (next.has(node.path)) next.delete(node.path)
+  else next.add(node.path)
+  expandedDirs.value = next
+}
+
+function expandAllDirectories(): void {
+  expandedDirs.value = new Set(collectDirectoryPaths(treeNodes.value))
+}
+
+function collapseAllDirectories(): void {
+  expandedDirs.value = new Set()
+}
 
 function mark(status: string): string {
   const head = status.charAt(0).toUpperCase()
@@ -60,6 +198,8 @@ watch(
   (info) => {
     cache.value = {}
     error.value = ''
+    treeNodes.value = buildChangeTree(info.files)
+    expandedDirs.value = new Set(collectDirectoryPaths(treeNodes.value))
     selected.value = info.files[0]?.path ?? ''
     if (selected.value) void pick(info.files[0])
   },
@@ -152,39 +292,87 @@ function sideBySide(text: string): DiffRow[] {
 
     <p class="changes-base">{{ changes.base }} … {{ changes.head }}</p>
 
-    <ul class="changes-file-list">
-      <li v-for="file in files" :key="file.path">
-        <button
-          class="changes-file"
-          type="button"
-          :class="{ active: file.path === selected }"
-          @click="pick(file)"
-        >
-          <span class="changes-file-mark" :data-status="mark(file.status)">{{ mark(file.status) }}</span>
-          <span class="changes-file-path" :title="file.path">{{ file.path }}</span>
-          <span class="changes-file-count">
-            <b class="chg-add">+{{ file.added }}</b> <b class="chg-del">−{{ file.deleted }}</b>
-          </span>
-        </button>
-      </li>
-    </ul>
-
-    <div class="changes-diff-wrap">
-      <p v-if="loading" class="changes-note">正在读取改动…</p>
-      <p v-else-if="error" class="changes-note changes-error">{{ error }}</p>
-      <p v-else-if="!files.length" class="changes-note">这一轮没有文件改动。</p>
-      <template v-else-if="current">
-        <div class="changes-diff">
-          <div v-for="(row, i) in rows" :key="i" class="changes-diff-row">
-            <div v-if="row.meta" class="changes-diff-meta">{{ row.meta }}</div>
-            <template v-else>
-              <code class="changes-diff-cell" :class="`is-${row.leftKind}`">{{ row.left }}</code>
-              <code class="changes-diff-cell" :class="`is-${row.rightKind}`">{{ row.right }}</code>
-            </template>
+    <div class="changes-split" :class="{ 'tree-collapsed': treeCollapsed }">
+      <aside v-if="!treeCollapsed" class="changes-tree">
+        <div class="changes-tree-head">
+          <span class="changes-tree-title">文件 · {{ files.length }}</span>
+          <div class="changes-tree-actions">
+            <button type="button" title="展开全部目录" @click="expandAllDirectories">展开</button>
+            <button type="button" title="折叠全部目录" @click="collapseAllDirectories">折叠</button>
+            <button
+              type="button"
+              class="changes-tree-pane-toggle"
+              title="收起文件树"
+              aria-label="收起文件树"
+              @click="treeCollapsed = true"
+            >
+              ‹
+            </button>
           </div>
         </div>
-        <p v-if="current.truncated" class="changes-note">改动太长，只显示前一段。</p>
-      </template>
+        <div class="changes-tree-scroll">
+          <button
+            v-for="row in visibleTreeNodes"
+            :key="row.node.path"
+            type="button"
+            class="changes-tree-row"
+            :class="{
+              'is-dir': row.node.kind === 'dir',
+              'is-file': row.node.kind === 'file',
+              active: row.node.kind === 'file' && row.node.path === selected,
+            }"
+            :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
+            :title="row.node.path"
+            :aria-expanded="row.node.kind === 'dir' ? row.expanded : undefined"
+            @click="row.node.kind === 'dir' ? toggleDirectory(row.node) : pick(row.node.file)"
+          >
+            <span v-if="row.node.kind === 'dir'" class="changes-tree-chevron">
+              {{ row.expanded ? '▾' : '▸' }}
+            </span>
+            <span
+              v-else
+              class="changes-file-mark changes-tree-mark"
+              :data-status="mark(row.node.file.status)"
+            >
+              {{ mark(row.node.file.status) }}
+            </span>
+            <span class="changes-tree-name">{{ row.node.name }}</span>
+            <span class="changes-tree-count">
+              <b class="chg-add">+{{ row.node.added }}</b>
+              <b class="chg-del">−{{ row.node.deleted }}</b>
+            </span>
+          </button>
+          <p v-if="!files.length" class="changes-note">这一轮没有文件改动。</p>
+        </div>
+      </aside>
+      <button
+        v-else
+        type="button"
+        class="changes-tree-rail"
+        title="展开文件树"
+        aria-label="展开文件树"
+        @click="treeCollapsed = false"
+      >
+        文件 ›
+      </button>
+
+      <div class="changes-diff-wrap">
+        <p v-if="loading" class="changes-note">正在读取改动…</p>
+        <p v-else-if="error" class="changes-note changes-error">{{ error }}</p>
+        <p v-else-if="!files.length" class="changes-note">这一轮没有文件改动。</p>
+        <template v-else-if="current">
+          <div class="changes-diff">
+            <div v-for="(row, i) in rows" :key="i" class="changes-diff-row">
+              <div v-if="row.meta" class="changes-diff-meta">{{ row.meta }}</div>
+              <template v-else>
+                <code class="changes-diff-cell" :class="`is-${row.leftKind}`">{{ row.left }}</code>
+                <code class="changes-diff-cell" :class="`is-${row.rightKind}`">{{ row.right }}</code>
+              </template>
+            </div>
+          </div>
+          <p v-if="current.truncated" class="changes-note">改动太长，只显示前一段。</p>
+        </template>
+      </div>
     </div>
   </div>
 </template>
