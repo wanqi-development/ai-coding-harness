@@ -117,7 +117,7 @@ class FakeProvider:
         if self.gate is not None:
             await self.gate.wait()
 
-    async def create(self, volumes, env):
+    async def create(self, volumes, env, *, session_id=None):
         client_id = f"sb-new-{len(self.created) + 1}"
         self.created.append(client_id)
         self.created_with.append((volumes, env))
@@ -129,7 +129,7 @@ class FakeProvider:
         self.clients.append(client)
         return client
 
-    async def reconnect(self, sandbox_id: str | None):
+    async def reconnect(self, sandbox_id: str | None, *, session_id=None, env=None):
         if sandbox_id is None or not self.reconnectable:
             return None
         self.reconnected.append(sandbox_id)

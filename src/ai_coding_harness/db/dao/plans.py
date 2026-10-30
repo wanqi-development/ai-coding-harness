@@ -257,6 +257,24 @@ async def set_plan_step_status(
         # 静默改错数据比报错更糟，这里直接当未命中处理。
         return None
     position = index - 1
+    if db.get_bind().dialect.name == "sqlite":
+        row = await db.scalar(
+            select(Plan).where(
+                Plan.id == plan_id,
+                Plan.session_id == session_id,
+            )
+        )
+        if row is None or not isinstance(row.steps, list) or position >= len(row.steps):
+            return None
+        steps = [dict(item) if isinstance(item, dict) else item for item in row.steps]
+        step = steps[position]
+        if not isinstance(step, dict):
+            return None
+        step["status"] = status
+        row.steps = steps
+        row.updated_at = _now()
+        await db.flush()
+        return steps
     path = cast(literal([str(position), "status"]), ARRAY(Text))
     result = await db.execute(
         update(Plan)

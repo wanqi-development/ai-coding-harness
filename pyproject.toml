@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ai-coding-harness"
 version = "0.1.0"
-description = "Coding-assist harness agent built on deepagents + OpenSandbox"
+description = "Coding-assist harness built on deepagents with standalone WSL and multi-worker sandbox profiles"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,6 +21,8 @@ dependencies = [
     "langchain-openai>=1.3.2,<1.4",
     "langgraph",
     "langgraph-checkpoint-postgres",
+    "langgraph-checkpoint-sqlite",
+    "aiosqlite",
     "psycopg[binary]",
     # 多 worker 时的跨进程旁路状态（运行缓冲 / 会话运行权 / 熔断状态）。
     # 不配 REDIS_URL 时用不到它 —— 代码里是懒 import，单 worker 部署照旧跑。
