@@ -9,7 +9,7 @@
  * - **拖动期间给 body 挂 resizing**：cursor / user-select 交给 CSS，免得拖着拖着选中一堆文字。
  */
 
-import { onBeforeUnmount, ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 
 export interface PanelWidthOptions {
   /** localStorage 键前缀，如 `ui.sidebar`（实际写 `<key>.width` / `<key>.collapsed`） */
@@ -19,6 +19,10 @@ export interface PanelWidthOptions {
   max: number
   /** 面板在对话区的**右侧**时传 true（拖动方向相反） */
   invert?: boolean
+  /** 面板所在容器：内部面板需要按容器宽度限制，不能只看整个窗口 */
+  container?: Ref<HTMLElement | null>
+  /** 容器里必须留给另一侧内容的最小宽度 */
+  reserve?: number
   /**
    * 收起状态要不要记住。默认记住；**左栏传 false** —— 它是导航，每次加载都该是展开的
    * （宽度仍然记住）。右栏是内容面板，收起往往是刻意的，所以保持记住。
@@ -44,7 +48,16 @@ function write(key: string, value: string): void {
 }
 
 export function usePanelWidth(options: PanelWidthOptions) {
-  const { key, defaultWidth, min, max, invert = false, persistCollapsed = true } = options
+  const {
+    key,
+    defaultWidth,
+    min,
+    max,
+    invert = false,
+    container,
+    reserve = 0,
+    persistCollapsed = true,
+  } = options
 
   const stored = Number(read(`${key}.width`))
   const width = ref(Number.isFinite(stored) && stored > 0 ? stored : defaultWidth)
@@ -53,7 +66,10 @@ export function usePanelWidth(options: PanelWidthOptions) {
 
   function clamp(value: number): number {
     // 窄屏上限跟着窗口走：两个面板都按上限摊开时，中间的对话列还得有地方
-    const cap = Math.max(min, Math.min(max, Math.round(window.innerWidth * 0.45)))
+    const available = container?.value?.clientWidth
+      ? container.value.clientWidth - reserve
+      : window.innerWidth * 0.45
+    const cap = Math.max(min, Math.min(max, Math.round(available)))
     return Math.round(Math.min(Math.max(value, min), cap))
   }
 
@@ -117,9 +133,19 @@ export function usePanelWidth(options: PanelWidthOptions) {
   }
   window.addEventListener('resize', onWindowResize)
 
+  let resizeObserver: ResizeObserver | null = null
+  onMounted(() => {
+    onWindowResize()
+    if (container?.value && typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(onWindowResize)
+      resizeObserver.observe(container.value)
+    }
+  })
+
   watch([width, collapsed], persist)
   onBeforeUnmount(() => {
     window.removeEventListener('resize', onWindowResize)
+    resizeObserver?.disconnect()
     document.body.classList.remove('resizing')
   })
 

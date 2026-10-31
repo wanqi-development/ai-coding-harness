@@ -53,6 +53,7 @@
 ## 环境要求
 
 - Windows 10/11 上安装 WSL2 和一套 Ubuntu 22.04/24.04。
+- Windows 安装 Node.js 20+，确保 `node --version` 和 `npm --version` 可直接执行。
 - 建议使用名为 `ai-coding-harness` 的专用发行版；使用现有发行版时同步修改 `WSL_DISTRO`。
 - 不需要在 Windows 或 WSL 中安装 Docker / OpenSandbox。
 - WSL 内核必须允许 unprivileged user namespaces，`bubblewrap` 才能创建命令沙箱。
@@ -99,7 +100,8 @@ wsl --install -d Ubuntu-24.04
 1. 安装 Python 3.11+、Node.js 20+、Java 21、Maven、Go、Git、ripgrep、sqlite3 与
    bubblewrap。
 2. 创建 `harness` 用户及 `~/.ai-coding-harness` 数据目录。
-3. 创建独立 Python 虚拟环境并安装项目依赖。
+3. 在 `~/.ai-coding-harness/venv` 创建独立 Python 虚拟环境并安装项目依赖；它不复用
+   开发仓库的 `.venv`。
 4. 缺少 `.env` 时从 `.env.example` 创建；已有 `.env` 不覆盖。
 5. 数据库没有用户时，自动生成随机密码创建首个 `admin` 并认领历史会话。
 
@@ -122,7 +124,7 @@ Standalone 初始管理员已创建
 凭据文件权限为 `0600`。管理员带有 `must_change_password=true`，首次登录后必须先修改密码。
 如果数据库已有用户，后续启动只提示管理员已存在，不再生成新密码，也不覆盖凭据文件。
 
-Windows 侧的 `frontend/node_modules` 缺失时，入口也会自动执行 `npm install`。
+Windows 侧的 `frontend/node_modules` 缺失时，入口会通过 `npm` 自动安装依赖。
 启动成功后自动打开 `http://localhost:5173`。
 
 运行期间保持启动窗口开启，按 `Ctrl+C` 同时停止前后端。直接关闭窗口可能留下脱离的后台
@@ -180,9 +182,10 @@ REDIS_REQUIRED=true
 SANDBOX_PROVIDER=opensandbox
 ```
 
-PostgreSQL 地址继续由 `POSTGRES_*` 或 `DATABASE_URL` 提供。multi 模式启动时强制要求
-PostgreSQL、Redis 与 OpenSandbox，不允许静默退回单 worker 或进程内状态。multi 的管理员
-创建由具体运维人员执行 `create-admin`，不会自动生成密码，也不会把凭据写入文件。
+PostgreSQL 地址继续由 `POSTGRES_*` 或 `DATABASE_URL` 提供。multi 模式要求
+PostgreSQL、Redis URL 与 OpenSandbox；`REDIS_REQUIRED=true` 用于要求 Redis 故障时
+直接阻止启动，存量部署只配置 `REDIS_URL` 也能运行。multi 的管理员创建由具体运维人员
+执行 `create-admin`，不会自动生成密码，也不会把凭据写入文件。
 
 ## 数据库
 

@@ -147,9 +147,13 @@ if (-not $needsBootstrap) {
 }
 
 if (-not $NoFrontend) {
+    & node --version
+    if ($LASTEXITCODE -ne 0) {
+        throw "node cannot run. Install Node.js 20+ and add it to PATH."
+    }
     $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
     if (-not $npm) {
-        throw "Windows npm was not found. Install Node.js LTS, then run this file again."
+        throw "npm.cmd was not found on PATH. Install Node.js 20+ with npm."
     }
     $viteBin = Join-Path $repoRoot "frontend\node_modules\.bin\vite.cmd"
     if (-not (Test-Path -LiteralPath $viteBin)) {

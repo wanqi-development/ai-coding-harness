@@ -5,8 +5,8 @@ set -euo pipefail
 COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${COMMON_DIR}/../.." && pwd)"
 
-# 可设 PYTHON 覆盖；默认使用当前已激活的 Python 环境（项目推荐 aicoding）
-PYTHON="${PYTHON:-python3}"
+# Python is project-local only. Environment managers materialize this exact .venv.
+PYTHON="${REPO_ROOT}/.venv/bin/python"
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
@@ -57,9 +57,27 @@ preflight_backend() {
   if [ ! -f "${REPO_ROOT}/.env" ]; then
     echo "[警告] 未找到 .env，后端可能无法启动。请先由 .env.example 复制并填写配置。"
   fi
-  if ! "${PYTHON}" -c "import sys" >/dev/null 2>&1; then
-    echo "[错误] Python 无法启动：${PYTHON}"
-    echo "       先激活项目环境（推荐 conda aicoding），或设置 PYTHON=/path/to/python。"
+  if [ ! -x "${PYTHON}" ]; then
+    echo "[错误] 未找到项目虚拟环境：${PYTHON}"
+    echo "       先执行：uv sync --extra dev"
+    return 1
+  fi
+  if ! "${PYTHON}" -c \
+    "import sys; raise SystemExit(0 if sys.version_info >= (3, 14) else 1)" \
+    >/dev/null 2>&1; then
+    echo "[错误] Python 3.14 无法启动：${PYTHON}"
+    echo "       用 Python 3.14 重新创建项目 .venv。"
+    return 1
+  fi
+  if ! "${PYTHON}" -c "import ssl" >/dev/null 2>&1; then
+    echo "[错误] 项目 Python 无法加载 SSL 模块：${PYTHON}"
+    echo "       解释器构建不完整，执行 uv sync --extra dev 重建 .venv。"
+    return 1
+  fi
+  if ! (cd "${REPO_ROOT}" && "${PYTHON}" -c "import ai_coding_harness.main") \
+    >/dev/null 2>&1; then
+    echo "[错误] 项目依赖未安装到：${PYTHON}"
+    echo "       执行：uv sync --extra dev"
     return 1
   fi
   if ! command -v git >/dev/null 2>&1; then
@@ -68,8 +86,12 @@ preflight_backend() {
 }
 
 preflight_frontend() {
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "[错误] 未找到 npm，无法启动前端。"
+  if ! node --version; then
+    echo "[错误] node 无法运行；请安装 Node.js 20+ 并加入 PATH。"
+    return 1
+  fi
+  if ! npm --version; then
+    echo "[错误] npm 无法运行；请确认 Node.js 20+ 的 npm 已加入 PATH。"
     return 1
   fi
 }

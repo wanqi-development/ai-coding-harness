@@ -702,7 +702,7 @@ class Settings(BaseSettings):
     )
 
     # OpenSandbox
-    opensandbox_domain: str = "192.168.72.128:8080"
+    opensandbox_domain: str = "127.0.0.1:8080"
     opensandbox_api_key: str = os.getenv("OPENSANDBOX_API_KEY", "")
     sandbox_image: str = "opensandbox/code-interpreter:v1.1.0"
     sandbox_root: str = "/ai_coding"
@@ -1012,8 +1012,8 @@ class Settings(BaseSettings):
             return
         if not url.startswith("postgresql"):
             raise ValueError("multi 必须使用 PostgreSQL DATABASE_URL")
-        if not self.redis_url or not self.redis_required:
-            raise ValueError("multi 必须配置 REDIS_URL 且设置 REDIS_REQUIRED=true")
+        if not self.redis_url:
+            raise ValueError("multi 必须配置 REDIS_URL")
         if provider != "opensandbox":
             raise ValueError("multi 当前只支持 SANDBOX_PROVIDER=opensandbox")
 

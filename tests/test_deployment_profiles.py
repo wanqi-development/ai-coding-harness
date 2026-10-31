@@ -89,8 +89,16 @@ def test_standalone_rejects_postgres(tmp_path: Path) -> None:
 
 
 def test_multi_requires_redis_and_opensandbox() -> None:
-    with pytest.raises(ValueError, match="REDIS_REQUIRED"):
+    with pytest.raises(ValueError, match="REDIS_URL"):
         Settings(_env_file=None, deployment_mode="multi").validate_deployment()
+
+    # Existing deployments may already have REDIS_URL but predate REDIS_REQUIRED.
+    # Redis remains enabled; the explicit flag only controls fail-closed behavior.
+    Settings(
+        _env_file=None,
+        deployment_mode="multi",
+        redis_url="redis://127.0.0.1:6379/0",
+    ).validate_deployment()
 
     settings = Settings(
         _env_file=None,

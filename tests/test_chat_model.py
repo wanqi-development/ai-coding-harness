@@ -1,10 +1,11 @@
-"""思考正文的补丁层：ChatOpenAI 丢掉 ``reasoning_content``，这里把它捞回来。
+"""思考正文的补丁层：ChatOpenAI 丢掉 ``reasoning_content``，这里完成完整往返。
 
-两层都要钉：
+三层都要钉：
 
 ① ``_convert_chunk_to_generation_chunk`` 从**原始 chunk** 里取 ``reasoning_content``；
 ② ``ReasoningAIMessageChunk.content_blocks`` 把它还原成 reasoning 块 —— OpenAI 的
-   provider translator 不读 ``additional_kwargs``，只补 ① 到不了 v3 事件桥。
+   provider translator 不读 ``additional_kwargs``，只补 ① 到不了 v3 事件桥；
+③ ``_get_request_payload`` 把历史里的思考写回 assistant 消息，工具续轮不会丢上下文。
 
 不联网：chunk 是手造的 dict，和 ``chunk.model_dump()`` 的形状一致。
 """
@@ -14,10 +15,11 @@ from __future__ import annotations
 from typing import Any
 
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk
 
 from ai_coding_harness.agent.chat_model import (
+    ReasoningAIMessage,
     ReasoningAIMessageChunk,
     ReasoningChatOpenAI,
 )
@@ -84,11 +86,71 @@ def test_stream_chunks_merge_reasoning_and_text() -> None:
     assert {"type": "text", "text": "425"} in merged.content_blocks
 
 
+def test_reasoning_content_is_replayed_in_the_next_chat_request() -> None:
+    """思考不能只在界面上出现；tool call 后的下一次请求必须把这段历史发回模型。"""
+    assistant = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": "先检查目录，再执行命令"},
+        tool_calls=[
+            {
+                "name": "execute",
+                "args": {"command": "ls"},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+    payload = _model()._get_request_payload(
+        [assistant, ToolMessage(content="README.md", tool_call_id="call_1")]
+    )
+
+    assert payload["messages"][0]["reasoning_content"] == "先检查目录，再执行命令"
+    assert payload["messages"][1]["role"] == "tool"
+
+
+def test_reasoning_block_is_also_replayed_in_the_next_chat_request() -> None:
+    """历史消息来自内容块形态时也不能丢；兼容旧 checkpoint 与新的 v3 消息。"""
+    assistant = AIMessage(
+        content=[{"type": "reasoning", "reasoning": "先算乘法"}],
+    )
+
+    payload = _model()._get_request_payload([assistant])
+
+    assert payload["messages"][0]["reasoning_content"] == "先算乘法"
+
+
 def test_a_chunk_without_reasoning_gains_no_empty_block() -> None:
     generation = _generation(_chunk(content="425"))
 
     assert "reasoning_content" not in generation.message.additional_kwargs
     assert generation.message.content_blocks == [{"type": "text", "text": "425"}]
+
+
+def test_non_stream_response_keeps_reasoning_content() -> None:
+    result = _model()._create_chat_result(
+        {
+            "model": "m",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "425",
+                        "reasoning_content": "先算乘法",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+
+    message = result.generations[0].message
+    assert isinstance(message, ReasoningAIMessage)
+    assert message.additional_kwargs["reasoning_content"] == "先算乘法"
+    assert message.content_blocks == [
+        {"type": "reasoning", "reasoning": "先算乘法"},
+        {"type": "text", "text": "425"},
+    ]
 
 
 def test_tool_calls_survive_when_the_default_class_is_the_subclass() -> None:
