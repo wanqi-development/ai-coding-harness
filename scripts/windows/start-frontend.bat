@@ -1,11 +1,10 @@
 @echo off
-"%SystemRoot%\System32\chcp.com" 936 >nul
 setlocal enabledelayedexpansion
 set "COMMON=%~dp0_common.bat"
 call "%COMMON%"
 
 if not defined HARNESS_SKIP_PORT_CHECK (
-  call "%COMMON%" check-port "%FRONTEND_PORT%" "Ç°¶Ë"
+  call "%COMMON%" check-port "%FRONTEND_PORT%" "frontend"
   if errorlevel 1 exit /b 1
 )
 if not defined HARNESS_SKIP_PREFLIGHT (
@@ -17,6 +16,7 @@ set "HARNESS_FRONTEND_PORT=%FRONTEND_PORT%"
 set "HARNESS_BACKEND_URL=http://%BACKEND_HOST%:%BACKEND_PORT%"
 
 cd /d "%REPO_ROOT%"
-echo [Ç°¶Ë] %FRONTEND_URL%
-"%NPM%" --prefix frontend run dev
+echo [frontend] %FRONTEND_URL%
+echo            npm: %NPM%
+call "%NPM%" --prefix frontend run dev
 exit /b %errorlevel%

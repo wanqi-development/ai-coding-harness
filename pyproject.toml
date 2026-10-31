@@ -10,9 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     # **这两个必须钉住**：我们按类排掉了 deepagents 自带的压缩中间件、自己构造了一份，
-    # 还依赖 langchain 摘要中间件的若干取值语义。`requirements.txt` 早就钉了，但
-    # `pip install -e ".[dev]"` 是按**这份**重装依赖的（AGENTS.md 记着这个坑）——
-    # 这里不钉，一次重装就可能把它们抬到新版而让上面那套静默失效。
+    # 还依赖 langchain 摘要中间件的若干取值语义。依赖只以本文件和 uv.lock 为准；
+    # 这里不设上界，一次 `uv sync` 就可能把它们抬到新版而让上面那套静默失效。
     "deepagents>=0.6.11,<0.7",
     "langchain>=1.4.0,<2",
     # **钉住**：``agent/chat_model.py`` 覆写了 ChatOpenAI 的流式 chunk 转换

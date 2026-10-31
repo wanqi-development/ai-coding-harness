@@ -1,12 +1,11 @@
 @echo off
-"%SystemRoot%\System32\chcp.com" 936 >nul
 setlocal enabledelayedexpansion
 set "COMMON=%~dp0_common.bat"
 call "%COMMON%"
 
-call "%COMMON%" check-port "%BACKEND_PORT%" "后端"
+call "%COMMON%" check-port "%BACKEND_PORT%" "backend"
 if errorlevel 1 exit /b 1
-call "%COMMON%" check-port "%FRONTEND_PORT%" "前端"
+call "%COMMON%" check-port "%FRONTEND_PORT%" "frontend"
 if errorlevel 1 exit /b 1
 call "%COMMON%" preflight-backend
 if errorlevel 1 exit /b 1
@@ -16,27 +15,27 @@ if errorlevel 1 exit /b 1
 set "HARNESS_SKIP_PORT_CHECK=1"
 set "HARNESS_SKIP_PREFLIGHT=1"
 
-echo [1/3] 启动后端 %BACKEND_HOST%:%BACKEND_PORT% ...
+echo [1/3] Starting backend on %BACKEND_HOST%:%BACKEND_PORT% ...
 start "harness-backend" cmd /k ""%~dp0start-backend.bat""
 
-echo       等待后端就绪（最多 %BACKEND_TRIES% 次探测）...
+echo       Waiting for backend (%BACKEND_TRIES% probes) ...
 call "%COMMON%" wait-http %BACKEND_HOST% %BACKEND_PORT% /health %BACKEND_TRIES%
 if errorlevel 1 (
-  echo [警告] 后端未就绪，仍继续启动前端；请查看 harness-backend 窗口中的报错。
+  echo [WARN] Backend did not become healthy. Check the harness-backend window.
 )
 
-echo [2/3] 启动前端 %FRONTEND_URL% ...
+echo [2/3] Starting frontend at %FRONTEND_URL% ...
 start "harness-frontend" cmd /k ""%~dp0start-frontend.bat""
 
-echo       等待前端就绪（最多 %FRONTEND_TRIES% 次探测）...
+echo       Waiting for frontend (%FRONTEND_TRIES% probes) ...
 call "%COMMON%" wait-http localhost %FRONTEND_PORT% / %FRONTEND_TRIES%
 if errorlevel 1 (
-  echo [警告] 前端未就绪，仍继续；请查看 harness-frontend 窗口中的报错。
+  echo [WARN] Frontend did not become ready. Check the harness-frontend window.
 )
 
-echo [3/3] 打开浏览器 ...
+echo [3/3] Opening browser ...
 start "" %FRONTEND_URL%
 
 echo.
-echo 完成。关闭对应窗口即可停止服务。
+echo Started. Close the service windows to stop.
 exit /b 0

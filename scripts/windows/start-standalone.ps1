@@ -147,14 +147,17 @@ if (-not $needsBootstrap) {
 }
 
 if (-not $NoFrontend) {
-    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
-    if (-not $npm) {
-        throw "Windows npm was not found. Install Node.js LTS, then run this file again."
+    if (-not $env:NODE_HOME) {
+        throw "NODE_HOME is not set. Set it to the Node.js installation directory."
+    }
+    $npm = Join-Path $env:NODE_HOME "npm.cmd"
+    if (-not (Test-Path -LiteralPath $npm)) {
+        throw "npm.cmd was not found under NODE_HOME: $npm"
     }
     $viteBin = Join-Path $repoRoot "frontend\node_modules\.bin\vite.cmd"
     if (-not (Test-Path -LiteralPath $viteBin)) {
         Write-Host "Installing frontend dependencies ..."
-        & $npm.Source --prefix (Join-Path $repoRoot "frontend") install
+        & $npm --prefix (Join-Path $repoRoot "frontend") install
         if ($LASTEXITCODE -ne 0) {
             throw "Frontend dependency installation failed."
         }

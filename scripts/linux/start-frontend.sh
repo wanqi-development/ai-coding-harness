@@ -15,4 +15,4 @@ cd "${REPO_ROOT}"
 echo "[前端] ${FRONTEND_URL}"
 export HARNESS_FRONTEND_PORT="${FRONTEND_PORT}"
 export HARNESS_BACKEND_URL="${HARNESS_BACKEND_URL:-http://${BACKEND_HOST}:${BACKEND_PORT}}"
-exec npm --prefix frontend run dev
+exec "${NPM}" --prefix frontend run dev

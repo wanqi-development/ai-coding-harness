@@ -23,6 +23,73 @@
 
 ## 修改记录
 
+### 2026-10-31
+
+#### 重构本地启动器的运行时依赖发现
+
+- **现象**：从精简环境启动时，根目录 `start.bat` 报 `chcp`、`ping`、`npm`
+  不是内部或外部命令；原启动器还把某个开发机专用的 Python 绝对路径提交到了仓库。
+- **根因**：启动器没有定义可移植的运行时依赖契约，既依赖父进程碰巧完整的
+  `PATH/PATHEXT`，又用机器绝对路径绕过该依赖。换机器后两者都会失效。
+- **改动**：
+  - Windows BAT 全部改为 ASCII + CRLF，移除 `chcp 936`，不再依赖本机代码页。
+  - Windows / Linux 启动器都只使用项目 `.venv` 中的解释器，不回落到 conda、系统
+    Python 或 `PATH`；Node 只从显式 `NODE_HOME` 查找。
+  - WSL standalone 也移除 `HARNESS_PYTHON` 覆盖，只运行 standalone 的固定 venv；
+    Windows standalone 启动器同样只从 `NODE_HOME` 取 npm。
+  - 提交 `.python-version`（3.14）与 `uv.lock`，把环境创建和依赖解析统一到 uv；
+    删除无人读取的 `requirements.txt`，避免出现第二份依赖事实源。
+  - 本地开发由 `.python-version` 固定 Python 3.14；包元数据继续保持 Python 3.11+，
+    避免把独立的 WSL standalone 运行时无意抬到 3.14。
+  - 公共脚本只补回标准 Windows 系统路径，不再包含 `D:\...`、用户名或任何机器
+    专属目录。
+  - 启动前校验 Python 3.14、SSL、项目依赖、npm 和前端依赖；缺失时输出明确的
+    修复命令。
+  - 根目录新增 `start.bat --check-env`，直接复用同一套发现和校验逻辑。
+  - 新增启动器契约测试，禁止重新引入机器绝对路径、非 ASCII 编码、LF-only 行尾、
+    `HARNESS_PYTHON/HARNESS_NPM` 或第二份依赖文件。
+  - 清掉文档中的本机路径痕迹，并把 OpenSandbox 默认地址从开发机私有网段改为通用的
+    `127.0.0.1:8080`；实际部署继续由 `OPENSANDBOX_DOMAIN` 覆盖。
+- **验证**：`uv lock --check` 与 `uv sync --locked --extra dev` 通过；全量测试
+  **1362 passed, 1 skipped, 1 deselected**（排除既有 Linux 只读目录环境失败）。
+  Windows 预检能明确识别缺失 `.venv`、缺失 `NODE_HOME` 以及损坏的解释器 SSL。
+- **遗留**：本机 Windows CPython 3.14.7 / 3.14.9 的 venv launcher 都无法加载
+  `_ssl`（基础解释器直接运行正常），因此本机 `start.bat --check-env` 会按设计
+  拒绝启动；换用 python.org 完整安装后删除 `.venv` 并重新 `uv sync` 即可。
+
+#### 修复 reasoning_content 历史未回传给模型
+
+- **现象**：模型流式返回里有思考正文，界面也能显示；但工具调用后的下一轮请求中，
+  assistant 历史只有 `content` / `tool_calls`，没有 `reasoning_content`。`gpt-6-luna`
+  因此看不到上一段推理，而 `gpt-6.1-luna` 的响应路径未暴露这个问题。
+- **根因**：`ReasoningChatOpenAI` 原先只从响应 chunk 提取思考并转成 reasoning 内容块，
+  没有覆写请求序列化；父类 `ChatOpenAI` 不处理第三方的 `reasoning_content`，所以这段
+  历史在发回网关时仍被丢掉。
+- **改动**：
+  - `ReasoningChatOpenAI._get_request_payload` 从历史 assistant 的
+    `additional_kwargs` 或 reasoning 内容块中取思考，写回 Chat Completions 的
+    `reasoning_content`。
+  - 新增 `ReasoningAIMessage`，非流式响应也保留思考；流式与非流式使用相同的
+    reasoning 块逻辑。
+  - 意图分类继续使用普通 `ChatOpenAI` 并关闭思考；它不需要展示或回传推理内容。
+- **验证**：定向测试 `58 passed`，Ruff 通过；全量 `1353 passed, 1 skipped`。唯一失败
+  是既有的 `test_repo_cache` 只读目录清理用例，在 Linux 下把目录权限设为 `0200`
+  后无法进入，与本次模型改动无关。
+- **遗留**：未使用真实网关重新发送 gpt-6-luna 工具续轮；上线后应确认网关在请求
+  assistant 消息中接受并利用 `reasoning_content`。
+
+#### 修复 GPT-6 Responses API 可读思考为空
+
+- **动机**：`gpt-6.1-sol` 已走 Responses API，但当前网关对
+  `reasoning.summary="detailed"` 只返回 `encrypted_content`，界面收到的 reasoning
+  block 长度为 0。
+- **改动**：GPT-6 的 reasoning summary 模式从 `detailed` 改为 `auto`；其他模型及
+  Responses API 的其余参数不变。
+- **验证**：同一模型、同一网关的原始 Responses API 实测：`detailed` summary 长度 0；
+  `auto` 返回 322 字；`concise` 返回 205 字。更新参数契约测试。
+- **遗留**：若供应商网关未来对 `auto` 也停止返回 summary，只能显示“该网关仅返回加密
+  reasoning”，无法从 `encrypted_content` 还原可读思考。
+
 ### 2026-10-30
 
 #### 恢复旧 start.bat 的 multi 配置兼容性
@@ -5409,16 +5476,16 @@
 
 #### 代码缓存搬到用户个人目录（默认 `~/.ai-coding-harness/repo_cache`）
 
-- **动机**：用户指出右侧栏「代码」面板在本机拉的那份仓库缓存落到了**项目目录**里（`D:\python-project\ai-coding-harness\repo_cache`）—— 那是下载来的第三方代码，混在项目里既会被误当成项目文件，也会跟着项目被备份/同步走。要求缓存到**用户个人目录**，用的时候从本地加载。
+- **动机**：用户指出右侧栏「代码」面板在本机拉的那份仓库缓存落到了**项目目录**里（`<repo-root>/repo_cache`）—— 那是下载来的第三方代码，混在项目里既会被误当成项目文件，也会跟着项目被备份/同步走。要求缓存到**用户个人目录**，用的时候从本地加载。
 - **改动**：
   - `src/ai_coding_harness/config.py`：`repo_view_dir` 的默认值从相对路径 `"repo_cache"` 改成**用户目录** `~/.ai-coding-harness/repo_cache`（用 `Field(default_factory=_default_repo_view_dir)` 算出来 —— 这是跟着机器走的路径，写不成字面量）。`REPO_VIEW_DIR` 照旧可覆盖；**给了相对路径仍按当前工作目录解析**（`repo_cache.cache_root()` 会转绝对路径，上一轮那个「相对路径被解析两次」的坑仍被盯着）。
   - `src/ai_coding_harness/repo_cache.py`：模块说明里把默认位置写清（不是项目目录），并保留那条 cwd 教训的注释。
   - `README.md`：代码面板那条把默认写成的路径。
-  - **删掉了项目目录里那份旧缓存** `D:\python-project\ai-coding-harness\repo_cache\`（≈700KB，含之前错位的那份嵌套克隆；纯缓存、可重新下载）。删除前核对过：解析后的绝对路径正好是工作区下的 `repo_cache`，不是工作区根。
+  - **删掉了项目目录里那份旧缓存** `<repo-root>/repo_cache/`（≈700KB，含之前错位的那份嵌套克隆；纯缓存、可重新下载）。删除前核对过：解析后的绝对路径正好是工作区下的 `repo_cache`，不是工作区根。
 - **关键决策**：
   - **按用户目录、不按系统规范**：Linux 的规矩是 `~/.cache/...`、Windows 是 `%LOCALAPPDATA%`，但那要维护两套规则、排障时还得多想一步；`~/.ai-coding-harness/…` 一套写法两个平台都好找（用户也选了这条）。
   - **默认值用工厂算**：路径随机器变（还要吃 `HOME`/`USERPROFILE`），所以不能写成 `log_dir` 那种字面量默认值。
-- **验证**：`Settings().repo_view_dir` 实测为 `C:\Users\52387\.ai-coding-harness\repo_cache`，`repo_cache.cache_root()` 解析一致；`REPO_VIEW_DIR=D:/x/cache` 覆盖仍有效；`tests/test_repo_cache.py` / `test_repo_routes.py` 等 **81 条全过**（它们用临时目录，不受默认值影响）；全量 `pytest` **927 条全过**；`ruff check` 改动文件干净。
+- **验证**：`Settings().repo_view_dir` 实测为 `~/.ai-coding-harness/repo_cache`，`repo_cache.cache_root()` 解析一致；`REPO_VIEW_DIR=D:/x/cache` 覆盖仍有效；`tests/test_repo_cache.py` / `test_repo_routes.py` 等 **81 条全过**（它们用临时目录，不受默认值影响）；全量 `pytest` **927 条全过**；`ruff check` 改动文件干净。
 - **遗留**：
   - **要重启后端**才用新默认值；重启后第一次点「同步」会在用户目录下重新 clone 一份（旧的已删，所以是全新下载）。
   - 缓存仍然**不会自动清理**（多仓库会持续占磁盘）：现在要清就是删 `~/.ai-coding-harness/repo_cache` 下对应目录。
@@ -5708,7 +5775,7 @@
   - 全量 `pytest`（conda 环境 `aicoding` + `PYTHONPATH=src`）**838 条全过**（上一批 821，净增 17）；本次改动文件 `ruff check` 干净。
   - 踩到一个测试环境的坑，值得记下来：那几条「长调用」用例**不能用**文件里那个冻结时钟的 `clock` fixture —— Windows 的 asyncio 定时器也走 `time.monotonic`，时钟一冻结 `await asyncio.sleep(...)` 就永远不醒（实测试跑挂住，得杀进程）。所以它们改用真实时钟 + 很小的续期间隔（0.05s）。
 - **遗留**：
-  - **没做真机验证**：本机到 OpenSandbox（`192.168.72.128:8080`）的 socket 被环境挡了（`WinError 10013`），续期请求没实打实发出去过。要确认两件事：① 你们那台 OpenSandbox 是否支持 `POST /sandboxes/{id}/renew-expiration`；② 续期后 `get_info().expires_at` 确实推后。跑一轮长会话、在 `logs/agent.log` 里找 `沙箱已续期：public_id=… 到期=…` 即可。
+  - **没做真机验证**：本机到 OpenSandbox（`<opensandbox-host>:8080`）的 socket 被环境挡了（`WinError 10013`），续期请求没实打实发出去过。要确认两件事：① 你们那台 OpenSandbox 是否支持 `POST /sandboxes/{id}/renew-expiration`；② 续期后 `get_info().expires_at` 确实推后。跑一轮长会话、在 `logs/agent.log` 里找 `沙箱已续期：public_id=… 到期=…` 即可。
   - **续期只延长寿命，不解决「已经丢过的容器内状态」**：想让 `/ai_coding/tmp`、`/ai_coding/review` 跨重建存活，得把它们也放进卷（现在卷只挂 `project/`）—— 另一件事。
   - 间隔默认 30 分钟是拍的量（TTL 的一半）；若某类会话一轮常跑超过 60 分钟，可以把 `SANDBOX_TIMEOUT_MINUTES` 一起调大。
   - 心跳的 tick 目前是模块常量（30 秒），没做成配置项：它只是「多久检查一次」，真正决定续不续的是 `SANDBOX_RENEW_INTERVAL_SECONDS`，暂时不值得多一个旋钮。
@@ -5865,7 +5932,7 @@
   - 同上文件（工作区与记忆口径）：`_BASE_ENV` 的「工作区规则」不再逐目录声称可写，改成「**你能写进去哪些目录，以你这份提示词的「工作目录」段为准**」，只保留硬不变量（policies / skills 只读、output 谁也不写、.secrets 不可读写）；生命周期那句改成「**这一轮改了代码就及时 commit + push**（只有改码的形态适用）」；`_BASE_ENV` 的记忆写回归属改成「写回只由**持有 `save_repo_memory` 的主控形态**完成……只读形态与三个子智能体都不写记忆」；联网搜索规则的「仓库上下文」改成指向注入的「仓库记忆」块（别再读盘）。
   - 同上文件（工作目录补全）：`_ROLE_ORCHESTRATE` 的「工作目录」补上 review（可写，审查原文）与 tmp（可写），project 那行从「**只读**」改成「**本轮不写**（写码由 coder 负责；核实现状只用只读命令）」—— 边界允许写、口径不许写，说「只读」是句假话；`_REVIEW_WORKDIR` 补上仓库记忆（**只读**）；`_ROLE_QA` / `_ROLE_ANALYSIS` 的工作目录各补一行仓库记忆（**只读**，写回不归这一轮）。
   - 同上文件（顺序）：`_MEMORY_GATE` 第一句改成「在 `write_todos` 之前、`storePlan` 之前，也在派 `planner` / `coder` / `reviewer` 之前（它是记忆写回，不算「落文件」）」—— 把三处「第一件事」的先后钉死，并点明它不违反「不落文件」。
-  - `start.bat` / `start.sh`：`PYTHON=` 默认值从已经失效的 `D:\python-venv\ai_coding\Scripts\python.exe` 改成 conda 环境 `aicoding` 的解释器（`D:\developmentBinary\miniconda3\envs\aicoding\python.exe`，`conda env list` 可见），并各加一段**启动前自检**：真跑一次 `python -c "import sys"`，失败就打印「Python 无法启动 + 项目运行环境是 conda 环境 aicoding」并退出。用「试跑」而不是「判文件在不在」是有理由的：那个坏掉的 venv 里 `Scripts\python.exe` **文件是在的**（255KB），`if not exist` 判不出来，只有真跑一次才知道它起不来。`start.bat` 是 **GBK 编码**，改动是用 `[System.Text.Encoding]::GetEncoding(936)` 读—改—写完成的，校验过：无 BOM（首三字节 `40 65 63`）、无 U+FFFD、按 UTF-8 严格解码仍失败（说明编码没被改坏）、`启动后端` / `未找到 .env` 等既有中文全部完好。
+  - `start.bat` / `start.sh`：`PYTHON=` 默认值从已经失效的 `<venv>\Scripts\python.exe` 改成 conda 环境 `aicoding` 的解释器（`<conda-env>\python.exe`，`conda env list` 可见），并各加一段**启动前自检**：真跑一次 `python -c "import sys"`，失败就打印「Python 无法启动 + 项目运行环境是 conda 环境 aicoding」并退出。用「试跑」而不是「判文件在不在」是有理由的：那个坏掉的 venv 里 `Scripts\python.exe` **文件是在的**（255KB），`if not exist` 判不出来，只有真跑一次才知道它起不来。`start.bat` 是 **GBK 编码**，改动是用 `[System.Text.Encoding]::GetEncoding(936)` 读—改—写完成的，校验过：无 BOM（首三字节 `40 65 63`）、无 U+FFFD、按 UTF-8 严格解码仍失败（说明编码没被改坏）、`启动后端` / `未找到 .env` 等既有中文全部完好。
   - `scripts/check_prompts.py`（**新增**）：渲染八个成品提示词并扫七类跨形态冲突（C1 清单口径 / C2 越界委派 / C3 越界回评 / C4 越界写命令 / C5 plan 记忆 / C6 目录可写 vs `policy_for` 的实际写根 / C7 只读形态的落地要求）。它只加载 `profiles` / `prompts` / `policy` 三个纯模块（`config` 打桩），因此**不依赖第三方包**，在装不起依赖的机器上也能跑；`--grep 仓库记忆` 可按关键字打印各形态的原文。改前 44 条、改后 0 条。
   - 测试：`tests/test_prompts.py` 的 `TestTheListCarriesThePlanSteps` 按合并后的口径重写（新增「相反要求不许回来」一条：既钉「一步一条」在，也钉「清单只写你自己的动作 / 不复述方案」**不在**）；新增 `TestSkillRulesBelongToTheFormThatDoesTheWork`（只有 orchestrate 提委派与回评、`code-review` skill 落在审查那三份）与 `TestGitWriteCommandsOnlyReachTheCoder`（写命令只在 `CODER_PROMPT`、只读命令留在共用段、plan 末步写明由 coder 执行）；`TestNoDanglingReferences` 的「子 Agent 名字要对」改钉 `MAIN_AGENT_PROMPT`（名字归唯一挂子智能体的形态）；`TestReviewReply` 的「不得凭记忆复述」改钉 `MAIN_AGENT_PROMPT` + `REVIEW_AGENT_PROMPT`（原断言钉在共用段，而那句已经挪走）；记忆写回归属那条断言随文案更新。`tests/test_profiles.py` 的 `test_plan_form_lands_no_files_at_all` 改写成 `test_plan_form_writes_only_the_memory_and_the_plan`，并新增三条（plan 记忆不再写成只读、review 形态的写目录与记忆只读、共用目录表指向按形态的「工作目录」段）与一条「没有形态收到无条件 commit + push」。
 - **关键决策**：
@@ -5879,13 +5946,13 @@
   - `scripts/check_prompts.py`：改前 **44 条**冲突（C1×8、C2×7、C3×3、C4×13、C5×1、C6×9、C7×2，去重后逐条打印），改后 **0 条**。
   - 另一组按新测试口径写的 13 条不变量自检全部通过（orchestrate 独占委派与回评、`code-review` skill 落在审查三份、plan 记忆不再只读且写回进白名单、planner 记忆仍只读、写命令只在 coder 那份、清单两条不再互相否定、四个单智能体形态都无无条件 commit + push）。
   - `ruff check` 本次改动文件（`prompts.py` / `scripts/check_prompts.py` / 两个测试文件）**All checks passed**；`py_compile` 四个文件通过。
-  - **全量 `pytest`：788 条全过**（`PYTHONPATH=src`，解释器 `D:\developmentBinary\miniconda3\envs\aicoding\python.exe`，9.48s；两条 warning 是既有的 v3 流式协议实验性提示，与本次改动无关）。跑第一遍时抓到一条**真失败**：`TestReviewReply::test_reply_must_quote_source_not_memory` 原来钉「不得凭记忆复述」在 `BASE_PROMPT` 里 —— 那句正是本批从共用段挪进 orchestrate 角色段的，断言跟着改成钉两个能回评的形态（已一并修正后才全绿）。
-  - 运行环境（用户确认 + 本机实测）：项目的运行环境是 **conda 环境 `aicoding`**（`conda env list` 可见，实质路径 `D:\developmentBinary\miniconda3\envs\aicoding`，Python 3.14.0，依赖齐全）。标准跑法：`conda activate aicoding` 之后 `PYTHONPATH=src python -m pytest -q` —— 这个环境里**没有**把本项目 `pip install -e .` 进去，`src` 必须进 `PYTHONPATH`（`start.bat` / `start.sh` 里本来就是这么设的）。实测 `conda run -n aicoding --no-capture-output python -m pytest -q` → **788 passed**。
-  - 另一套环境（顺手把话说准，免得下次误判）：`D:\python-venv\ai_coding` 这个 venv **现在能用** —— 它把本项目 editable 装了（`ai-coding-harness 0.1.0 → D:\python-project\ai-coding-harness`），pytest / deepagents 齐全，`-m pytest` 可直接跑。（**2026-09-24 我第一次检查时它是坏的**：当时 `pyvenv.cfg` 的 `home` 指向已被删除的 `D:\development_software\python3.4.17`，`Scripts\python.exe` 报「did not find executable」；现在该文件指向 `D:\developmentBinary\python3.14`。本批的启动脚本按用户指定的 conda 环境改，两套都能跑，要换回 venv 只需改那一行。）
+  - **全量 `pytest`：788 条全过**（`PYTHONPATH=src`，解释器 `<conda-env>\python.exe`，9.48s；两条 warning 是既有的 v3 流式协议实验性提示，与本次改动无关）。跑第一遍时抓到一条**真失败**：`TestReviewReply::test_reply_must_quote_source_not_memory` 原来钉「不得凭记忆复述」在 `BASE_PROMPT` 里 —— 那句正是本批从共用段挪进 orchestrate 角色段的，断言跟着改成钉两个能回评的形态（已一并修正后才全绿）。
+  - 运行环境（用户确认 + 本机实测）：项目的运行环境是 **conda 环境 `aicoding`**（`conda env list` 可见，实质路径 `<conda-env>`，Python 3.14.0，依赖齐全）。标准跑法：`conda activate aicoding` 之后 `PYTHONPATH=src python -m pytest -q` —— 这个环境里**没有**把本项目 `pip install -e .` 进去，`src` 必须进 `PYTHONPATH`（`start.bat` / `start.sh` 里本来就是这么设的）。实测 `conda run -n aicoding --no-capture-output python -m pytest -q` → **788 passed**。
+  - 另一套环境（顺手把话说准，免得下次误判）：`<venv>` 这个 venv **现在能用** —— 它把本项目 editable 装了（`ai-coding-harness 0.1.0 → <repo-root>`），pytest / deepagents 齐全，`-m pytest` 可直接跑。（**2026-09-24 我第一次检查时它是坏的**：当时 `pyvenv.cfg` 的 `home` 指向已被删除的 `<old-python-home>`，`Scripts\python.exe` 报「did not find executable」；现在该文件指向 `<python-home>`。本批的启动脚本按用户指定的 conda 环境改，两套都能跑，要换回 venv 只需改那一行。）
 - **遗留**：
   - **改动尚未在活的后端生效**（活进程比这些文件旧），要重启才算数；提示词是构建期读盘，新建会话即拿新的，重启只是让活进程也换过来。
   - **`start.sh` 没能做语法检查**：本机 PATH 上没有 `bash`（`Get-Command bash` 为空），`bash -n start.sh` 跑不了，改动靠与既有行同形 + 人工核对。`start.bat` 那半的 `if errorlevel 1` 构造用等价的 `cmd /v:on` 一次性命令验过（conda 解释器 → `OK`）。
-  - **两个启动脚本本批都改了，但它们各自指向的解释器需要你确认**：现在指 conda 环境 `aicoding`（按你说的口径）；如果你日常其实用 `D:\python-venv\ai_coding`（那套是 editable 装的，能直接 `import ai_coding_harness`），把 `PYTHON=` 换回它即可 —— 两套我都实测过能跑。
+  - **两个启动脚本本批都改了，但它们各自指向的解释器需要你确认**：现在指 conda 环境 `aicoding`（按你说的口径）；如果你日常其实用 `<venv>`（那套是 editable 装的，能直接 `import ai_coding_harness`），把 `PYTHON=` 换回它即可 —— 两套我都实测过能跑。
   - **`orchestrate` 的 project 写根仍与它的口径并存**（本批只把「只读」改成「本轮不写」）：要彻底一致就得撤 policy 的写根，风险是主控在派发前后自己跑 git 写操作时会被拒 —— **等你定**。
   - **共用段与角色段的划分仍是手工维护的**：`scripts/check_prompts.py` 只覆盖这七类已知冲突，新模式（例如新形态、新技能）还得靠人看；如果以后这类矛盾再出现，优先往这个脚本里加一条规则，而不是只加测试。
   - 上一批记的两条仍未动：`save_repo_memory` 的「不像记忆就拒写」守卫、需求表已有行的「分支 / 链接」纠正。
@@ -7279,7 +7346,7 @@
   - `sandbox/provider.py`：`SandboxProvider`（每会话新建沙箱 → `mkdir -p` 初始化五个目录 → 返回 `SandboxClient`；`destroy` 销毁）。
   - `config.py` 增加 `sandbox_timeout_minutes = 60`。
 - **关键决策**：
-  - 沙箱镜像 `opensandbox/code-interpreter:v1.1.0`，服务地址 `192.168.72.128:8080`，沙箱根目录 `/ai_coding`。
+  - 沙箱镜像 `opensandbox/code-interpreter:v1.1.0`，服务地址 `<opensandbox-host>:8080`，沙箱根目录 `/ai_coding`。
   - 五个工作目录：`/ai_coding/{project,policies,run,skills,output}`。
   - OpenSandbox API key 配置在 `.env`（不进代码、不入库）。
 
@@ -7288,5 +7355,5 @@
 - **改动**：建立 src 布局、`pyproject.toml`（hatchling 打包）、`.env.example`、`README.md`、`.gitignore`、`config.py`、`main.py` 占位。
 - **关键决策**：
   - 发行包名 `ai-coding-harness`，导入包 `ai_coding_harness`。
-  - venv 用 `D:\python-venv\ai_coding\Scripts\python.exe`（Python 3.14.7）。
+  - venv 用 `<venv>\Scripts\python.exe`（Python 3.14.7）。
   - 环境变量无前缀；`OPENAI_API_KEY` / `OPENAI_MODEL` 由用户自填。

@@ -9,7 +9,7 @@ HARNESS_HOME="$(getent passwd "${HARNESS_USER}" | cut -d: -f6)"
 APP_HOME="${HARNESS_HOME}/.ai-coding-harness"
 VENV="${HARNESS_VENV:-${APP_HOME}/venv}"
 DB_PATH="${HARNESS_SQLITE_PATH:-${APP_HOME}/harness.sqlite3}"
-PYTHON="${HARNESS_PYTHON:-${VENV}/bin/python}"
+PYTHON="${VENV}/bin/python"
 ADMIN_CREDENTIALS_FILE="${ADMIN_CREDENTIALS_FILE:-${APP_HOME}/logs/initial-admin.txt}"
 
 if [ ! -x "${PYTHON}" ]; then

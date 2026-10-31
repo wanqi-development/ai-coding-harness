@@ -305,24 +305,54 @@ start.bat                # Windows 兼容入口
 
 ## 环境与启动
 
-multi 模式或手工部署推荐 Python 3.11+ 和 conda 环境 `aicoding`：
+本地开发使用 uv，并固定使用仓库根目录的项目环境：
+
+- Python：`.python-version` 固定为 3.14，解释器只取 `.venv`；不会回落到 conda、系统
+  Python 或其他命名环境。
+- Node：版本 20+，安装位置只通过 `NODE_HOME` 提供。
+- 依赖事实源：`pyproject.toml + uv.lock`；`.venv` 和 `node_modules` 都不提交。
+
+需要预先安装 [uv](https://docs.astral.sh/uv/) 和 Node.js 20+。先在仓库根目录同步
+Python 环境并初始化数据库：
+
+```bash
+uv sync --extra dev
+uv run alembic upgrade head
+uv run python -m ai_coding_harness.manage create-admin --username admin --claim-existing
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+$env:NODE_HOME = "C:\Program Files\nodejs"
+[Environment]::SetEnvironmentVariable("NODE_HOME", "C:\Program Files\nodejs", "User")
+& "$env:NODE_HOME\npm.cmd" --prefix frontend install
+.\start.bat --check-env
+.\start.bat
+```
+
+Linux：
 
 ```bash
 cp .env.example .env
-pip install -e ".[dev]"
-alembic upgrade head
-python -m ai_coding_harness.manage create-admin --username admin --claim-existing
-npm --prefix frontend install
+export NODE_HOME=/path/to/node
+"$NODE_HOME/bin/npm" --prefix frontend install
+bash scripts/linux/start.sh
 ```
 
-一键启动：
+启动器只调用 `.venv\Scripts\python.exe`（Windows）或 `.venv/bin/python`
+（Linux/macOS）。缺少 `.venv`、项目依赖、Node 或 `NODE_HOME` 时，会停止在预检阶段并
+打印修复命令，不会启动一个依赖错误环境的半成品服务。
 
-```bash
-bash scripts/linux/start.sh     # Linux
-start.bat                       # Windows（也可直接运行 scripts\windows\start.bat）
-```
+`.venv` 是生成目录，不提交到 Git。若 `--check-env` 报项目 Python 无法加载 `ssl`，
+说明底层 CPython 安装不完整；请换用 python.org 的完整 CPython 3.14，删除 `.venv`
+后重新执行 `uv sync --extra dev`。
 
 WSL2 standalone（后端运行在 WSL，Windows 只负责启动和打开界面）：
+
+standalone 使用自己的固定 WSL venv，不复用开发机的 `.venv`；Python 支持 3.11+。
+Windows 前端仍要求设置 `NODE_HOME`。
 
 ```text
 双击根目录 start-standalone.bat
@@ -361,10 +391,11 @@ bash scripts/linux/start-backend.sh
 bash scripts/linux/start-frontend.sh
 ```
 
-Linux 脚本默认使用当前环境里的 `python3`；conda 环境未激活时可这样覆盖：
+Linux 脚本固定使用仓库 `.venv/bin/python`，Node 通过 `NODE_HOME/bin/npm` 启动：
 
 ```bash
-PYTHON=/path/to/aicoding/bin/python bash scripts/linux/start.sh
+export NODE_HOME=/path/to/node
+bash scripts/linux/start.sh
 ```
 
 后端：`http://127.0.0.1:8000`
@@ -456,7 +487,7 @@ CLI 或服务长时间无响应。
 
 `SESSION_CACHE_ENCRYPTION_KEY` 接受 32 字节 base64 或 64 位十六进制。multi 启用 Redis
 但没有有效密钥时服务直接启动失败，避免 token 明文进入 Redis 或多 worker 静默退回本地缓存。
-可用 `python -m ai_coding_harness.manage generate-session-cache-key` 生成。
+可用 `uv run python -m ai_coding_harness.manage generate-session-cache-key` 生成。
 
 multi 模式必须同时具备 PostgreSQL、Redis 和 OpenSandbox。设置
 `REDIS_REQUIRED=true` 后，Redis 故障会直接阻止启动。
@@ -465,11 +496,10 @@ multi 模式必须同时具备 PostgreSQL、Redis 和 OpenSandbox。设置
 
 ```powershell
 $env:PYTHONPATH='src'
-conda run -n aicoding --no-capture-output python -m pytest -q
-
-D:\python-venv\ai_coding\Scripts\ruff.exe check <changed-files>
-python scripts/check_prompts.py
-npm.cmd --prefix frontend run build
+.\.venv\Scripts\python -m pytest -q
+.\.venv\Scripts\python -m ruff check <changed-files>
+.\.venv\Scripts\python scripts/check_prompts.py
+"$env:NODE_HOME\npm.cmd" --prefix frontend run build
 ```
 
 ## 更多文档
