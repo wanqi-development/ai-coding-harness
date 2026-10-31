@@ -274,8 +274,9 @@ def _wants_responses_api(model: str) -> bool:
     """GPT-6 通过 Responses API 返回可展示的 reasoning summary。
 
     2026-10-28 实测：``gpt-6-luna`` / ``gpt-6.1-sol`` 走 Chat Completions 时只有
-    reasoning token，没有可读思考；切到 Responses API 并显式请求
-    ``summary="detailed"`` 后才返回 ``response.reasoning_summary_text.delta``。
+    reasoning token，没有可读思考；切到 Responses API 并显式请求 reasoning summary
+    后才返回 ``response.reasoning_summary_text.delta``。当前网关对 ``detailed`` 返回空
+    summary + encrypted_content，``auto`` 才返回可读摘要（2026-10-31 实测 322 字）。
     这是模型/接口能力差异，不是全局默认，其他仍走 Chat Completions。
     """
     name = (model or "").strip().lower()
@@ -307,7 +308,7 @@ def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
         model_options: dict[str, Any] = {
             "use_responses_api": True,
             "output_version": "responses/v1",
-            "reasoning": {"effort": "high", "summary": "detailed"},
+            "reasoning": {"effort": "high", "summary": "auto"},
             # 完整历史已包含 Responses reasoning item；继续走本地 checkpoint，
             # 不把会话状态隐式转交给网关的 previous_response_id。
             "use_previous_response_id": False,

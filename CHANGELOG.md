@@ -23,6 +23,20 @@
 
 ## 修改记录
 
+### 2026-10-31
+
+#### 修复 GPT-6 Responses API 可读思考为空
+
+- **动机**：`gpt-6.1-sol` 已走 Responses API，但当前网关对
+  `reasoning.summary="detailed"` 只返回 `encrypted_content`，界面收到的 reasoning
+  block 长度为 0。
+- **改动**：GPT-6 的 reasoning summary 模式从 `detailed` 改为 `auto`；其他模型及
+  Responses API 的其余参数不变。
+- **验证**：同一模型、同一网关的原始 Responses API 实测：`detailed` summary 长度 0；
+  `auto` 返回 322 字；`concise` 返回 205 字。更新参数契约测试。
+- **遗留**：若供应商网关未来对 `auto` 也停止返回 summary，只能显示“该网关仅返回加密
+  reasoning”，无法从 `encrypted_content` 还原可读思考。
+
 ### 2026-10-30
 
 #### 模型配置支持复用同端点 API Key

@@ -210,7 +210,7 @@ def test_gpt6_uses_responses_api_with_detailed_reasoning(name: str) -> None:
 
     assert model.use_responses_api is True
     assert model.output_version == "responses/v1"
-    assert model.reasoning == {"effort": "high", "summary": "detailed"}
+    assert model.reasoning == {"effort": "high", "summary": "auto"}
     assert model.use_previous_response_id is False
     assert model.reasoning_effort is None
     assert model.extra_body in (None, {})
