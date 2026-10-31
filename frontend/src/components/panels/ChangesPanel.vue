@@ -10,6 +10,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { getRepoDiff, type ChangesInfo, type FileChange } from '../../lib/api'
+import { usePanelWidth } from '../../lib/splitter'
 
 const props = defineProps<{ sessionId: string; changes: ChangesInfo }>()
 const emit = defineEmits<{ close: [] }>()
@@ -18,8 +19,30 @@ const selected = ref('')
 const cache = ref<Record<string, { text: string; truncated: boolean }>>({})
 const loading = ref(false)
 const error = ref('')
-const treeCollapsed = ref(false)
 const expandedDirs = ref<Set<string>>(new Set())
+const splitRef = ref<HTMLElement | null>(null)
+
+const {
+  width: treeWidth,
+  collapsed: treeCollapsed,
+  min: treeMin,
+  max: treeMax,
+  onGripDown: treeGripDown,
+  onGripMove: treeGripMove,
+  onGripUp: treeGripUp,
+  onGripKey: treeGripKey,
+  reset: resetTreeWidth,
+} = usePanelWidth({
+  key: 'ui.changesTree',
+  defaultWidth: 220,
+  min: 160,
+  max: 520,
+  container: splitRef,
+  // diff 至少要留出一列代码的宽度，再扣掉中间 8px 拖拽热区。
+  reserve: 320,
+  // 文件树是可收起的内容区，但每次进入改动页先展开；宽度仍然记住。
+  persistCollapsed: false,
+})
 
 const files = computed(() => props.changes.files)
 const added = computed(() => files.value.reduce((sum, f) => sum + f.added, 0))
@@ -78,12 +101,34 @@ function aggregateTree(node: ChangeTreeNode): { added: number; deleted: number; 
 
 function sortTree(nodes: ChangeTreeNode[]): void {
   nodes.sort((left, right) => {
-    if (left.kind !== right.kind) return left.kind === 'dir' ? -1 : 1
+    if (left.kind !== right.kind) return left.kind === 'file' ? -1 : 1
     return left.name.localeCompare(right.name)
   })
   for (const node of nodes) {
     if (node.kind === 'dir') sortTree(node.children)
   }
+}
+
+/**
+ * 把没有文件、且只有一个目录子节点的中间路径压成一行，例如：
+ * `a -> b -> c + file2, d/file1` 显示为 `a/b/c`，下面是 `file2` 和 `d/file1`。
+ */
+function compactDirectoryChains(nodes: ChangeTreeNode[]): ChangeTreeNode[] {
+  return nodes.map((node) => {
+    if (node.kind === 'file') return node
+
+    const children = compactDirectoryChains(node.children)
+    const onlyChild = children.length === 1 ? children[0] : null
+    if (onlyChild?.kind === 'dir') {
+      return {
+        ...node,
+        name: `${node.name}/${onlyChild.name}`,
+        path: onlyChild.path,
+        children: onlyChild.children,
+      }
+    }
+    return { ...node, children }
+  })
 }
 
 function buildChangeTree(changes: FileChange[]): ChangeTreeNode[] {
@@ -121,9 +166,10 @@ function buildChangeTree(changes: FileChange[]): ChangeTreeNode[] {
       fileCount: 1,
     })
   }
-  sortTree(roots)
-  for (const root of roots) aggregateTree(root)
-  return roots
+  const compacted = compactDirectoryChains(roots)
+  sortTree(compacted)
+  for (const root of compacted) aggregateTree(root)
+  return compacted
 }
 
 function collectDirectoryPaths(nodes: ChangeTreeNode[]): string[] {
@@ -292,8 +338,13 @@ function sideBySide(text: string): DiffRow[] {
 
     <p class="changes-base">{{ changes.base }} … {{ changes.head }}</p>
 
-    <div class="changes-split" :class="{ 'tree-collapsed': treeCollapsed }">
-      <aside v-if="!treeCollapsed" class="changes-tree">
+    <div
+      ref="splitRef"
+      class="changes-split"
+      :class="{ 'tree-collapsed': treeCollapsed }"
+      :style="treeCollapsed ? undefined : { '--changes-tree-width': `${treeWidth}px` }"
+    >
+      <aside v-if="!treeCollapsed" id="changes-file-tree" class="changes-tree">
         <div class="changes-tree-head">
           <span class="changes-tree-title">文件 · {{ files.length }}</span>
           <div class="changes-tree-actions">
@@ -355,6 +406,26 @@ function sideBySide(text: string): DiffRow[] {
       >
         文件 ›
       </button>
+
+      <div
+        v-if="!treeCollapsed"
+        class="changes-tree-grip"
+        role="separator"
+        aria-orientation="vertical"
+        aria-controls="changes-file-tree"
+        :aria-valuemin="treeMin"
+        :aria-valuemax="treeMax"
+        :aria-valuenow="treeWidth"
+        aria-label="调整文件树宽度"
+        title="拖拽调整宽度，双击恢复默认"
+        tabindex="0"
+        @pointerdown="treeGripDown"
+        @pointermove="treeGripMove"
+        @pointerup="treeGripUp"
+        @pointercancel="treeGripUp"
+        @dblclick="resetTreeWidth"
+        @keydown="treeGripKey"
+      ></div>
 
       <div class="changes-diff-wrap">
         <p v-if="loading" class="changes-note">正在读取改动…</p>
