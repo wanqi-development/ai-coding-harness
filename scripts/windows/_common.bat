@@ -85,11 +85,11 @@ exit /b 1
 rem %2=主机 %3=端口 %4=路径 %5=探测次数上限；返回 0=就绪，1=超时
 set "host=%~2"
 set "port=%~3"
-set "path=%~4"
+set "req_path=%~4"
 set "tries=%~5"
 set /a "waited=0"
 :wait_http_loop
-"%CURL%" -s -f --connect-timeout 1 --max-time 2 -o nul "http://!host!:!port!!path!" >nul 2>&1
+"%CURL%" -s -f --connect-timeout 1 --max-time 2 -o nul "http://!host!:!port!!req_path!" >nul 2>&1
 if not errorlevel 1 goto :wait_http_ok
 if !waited! geq !tries! goto :wait_http_timeout
 <nul set /p "=."

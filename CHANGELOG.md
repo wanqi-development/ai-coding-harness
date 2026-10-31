@@ -38,6 +38,9 @@
   - `_common.bat` 主动恢复 System32 PATH，并通过环境变量、常见安装目录和 `where.exe`
     查找 `npm.cmd`，再把 Node 所在目录加入 PATH；Vite 用解析出的绝对路径启动，不再依赖
     新 cmd 窗口是否继承了完整 PATH。
+  - 修复真正的 PATH 覆盖根因：`wait_http` 内部变量 `path` 与 Windows 大小写不敏感的
+    `PATH` 是同一个环境变量，健康探测后会把系统 PATH 改成 `/health`。变量已改名
+    `req_path`。
   - `BACKEND_HOST` / `BACKEND_PORT` / `FRONTEND_PORT` / 探测次数允许通过环境变量覆盖。
   - `.env.example`、README 与 standalone 文档同步说明该开关的语义。
 - **关键决策**：保留 Redis 故障降级的旧行为；希望多 worker 生产部署拒绝降级的实例仍可
@@ -48,6 +51,8 @@
   - 模拟外部 `PORT=5173` 启动后端，服务仍正确监听 8000，`/health` 返回 200。
   - 将 PATH 人为缩减到只有 PowerShell 后启动前端，仍能解析 `npm.cmd` 并在 5173 提供
     页面；前端 `/auth/config` 代理返回 200。
+  - 原根目录 `start.bat` 完整启动成功：后端 `/health` 200、前端 `/` 200、
+    `/auth/config` 代理 200。
 
 #### 模型配置支持复用同端点 API Key
 
