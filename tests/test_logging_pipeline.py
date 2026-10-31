@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import pathlib
 from collections.abc import Iterator
 
@@ -132,3 +133,38 @@ class TestByPassStateLog:
     def test_redis_logs_stay_out_of_api_log(self, logs):
         logging.getLogger("ai_coding_harness.infra.redis_cache").warning("Redis 不可用")
         assert "Redis 不可用" not in (logs / "api.log").read_text(encoding="utf-8")
+
+
+def test_a_locked_api_log_falls_back_to_a_process_specific_file(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_handler = logging.handlers.RotatingFileHandler
+    fallback_lines: list[str] = []
+
+    class HandlesFallback(real_handler):
+        def __init__(self, filename, *args, **kwargs):
+            path = pathlib.Path(filename)
+            fallback_lines.append(str(path))
+            if path.name == "api.log":
+                raise PermissionError(13, "locked", str(path))
+            super().__init__(filename, *args, **kwargs)
+
+    monkeypatch.setattr(logging.handlers, "RotatingFileHandler", HandlesFallback)
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    try:
+        path = setup_logging(Settings(_env_file=None, log_dir=str(tmp_path)))
+        logging.getLogger("ai_coding_harness.api.routes").info("fallback works")
+        for handler in list(root.handlers):
+            handler.flush()
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
+        for handler in saved_handlers:
+            root.addHandler(handler)
+        root.setLevel(saved_level)
+
+    assert path.name == f"api.{__import__('os').getpid()}.log"
+    assert "fallback works" in path.read_text(encoding="utf-8")

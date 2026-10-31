@@ -147,17 +147,18 @@ if (-not $needsBootstrap) {
 }
 
 if (-not $NoFrontend) {
-    if (-not $env:NODE_HOME) {
-        throw "NODE_HOME is not set. Set it to the Node.js installation directory."
+    & node --version
+    if ($LASTEXITCODE -ne 0) {
+        throw "node cannot run. Install Node.js 20+ and add it to PATH."
     }
-    $npm = Join-Path $env:NODE_HOME "npm.cmd"
-    if (-not (Test-Path -LiteralPath $npm)) {
-        throw "npm.cmd was not found under NODE_HOME: $npm"
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) {
+        throw "npm.cmd was not found on PATH. Install Node.js 20+ with npm."
     }
     $viteBin = Join-Path $repoRoot "frontend\node_modules\.bin\vite.cmd"
     if (-not (Test-Path -LiteralPath $viteBin)) {
         Write-Host "Installing frontend dependencies ..."
-        & $npm --prefix (Join-Path $repoRoot "frontend") install
+        & $npm.Source --prefix (Join-Path $repoRoot "frontend") install
         if ($LASTEXITCODE -ne 0) {
             throw "Frontend dependency installation failed."
         }

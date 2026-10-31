@@ -25,6 +25,41 @@
 
 ### 2026-10-31
 
+#### 日志文件不可写时不再阻断后端启动
+
+- **现象**：`logs/api.log` 在启动时偶发 `PermissionError`，后端在日志初始化阶段直接退出；
+  当时文件 ACL 对当前用户实际可写，也没有持续存在的独占锁。
+- **根因**：日志是可观测组件，却被当成启动硬依赖。旧后端、扫描器或外部编辑器短暂持有
+  文件句柄时，固定日志路径无法打开，整个服务随之终止。
+- **改动**：主日志文件打开失败时，自动降级到带 PID 的
+  `api.<pid>.log` / `agent.<pid>.log`，并在控制台打印主文件与备用文件路径；备用文件也
+  不可写时继续使用控制台日志，不再阻止服务启动。
+- **验证**：模拟 `api.log` 抛出 `PermissionError` 后，服务和根 logger 正常配置，接口日志
+  写入备用文件；日志管道与日志路由测试 **23 passed**，Ruff 通过。
+
+#### 修复 start.bat 启动窗口静默退出
+
+- **现象**：双击根目录 `start.bat` 后只出现一个控制台窗口，等待一段时间后自行关闭；
+  无法判断后端或前端是否启动失败。
+- **根因**：原 BAT 编排把服务进程生命周期与健康探测脱钩。子进程已经退出时，
+  `wait-http` 仍继续固定次数轮询；两个探测都超时后只打印 warning，最终仍返回成功并关闭
+  启动窗口。窗口退出是控制流设计问题，不是单个命令或 PATH 问题。
+- **改动**：
+  - 根 `start.bat` 改为只负责调用单一 PowerShell 启动监督器。
+  - 监督器持有后端、前端进程句柄；健康探测每轮先检查子进程是否退出，失败立即中止并
+    回收本轮已启动的进程。
+  - 启动日志统一写入固定文件 `logs/launcher.log`，每次启动覆盖重建；监督器、预检、
+    后端和前端输出的摘要都经过统一格式写入，不再拆成时间戳目录与多份子日志。
+  - 只有后端和前端都健康才打开浏览器；任何一步失败都返回非零退出码。
+  - 前端健康探测使用 Vite 实际监听的 `localhost`，不再错误探测 IPv4
+    `127.0.0.1` 后把已经就绪的 Vite 当成超时进程杀掉。
+  - 双击启动时控制台保留最终状态并等待按键，不再静默关闭。
+  - 新增根目录 `stop.bat`，按 PID、启动时间和进程树停止本次启动的后端与前端。
+- **验证**：PowerShell 语法检查通过；普通 Windows 上下文完整启动成功，后端 `/health`
+  与前端均返回 200，`launcher.log` 每次启动被覆盖为单次启动快照。代码代理的受限执行
+  沙箱会拦截工作区内解释器加载外部 DLL，并表现为 `_ssl` 初始化失败；同一 `.venv` 在
+  沙箱外通过预检，因此该现象不作为项目安装故障。
+
 #### 重构本地启动器的运行时依赖发现
 
 - **现象**：从精简环境启动时，根目录 `start.bat` 报 `chcp`、`ping`、`npm`
@@ -34,9 +69,9 @@
 - **改动**：
   - Windows BAT 全部改为 ASCII + CRLF，移除 `chcp 936`，不再依赖本机代码页。
   - Windows / Linux 启动器都只使用项目 `.venv` 中的解释器，不回落到 conda、系统
-    Python 或 `PATH`；Node 只从显式 `NODE_HOME` 查找。
+    Python 或 `PATH`；Node/npm 直接从 `PATH` 执行并用版本输出做预检。
   - WSL standalone 也移除 `HARNESS_PYTHON` 覆盖，只运行 standalone 的固定 venv；
-    Windows standalone 启动器同样只从 `NODE_HOME` 取 npm。
+    Windows standalone 启动器同样直接使用 `PATH` 中的 node/npm。
   - 提交 `.python-version`（3.14）与 `uv.lock`，把环境创建和依赖解析统一到 uv；
     删除无人读取的 `requirements.txt`，避免出现第二份依赖事实源。
   - 本地开发由 `.python-version` 固定 Python 3.14；包元数据继续保持 Python 3.11+，
@@ -52,7 +87,7 @@
     `127.0.0.1:8080`；实际部署继续由 `OPENSANDBOX_DOMAIN` 覆盖。
 - **验证**：`uv lock --check` 与 `uv sync --locked --extra dev` 通过；全量测试
   **1362 passed, 1 skipped, 1 deselected**（排除既有 Linux 只读目录环境失败）。
-  Windows 预检能明确识别缺失 `.venv`、缺失 `NODE_HOME` 以及损坏的解释器 SSL。
+  Windows 预检能明确识别缺失 `.venv`、node/npm 不可执行以及损坏的解释器 SSL。
 - **遗留**：本机 Windows CPython 3.14.7 / 3.14.9 的 venv launcher 都无法加载
   `_ssl`（基础解释器直接运行正常），因此本机 `start.bat --check-env` 会按设计
   拒绝启动；换用 python.org 完整安装后删除 `.venv` 并重新 `uv sync` 即可。

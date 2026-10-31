@@ -310,7 +310,7 @@ start.bat                # Windows 兼容入口
 
 - Python：`.python-version` 固定为 3.14，解释器只取 `.venv`；不会回落到 conda、系统
   Python 或其他命名环境。
-- Node：版本 20+，安装位置只通过 `NODE_HOME` 提供。
+- Node：版本 20+，`node` 和 `npm` 必须可从 `PATH` 直接执行。
 - 依赖事实源：`pyproject.toml + uv.lock`；`.venv` 和 `node_modules` 都不提交。
 
 需要预先安装 [uv](https://docs.astral.sh/uv/) 和 Node.js 20+。先在仓库根目录同步
@@ -326,9 +326,9 @@ Windows PowerShell：
 
 ```powershell
 Copy-Item .env.example .env
-$env:NODE_HOME = "C:\Program Files\nodejs"
-[Environment]::SetEnvironmentVariable("NODE_HOME", "C:\Program Files\nodejs", "User")
-& "$env:NODE_HOME\npm.cmd" --prefix frontend install
+node --version
+npm --version
+npm --prefix frontend install
 .\start.bat --check-env
 .\start.bat
 ```
@@ -337,23 +337,37 @@ Linux：
 
 ```bash
 cp .env.example .env
-export NODE_HOME=/path/to/node
-"$NODE_HOME/bin/npm" --prefix frontend install
+node --version
+npm --version
+npm --prefix frontend install
 bash scripts/linux/start.sh
 ```
 
 启动器只调用 `.venv\Scripts\python.exe`（Windows）或 `.venv/bin/python`
-（Linux/macOS）。缺少 `.venv`、项目依赖、Node 或 `NODE_HOME` 时，会停止在预检阶段并
+（Linux/macOS）。缺少 `.venv`、项目依赖、Node 或 npm 时，会停止在预检阶段并
 打印修复命令，不会启动一个依赖错误环境的半成品服务。
 
-`.venv` 是生成目录，不提交到 Git。若 `--check-env` 报项目 Python 无法加载 `ssl`，
-说明底层 CPython 安装不完整；请换用 python.org 的完整 CPython 3.14，删除 `.venv`
-后重新执行 `uv sync --extra dev`。
+Windows 的 `start.bat` 是启动监督器，而不是简单串联命令：
+
+- 后端/前端作为受监控子进程运行，监督器、预检与失败时的服务输出摘要统一写入
+  `logs/launcher.log`，每行包含时间与级别；
+- 每次启动覆盖重建 `launcher.log`，不再为每次启动创建时间戳目录或多份子日志；
+- 任一进程提前退出会立即终止本次启动并返回失败，不再盲目等待健康探测超时；
+- 只有两个服务都健康才打开浏览器；
+- 双击启动时窗口保留最终状态并等待按键；运行 `stop.bat` 可停止本次服务。
+
+`.venv` 是生成目录，不提交到 Git。若在普通终端中 `--check-env` 报项目 Python 无法
+加载 `ssl`，先确认底层 CPython 安装完整；修复解释器后删除 `.venv`，再执行
+`uv sync --extra dev`。某些代码代理或第三方进程沙箱可能拦截工作区内解释器加载外部
+DLL，这种环境差异不等同于解释器损坏，应直接在普通终端运行 `start.bat` 验证。
+
+若主日志文件 `logs/api.log` 或 `logs/agent.log` 被旧进程/扫描器短暂占用，后端会降级到
+`api.<pid>.log` / `agent.<pid>.log` 并在控制台告警，不会因为日志 sink 不可用而退出。
 
 WSL2 standalone（后端运行在 WSL，Windows 只负责启动和打开界面）：
 
 standalone 使用自己的固定 WSL venv，不复用开发机的 `.venv`；Python 支持 3.11+。
-Windows 前端仍要求设置 `NODE_HOME`。
+Windows 前端通过 `PATH` 中的 `node` / `npm` 启动。
 
 ```text
 双击根目录 start-standalone.bat
@@ -392,10 +406,9 @@ bash scripts/linux/start-backend.sh
 bash scripts/linux/start-frontend.sh
 ```
 
-Linux 脚本固定使用仓库 `.venv/bin/python`，Node 通过 `NODE_HOME/bin/npm` 启动：
+Linux 脚本固定使用仓库 `.venv/bin/python`，Node 通过 `PATH` 中的 `npm` 启动：
 
 ```bash
-export NODE_HOME=/path/to/node
 bash scripts/linux/start.sh
 ```
 
@@ -500,7 +513,7 @@ $env:PYTHONPATH='src'
 .\.venv\Scripts\python -m pytest -q
 .\.venv\Scripts\python -m ruff check <changed-files>
 .\.venv\Scripts\python scripts/check_prompts.py
-"$env:NODE_HOME\npm.cmd" --prefix frontend run build
+npm --prefix frontend run build
 ```
 
 ## 更多文档

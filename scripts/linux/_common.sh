@@ -7,10 +7,6 @@ REPO_ROOT="$(cd "${COMMON_DIR}/../.." && pwd)"
 
 # Python is project-local only. Environment managers materialize this exact .venv.
 PYTHON="${REPO_ROOT}/.venv/bin/python"
-NPM=""
-if [ -n "${NODE_HOME:-}" ]; then
-  NPM="${NODE_HOME}/bin/npm"
-fi
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
@@ -90,13 +86,12 @@ preflight_backend() {
 }
 
 preflight_frontend() {
-  if [ -z "${NODE_HOME:-}" ]; then
-    echo "[错误] 未设置 NODE_HOME。"
-    echo "       将其设为 Node.js 安装目录，例如 /usr/local/node。"
+  if ! node --version; then
+    echo "[错误] node 无法运行；请安装 Node.js 20+ 并加入 PATH。"
     return 1
   fi
-  if [ ! -x "${NPM}" ]; then
-    echo "[错误] NODE_HOME 下未找到可执行的 npm：${NPM}"
+  if ! npm --version; then
+    echo "[错误] npm 无法运行；请确认 Node.js 20+ 的 npm 已加入 PATH。"
     return 1
   fi
 }

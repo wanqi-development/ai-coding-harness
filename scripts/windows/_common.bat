@@ -18,10 +18,6 @@ rem Python has one project-local owner: the repository .venv. Never fall back to
 rem conda or a global interpreter, because they may contain a different dependency set.
 set "PYTHON=%REPO_ROOT%\.venv\Scripts\python.exe"
 
-rem Node is an external runtime and must be configured explicitly.
-set "NPM="
-if defined NODE_HOME if exist "%NODE_HOME%\npm.cmd" set "NPM=%NODE_HOME%\npm.cmd"
-
 if not defined BACKEND_HOST set "BACKEND_HOST=127.0.0.1"
 if not defined BACKEND_PORT set "BACKEND_PORT=8000"
 if not defined FRONTEND_PORT set "FRONTEND_PORT=5173"
@@ -59,11 +55,11 @@ if errorlevel 1 (
 exit /b 0
 
 :preflight_frontend
-call :check_npm
+call :check_node
 if errorlevel 1 exit /b 1
 if not exist "%REPO_ROOT%\frontend\node_modules" (
   echo [ERROR] frontend dependencies are missing.
-  echo         Run: "%NPM%" --prefix "%REPO_ROOT%\frontend" install
+  echo         Run: npm --prefix "%REPO_ROOT%\frontend" install
   exit /b 1
 )
 exit /b 0
@@ -71,10 +67,9 @@ exit /b 0
 :preflight_runtime
 call :check_python
 if errorlevel 1 exit /b 1
-call :check_npm
+call :check_node
 if errorlevel 1 exit /b 1
 echo [OK] Python: "%PYTHON%"
-echo [OK] npm: "%NPM%"
 exit /b 0
 
 :check_python
@@ -105,21 +100,27 @@ if errorlevel 1 (
 )
 exit /b 0
 
-:check_npm
-if not defined NODE_HOME (
-  echo [ERROR] NODE_HOME is not set.
-  echo         Set NODE_HOME to the Node.js installation directory.
-  exit /b 1
-)
-if not defined NPM (
-  echo [ERROR] npm.cmd was not found under NODE_HOME.
-  echo         Expected: "%NODE_HOME%\npm.cmd"
-  exit /b 1
-)
-call "%NPM%" --version >nul 2>&1
+:check_node
+where node.exe >nul 2>&1
 if errorlevel 1 (
-  echo [ERROR] npm cannot run: "%NPM%"
-  echo         Check that NODE_HOME points to a working Node.js 20+ installation.
+  echo [ERROR] node was not found on PATH.
+  echo         Install Node.js 20+ and make node available on PATH.
+  exit /b 1
+)
+node --version
+if errorlevel 1 (
+  echo [ERROR] node cannot run.
+  exit /b 1
+)
+where npm.cmd >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] npm.cmd was not found on PATH.
+  echo         Install Node.js 20+ with npm.
+  exit /b 1
+)
+call npm.cmd --version
+if errorlevel 1 (
+  echo [ERROR] npm cannot run.
   exit /b 1
 )
 exit /b 0

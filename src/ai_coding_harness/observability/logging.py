@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 from pathlib import Path
 
@@ -92,16 +93,48 @@ class _NamePrefixFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
-def _rotating_file(path: Path, settings: Settings) -> logging.Handler:
-    handler = logging.handlers.RotatingFileHandler(
-        path,
-        maxBytes=settings.log_max_bytes,
-        backupCount=settings.log_backup_count,
-        encoding="utf-8",
-    )
-    handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
-    handler.addFilter(_TraceIdFilter())
-    return handler
+def _rotating_file(
+    path: Path,
+    settings: Settings,
+) -> tuple[logging.Handler | None, Path]:
+    """Create a file handler without making an unavailable log sink fatal.
+
+    A second backend process, antivirus scanner, or malformed ACL can temporarily deny the
+    fixed log path. Observability must degrade to a process-specific file instead of
+    preventing the service from starting.
+    """
+
+    def build(candidate: Path) -> logging.Handler:
+        handler = logging.handlers.RotatingFileHandler(
+            candidate,
+            maxBytes=settings.log_max_bytes,
+            backupCount=settings.log_backup_count,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
+        handler.addFilter(_TraceIdFilter())
+        return handler
+
+    try:
+        return build(path), path
+    except OSError as primary_error:
+        fallback = path.with_name(f"{path.stem}.{os.getpid()}{path.suffix}")
+        try:
+            handler = build(fallback)
+        except OSError as fallback_error:
+            print(
+                f"[WARN] Cannot open log file {path}: {primary_error}; "
+                f"fallback {fallback} also failed: {fallback_error}. "
+                "Continuing with console logging only.",
+                file=sys.stderr,
+            )
+            return None, path
+        print(
+            f"[WARN] Cannot open log file {path}: {primary_error}. "
+            f"Logging to {fallback} instead.",
+            file=sys.stderr,
+        )
+        return handler, fallback
 
 
 def setup_logging(settings: Settings) -> Path:
@@ -114,19 +147,23 @@ def setup_logging(settings: Settings) -> Path:
     console.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
     console.addFilter(_TraceIdFilter())
 
-    api_file = _rotating_file(log_dir / settings.log_api_file, settings)
-    api_file.addFilter(_NamePrefixFilter(_API_PREFIXES))
+    api_file, api_path = _rotating_file(log_dir / settings.log_api_file, settings)
+    if api_file is not None:
+        api_file.addFilter(_NamePrefixFilter(_API_PREFIXES))
 
-    agent_file = _rotating_file(log_dir / settings.log_agent_file, settings)
-    agent_file.addFilter(_NamePrefixFilter(_AGENT_PREFIXES))
+    agent_file, _ = _rotating_file(log_dir / settings.log_agent_file, settings)
+    if agent_file is not None:
+        agent_file.addFilter(_NamePrefixFilter(_AGENT_PREFIXES))
 
     root = logging.getLogger()
     root.setLevel(level)
     for handler in list(root.handlers):
         root.removeHandler(handler)
     root.addHandler(console)
-    root.addHandler(api_file)
-    root.addHandler(agent_file)
+    if api_file is not None:
+        root.addHandler(api_file)
+    if agent_file is not None:
+        root.addHandler(agent_file)
 
     # uvicorn 自带 handler：清掉、改为冒泡到根（从而进入控制台与 api.log）
     for name in _UVICORN_LOGGERS:
@@ -141,4 +178,4 @@ def setup_logging(settings: Settings) -> Path:
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    return log_dir / settings.log_api_file
+    return api_path

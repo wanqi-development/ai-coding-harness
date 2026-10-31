@@ -17,6 +17,5 @@ set "HARNESS_BACKEND_URL=http://%BACKEND_HOST%:%BACKEND_PORT%"
 
 cd /d "%REPO_ROOT%"
 echo [frontend] %FRONTEND_URL%
-echo            npm: %NPM%
-call "%NPM%" --prefix frontend run dev
+call npm.cmd --prefix frontend run dev
 exit /b %errorlevel%

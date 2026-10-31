@@ -53,8 +53,7 @@
 ## 环境要求
 
 - Windows 10/11 上安装 WSL2 和一套 Ubuntu 22.04/24.04。
-- Windows 安装 Node.js 20+，并把 `NODE_HOME` 设为 Node.js 安装目录；前端启动器不会
-  从 `PATH` 猜测 npm。
+- Windows 安装 Node.js 20+，确保 `node --version` 和 `npm --version` 可直接执行。
 - 建议使用名为 `ai-coding-harness` 的专用发行版；使用现有发行版时同步修改 `WSL_DISTRO`。
 - 不需要在 Windows 或 WSL 中安装 Docker / OpenSandbox。
 - WSL 内核必须允许 unprivileged user namespaces，`bubblewrap` 才能创建命令沙箱。
@@ -125,8 +124,7 @@ Standalone 初始管理员已创建
 凭据文件权限为 `0600`。管理员带有 `must_change_password=true`，首次登录后必须先修改密码。
 如果数据库已有用户，后续启动只提示管理员已存在，不再生成新密码，也不覆盖凭据文件。
 
-Windows 侧的 `frontend/node_modules` 缺失时，入口会通过
-`$env:NODE_HOME\npm.cmd` 自动安装依赖。
+Windows 侧的 `frontend/node_modules` 缺失时，入口会通过 `npm` 自动安装依赖。
 启动成功后自动打开 `http://localhost:5173`。
 
 运行期间保持启动窗口开启，按 `Ctrl+C` 同时停止前后端。直接关闭窗口可能留下脱离的后台
