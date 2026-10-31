@@ -35,6 +35,9 @@
   - 新增回归测试，覆盖“已有 REDIS_URL、没有 REDIS_REQUIRED”的兼容启动场景。
   - Windows 启动脚本现在把 `BACKEND_PORT` / `FRONTEND_PORT` 显式传给后端和 Vite，
     避免继承外部 `PORT`；公共等待逻辑改为显式调用系统 `ping.exe`。
+  - `_common.bat` 主动恢复 System32 PATH，并通过环境变量、常见安装目录和 `where.exe`
+    查找 `npm.cmd`，再把 Node 所在目录加入 PATH；Vite 用解析出的绝对路径启动，不再依赖
+    新 cmd 窗口是否继承了完整 PATH。
   - `BACKEND_HOST` / `BACKEND_PORT` / `FRONTEND_PORT` / 探测次数允许通过环境变量覆盖。
   - `.env.example`、README 与 standalone 文档同步说明该开关的语义。
 - **关键决策**：保留 Redis 故障降级的旧行为；希望多 worker 生产部署拒绝降级的实例仍可
@@ -43,6 +46,8 @@
   - `tests/test_deployment_profiles.py` 通过。
   - 原 `scripts/windows/start-backend.bat` 使用现有 `.env` 启动验证。
   - 模拟外部 `PORT=5173` 启动后端，服务仍正确监听 8000，`/health` 返回 200。
+  - 将 PATH 人为缩减到只有 PowerShell 后启动前端，仍能解析 `npm.cmd` 并在 5173 提供
+    页面；前端 `/auth/config` 代理返回 200。
 
 #### 模型配置支持复用同端点 API Key
 

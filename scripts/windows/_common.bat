@@ -1,4 +1,6 @@
 @echo off
+if not defined SystemRoot set "SystemRoot=C:\Windows"
+set "PATH=%SystemRoot%\System32;%SystemRoot%;%PATH%"
 rem Shared configuration and checks for the Windows launchers.
 set "COMMON_DIR=%~dp0"
 for %%I in ("%~dp0..\..") do set "REPO_ROOT=%%~fI"
@@ -15,6 +17,11 @@ set "PING=%SystemRoot%\System32\ping.exe"
 if not defined BACKEND_TRIES set "BACKEND_TRIES=30"
 if not defined FRONTEND_TRIES set "FRONTEND_TRIES=15"
 set "PYTHONPATH=src"
+if not defined NPM if exist "%ProgramFiles%\nodejs\npm.cmd" set "NPM=%ProgramFiles%\nodejs\npm.cmd"
+if not defined NPM if exist "%ProgramFiles(x86)%\nodejs\npm.cmd" set "NPM=%ProgramFiles(x86)%\nodejs\npm.cmd"
+if not defined NPM for /d %%D in ("D:\developmentBinary\node-*") do if not defined NPM if exist "%%~fD\npm.cmd" set "NPM=%%~fD\npm.cmd"
+if not defined NPM for /f "delims=" %%I in ('where.exe npm.cmd 2^>nul') do if not defined NPM set "NPM=%%I"
+if defined NPM for %%I in ("%NPM%") do set "PATH=%%~dpI;%PATH%"
 rem --------------------
 
 if "%~1"=="" exit /b 0
@@ -36,16 +43,19 @@ if errorlevel 1 (
   echo        项目运行环境是 conda 环境 aicoding（conda env list 查看）；换环境时改 _common.bat。
   exit /b 1
 )
-where git >nul 2>&1
+where.exe git >nul 2>&1
 if errorlevel 1 (
   echo [警告] 未找到 git：右侧栏「代码」面板用不了（装 git，或设 REPO_VIEW_GIT 指定可执行文件）。
 )
 exit /b 0
 
 :preflight_frontend
-where npm >nul 2>&1
-if errorlevel 1 (
+if not defined NPM (
   echo [错误] 未找到 npm，无法启动前端。
+  exit /b 1
+)
+if not exist "%NPM%" (
+  echo [错误] npm 路径无效：%NPM%
   exit /b 1
 )
 exit /b 0

@@ -1,5 +1,5 @@
 @echo off
-chcp 936 >nul
+"%SystemRoot%\System32\chcp.com" 936 >nul
 setlocal enabledelayedexpansion
 set "COMMON=%~dp0_common.bat"
 call "%COMMON%"

@@ -1,5 +1,5 @@
 @echo off
-chcp 936 >nul
+"%SystemRoot%\System32\chcp.com" 936 >nul
 setlocal enabledelayedexpansion
 set "COMMON=%~dp0_common.bat"
 call "%COMMON%"
@@ -18,5 +18,5 @@ set "HARNESS_BACKEND_URL=http://%BACKEND_HOST%:%BACKEND_PORT%"
 
 cd /d "%REPO_ROOT%"
 echo [Ç°¶Ë] %FRONTEND_URL%
-npm --prefix frontend run dev
+"%NPM%" --prefix frontend run dev
 exit /b %errorlevel%
