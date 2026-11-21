@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 
@@ -111,6 +112,32 @@ def test_multi_requires_redis_and_opensandbox() -> None:
         settings.validate_deployment()
 
 
+def test_standalone_stays_on_inline_execution(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        deployment_mode="standalone",
+        sqlite_path=str(tmp_path / "harness.sqlite3"),
+        sandbox_provider="wsl",
+        run_execution_mode="distributed",
+    )
+
+    with pytest.raises(ValueError, match="standalone.*inline"):
+        settings.validate_deployment()
+
+
+def test_distributed_worker_requires_distributed_mode() -> None:
+    settings = Settings(
+        _env_file=None,
+        deployment_mode="multi",
+        redis_url="redis://127.0.0.1:6379/0",
+        app_role="worker",
+        run_execution_mode="inline",
+    )
+
+    with pytest.raises(ValueError, match="Agent worker"):
+        settings.validate_deployment()
+
+
 async def test_standalone_bootstraps_business_and_langgraph_tables(
     tmp_path: Path,
 ) -> None:
@@ -135,9 +162,16 @@ async def test_standalone_bootstraps_business_and_langgraph_tables(
     store = await build_store(settings)
     checkpointer = await build_checkpointer(settings)
     try:
+        assert store._harness_closeable is not checkpointer._harness_closeable
         await store.aput(("tests",), "probe", {"content": "ok"})
         item = await store.aget(("tests",), "probe")
         assert item is not None and item.value["content"] == "ok"
+        await asyncio.gather(
+            store.aget(("tests",), "probe"),
+            checkpointer.aget_tuple(
+                {"configurable": {"thread_id": "transaction-isolation-probe"}}
+            ),
+        )
     finally:
         await close_persistence(store, checkpointer)
 

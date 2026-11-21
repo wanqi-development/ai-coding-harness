@@ -19,11 +19,35 @@
 
 ## 数据与目录
 
-独立版默认只在 WSL 的 ext4 文件系统中写数据：
+独立版把持久数据放在 Windows，便于直接定位和备份：
+
+```text
+%LOCALAPPDATA%\ai-coding-harness\
+├── data/
+│   └── harness.sqlite3      # 业务表 + checkpoint + Store
+├── logs/
+│   ├── launcher.log
+│   ├── api.log
+│   ├── agent.log
+│   ├── backend.stdout.log
+│   └── frontend.stdout.log
+├── credentials/
+│   └── initial-admin.txt
+└── backups/
+```
+
+默认根目录可用绝对 Windows 路径覆盖：
+
+```powershell
+$env:HARNESS_HOST_HOME = "D:\ai-coding-harness-runtime"
+```
+
+Windows 启动器会创建目录、通过 `wslpath` 转换路径，并注入
+`SQLITE_PATH / SQLITE_BACKUP_DIR / LOG_DIR`。WSL 内只保留需要 Linux 权限和文件系统
+语义的临时 sandbox 会话：
 
 ```text
 /home/<WSL_USER>/.ai-coding-harness/
-├── harness.sqlite3          # 业务表 + checkpoint + Store
 ├── sessions/
 │   └── <session-id>/
 │       ├── home/
@@ -38,7 +62,6 @@
 │           ├── tmp/
 │           ├── .secrets/
 │           └── .m2/
-├── logs/
 └── venv/
 ```
 
@@ -46,9 +69,39 @@
 `policies`、`skills`、`maven` 只读。`bubblewrap` 不暴露真实的 WSL home、`/mnt/c` 或
 `/mnt/d`，会话销毁时删除自己的 session 根目录。
 
-业务库、LangGraph checkpoint 与 Store 必须共用一个 SQLite 文件。推荐只设置
-`SQLITE_PATH`，不要同时手工填写另一个 `DATABASE_URL`；若两者同时出现，启动校验会要求它们
-指向同一文件。
+业务库、LangGraph checkpoint 与 Store 必须共用一个 SQLite 文件。使用 Windows 启动器时
+不需要手填 `SQLITE_PATH`。手工在 WSL 内启动时，必须显式提供 `/mnt/...` 下的
+`SQLITE_PATH` 和 `LOG_DIR`，且不要同时填写另一个 `DATABASE_URL`。
+
+### Schema 检查与修复
+
+Standalone 启动前会对比 ORM 元数据与 SQLite 实际结构：
+
+- 新库创建缺失业务表；
+- 旧库安全补上 nullable / 有默认值的新列；
+- 真正修改前备份到 `backups/`；
+- 无法安全自动处理的非空无默认列会让启动失败，而不是带病运行到接口 500。
+
+手工排查：
+
+```bash
+python -m ai_coding_harness.manage check-schema
+python -m ai_coding_harness.manage repair-standalone-schema --dry-run
+python -m ai_coding_harness.manage repair-standalone-schema
+```
+
+旧 WSL 数据库会在首次使用新 Windows 目录启动时通过 SQLite backup API 复制到
+`data/harness.sqlite3`，不会删除源库。旧日志和初始管理员凭据也会在不覆盖新文件的前提
+下复制。
+
+`/mnt/<drive>` 是 Windows drvfs，不支持 Linux `chmod/chown`。宿主目录由 Windows
+启动器用当前 Windows 账号创建，WSL 内只使用 `mkdir -p`，不会执行 `install -m`；
+不要再改回 `install -d -m 700 /mnt/...`，否则会报
+`chmod failed with error Operation not permitted`。
+
+启动器还会检查 `deepagents / langgraph / typesafe_sdk`。Standalone venv 是独立环境，
+不会复用开发机 `.venv`；缺包时会按当前 `pyproject.toml` 自动安装一次。若不允许联网或
+自动修复，可设置 `HARNESS_SKIP_DEPENDENCY_REPAIR=1` 并在启动前手工同步环境。
 
 ## 环境要求
 
@@ -117,7 +170,7 @@ wsl --install -d Ubuntu-24.04
 Standalone 初始管理员已创建
 用户名：admin
 密码：<随机密码>
-凭据文件：/home/harness/.ai-coding-harness/logs/initial-admin.txt
+凭据文件：%LOCALAPPDATA%\ai-coding-harness\credentials\initial-admin.txt
 首次登录后必须修改密码。
 ```
 
@@ -159,7 +212,8 @@ bash scripts/wsl/start-standalone.sh
 
 ```env
 DEPLOYMENT_MODE=standalone
-SQLITE_PATH=/home/harness/.ai-coding-harness/harness.sqlite3
+SQLITE_PATH=/mnt/d/ai-coding-harness-runtime/data/harness.sqlite3
+SQLITE_BACKUP_DIR=/mnt/d/ai-coding-harness-runtime/backups
 SANDBOX_PROVIDER=wsl
 WSL_DISTRO=ai-coding-harness
 WSL_USER=harness
@@ -196,8 +250,9 @@ standalone 应视为新建独立实例。
 常用检查：
 
 ```bash
-sqlite3 ~/.ai-coding-harness/harness.sqlite3 ".tables"
-sqlite3 ~/.ai-coding-harness/harness.sqlite3 "SELECT id, username, role FROM users;"
+sqlite3 /mnt/d/ai-coding-harness-runtime/data/harness.sqlite3 ".tables"
+sqlite3 /mnt/d/ai-coding-harness-runtime/data/harness.sqlite3 \
+  "SELECT id, username, role FROM users;"
 ```
 
 ## 安全边界
@@ -205,6 +260,7 @@ sqlite3 ~/.ai-coding-harness/harness.sqlite3 "SELECT id, username, role FROM use
 - 命令在 bubblewrap 中运行，使用独立 PID / IPC / UTS namespace。
 - `/usr`、`/bin`、`/sbin`、`/lib*`、`/etc` 与会话资产中的只读目录按只读方式挂载。
 - 会话目录位于 WSL ext4，不使用 Windows 盘上的路径。
-- 自动生成的初始凭据只写入 `logs/initial-admin.txt`，权限 `0600`；首次改密后临时密码失效。
+- 自动生成的初始凭据只写入 Windows `credentials/initial-admin.txt`，权限 `0600`；
+  首次改密后临时密码失效。
 - 默认保留网络访问，因为代码智能体需要拉依赖和访问代码平台；网络 allowlist 代理尚未接入。
 - SQLite 使用 WAL、`busy_timeout=5000`、外键约束；该档位仍明确只支持单 worker。

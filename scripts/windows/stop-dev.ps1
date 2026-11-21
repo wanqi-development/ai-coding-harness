@@ -41,11 +41,38 @@ foreach ($entry in @(
         Write-Host "Skipping $($entry.name) PID $($entry.pid): PID was reused."
         continue
     }
-    Write-Host "Stopping $($entry.name) process tree (PID $($entry.pid)) ..."
-    & $taskkillExe /PID $entry.pid /T /F *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Failed to stop $($entry.name) PID $($entry.pid)."
-        $failed = $true
+    $graceful = $false
+    if ($entry.name -eq "backend" -and $state.shutdown_file) {
+        try {
+            [IO.File]::WriteAllText(
+                [string]$state.shutdown_file,
+                "stop",
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            Write-Host "Waiting for $($entry.name) to save active work ..."
+            for ($attempt = 0; $attempt -lt 150; $attempt++) {
+                $process.Refresh()
+                if ($process.HasExited) {
+                    $graceful = $true
+                    break
+                }
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        catch {
+            Write-Host "Graceful shutdown request failed: $($_.Exception.Message)"
+        }
+    }
+    if (-not $graceful) {
+        Write-Host "Stopping $($entry.name) process tree (PID $($entry.pid)) ..."
+        & $taskkillExe /PID $entry.pid /T /F *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to stop $($entry.name) PID $($entry.pid)."
+            $failed = $true
+        }
+    }
+    else {
+        Write-Host "$($entry.name) stopped gracefully."
     }
 }
 
@@ -54,6 +81,12 @@ if (-not $failed) {
         $serviceLogDir = [string]$state.service_log_dir
         if (Test-Path -LiteralPath $serviceLogDir) {
             $resolvedServiceLogDir = (Resolve-Path -LiteralPath $serviceLogDir).Path
+            $stableServiceLogDir = Join-Path $repoRoot "logs\services"
+            $isStableHarnessLogDir = [string]::Equals(
+                $resolvedServiceLogDir,
+                $stableServiceLogDir,
+                [StringComparison]::OrdinalIgnoreCase
+            )
             $isHarnessTempDir = (
                 $resolvedServiceLogDir.StartsWith(
                     $tempRoot + [IO.Path]::DirectorySeparatorChar,
@@ -64,7 +97,10 @@ if (-not $failed) {
                     [StringComparison]::Ordinal
                 )
             )
-            if ($isHarnessTempDir) {
+            if ($isStableHarnessLogDir) {
+                Write-Host "Preserving service logs: $resolvedServiceLogDir"
+            }
+            elseif ($isHarnessTempDir) {
                 Remove-Item -LiteralPath $resolvedServiceLogDir -Recurse -Force
             }
             else {

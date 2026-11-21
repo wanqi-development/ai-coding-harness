@@ -13,6 +13,11 @@ venv/
 dist/
 build/
 logs/
+output/
+pytest-of-*/
+data/
+backups/
+credentials/
 .idea/
 .vscode/
 # Claude Code 的**本机**设置（权限允许清单里是这台机器的绝对路径），工程级的

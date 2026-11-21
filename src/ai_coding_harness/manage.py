@@ -27,6 +27,10 @@ from ai_coding_harness.backends.composite import (
 from ai_coding_harness.config import Settings, get_settings
 from ai_coding_harness.db import Database, dao
 from ai_coding_harness.db.models import AgentSession, Repository
+from ai_coding_harness.db.standalone_schema import (
+    inspect_standalone_schema,
+    repair_standalone_schema,
+)
 from ai_coding_harness.session.state import build_store, close_persistence
 from ai_coding_harness.utils.path_util import ROOT_DIR
 
@@ -57,7 +61,13 @@ def _write_private_text(path: Path, content: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        try:
+            os.chmod(path, 0o600)
+        except PermissionError:
+            # Windows drvfs (/mnt/<drive>) ignores Linux mode changes. The
+            # containing directory was created through the Windows account ACL.
+            if not str(path.resolve()).startswith("/mnt/"):
+                raise
     finally:
         try:
             temporary.unlink()
@@ -274,6 +284,59 @@ async def _migrate_repo_memory(args: argparse.Namespace) -> int:
         await database.dispose()
 
 
+def _print_schema_plan(settings: Settings) -> bool:
+    path = settings.standalone_database_path
+    print(f"SQLite: {path}")
+    plan = inspect_standalone_schema(path)
+    if plan.healthy:
+        print("Schema 正常。")
+        return True
+    for name in plan.missing_tables:
+        print(f"缺表：{name}")
+    for fix in plan.column_fixes:
+        print(f"缺列：{fix.table}.{fix.column}")
+    for blocker in plan.blockers:
+        print(f"无法自动修复：{blocker}", file=sys.stderr)
+    return False
+
+
+def _check_standalone_schema() -> int:
+    settings = get_settings()
+    if not settings.is_standalone:
+        print("check-schema 只适用于 standalone。", file=sys.stderr)
+        return 2
+    return 0 if _print_schema_plan(settings) else 1
+
+
+def _repair_standalone(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    if not settings.is_standalone:
+        print("repair-standalone-schema 只适用于 standalone。", file=sys.stderr)
+        return 2
+    report = repair_standalone_schema(
+        settings.standalone_database_path,
+        backup_dir=settings.standalone_backup_path,
+        dry_run=args.dry_run,
+    )
+    if report.backup_path is not None:
+        print(f"备份：{report.backup_path}")
+    for name in report.created_tables:
+        print(f"创建表：{name}")
+    for name in report.added_columns:
+        print(f"补齐列：{name}")
+    if report.plan.healthy:
+        print("Schema 修复完成。" if not args.dry_run else "Schema 无需修复。")
+        return 0
+    print("Schema 仍需处理：", file=sys.stderr)
+    for name in report.plan.missing_tables:
+        print(f"缺表：{name}", file=sys.stderr)
+    for fix in report.plan.column_fixes:
+        print(f"缺列：{fix.table}.{fix.column}", file=sys.stderr)
+    for blocker in report.plan.blockers:
+        print(f"无法自动修复：{blocker}", file=sys.stderr)
+    return 1
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ai-coding-harness 运维命令")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -308,6 +371,19 @@ def _parser() -> argparse.ArgumentParser:
         help="目标新 key 已存在时也覆盖（默认记为冲突并退出非零）",
     )
     sub.add_parser(
+        "check-schema",
+        help="只读检查 standalone SQLite 是否缺少业务表或列",
+    )
+    repair_schema = sub.add_parser(
+        "repair-standalone-schema",
+        help="备份并修复 standalone SQLite 的可安全补齐结构",
+    )
+    repair_schema.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只打印将修复的项目，不备份也不写数据库",
+    )
+    sub.add_parser(
         "generate-session-cache-key",
         help="生成 Redis Session 快照使用的 32 字节 base64 密钥",
     )
@@ -324,6 +400,10 @@ async def _main(args: argparse.Namespace) -> int:
         return await _reset_password(args)
     if args.command == "migrate-repo-memory":
         return await _migrate_repo_memory(args)
+    if args.command == "check-schema":
+        return _check_standalone_schema()
+    if args.command == "repair-standalone-schema":
+        return _repair_standalone(args)
     if args.command == "generate-session-cache-key":
         print(base64.urlsafe_b64encode(os.urandom(32)).decode())
         return 0

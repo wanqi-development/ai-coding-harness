@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 DEPLOYMENT_MODES: tuple[str, ...] = ("multi", "standalone")
 SANDBOX_PROVIDERS: tuple[str, ...] = ("opensandbox", "wsl")
+PROVIDER_PROTOCOLS: tuple[str, ...] = ("openai_compatible", "anthropic_messages")
+DEFAULT_PROVIDER_PROTOCOL = "openai_compatible"
+ANTHROPIC_PROTOCOL = "anthropic_messages"
 
 
 def _default_repo_view_dir() -> str:
@@ -34,11 +37,13 @@ def _default_repo_view_dir() -> str:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """OpenAI-compatible model configuration (model name + endpoint + key)."""
+    """A role's model configuration, including its provider wire protocol."""
 
     model: str
     api_key: str
     base_url: str
+    provider: str = "custom"
+    protocol: str = DEFAULT_PROVIDER_PROTOCOL
     context_window: int = 0  # 上下文窗口（tokens）；0 表示未知
     # 温度是**逐家**的，不是全局常量：kimi-k2.6 只收 1，传 0.3 直接 400
     # （``invalid temperature: only 1 is allowed for this model``），而其余几家 0.3
@@ -244,6 +249,8 @@ class ProviderMeta:
     provider: str
     display_name: str
     default_base_url: str = ""
+    #: 运行时协议：``openai_compatible`` / ``anthropic_messages``
+    protocol: str = DEFAULT_PROVIDER_PROTOCOL
     ui_group: str = ""
     sort_order: int = 0
     status: int = 1
@@ -251,6 +258,8 @@ class ProviderMeta:
     models_path: str = "/models"
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer "
+    #: 额外请求头（仅模型列表探测等平台侧请求使用；运行时由厂商 SDK 管）
+    extra_headers: dict[str, str] = field(default_factory=dict)
 
 
 def load_provider_seed(path: Path | None = None) -> tuple[ProviderMeta, ...]:
@@ -304,12 +313,18 @@ def temperature_for(model: str, default: float) -> float:
     return default
 
 
-def provider_key_for(base_url: str, metas: Sequence[ProviderMeta]) -> str:
-    """按 base_url 反推「提供商」——**纯界面提示，不参与任何解析**。
+def protocol_for_provider(provider: str, configured: str = "") -> str:
+    """Provider 的运行时协议；旧目录没有 protocol 时按已知厂商补默认值。"""
+    if configured in PROVIDER_PROTOCOLS:
+        return configured
+    return ANTHROPIC_PROTOCOL if provider == "anthropic" else DEFAULT_PROVIDER_PROTOCOL
 
-    命中目录里某个地址就给它的 key，否则 ``custom``。之所以不把「提供商」存进 agent 那一行：
-    它只影响界面带出哪个 base_url，而模型真正用哪套连接由 base_url + 模型 + key 决定
-    （见 ``llm._config_for``）。
+
+def provider_key_for(base_url: str, metas: Sequence[ProviderMeta]) -> str:
+    """按 base_url 反推「提供商」——**只用于旧模型行的兼容回填**。
+
+    新模型行会显式保存 provider；命中不了旧地址时仍回落 ``custom``。运行时不能用这个结果
+    替代显式 provider，因为多个厂商可以共用一个代理地址。
     """
     target = (base_url or "").strip().rstrip("/").lower()
     if not target:
@@ -330,6 +345,9 @@ def provider_meta_of(row: Any) -> ProviderMeta:
         provider=str(row.provider),
         display_name=str(row.display_name or row.provider),
         default_base_url=row.default_base_url or "",
+        protocol=protocol_for_provider(
+            str(row.provider), str(getattr(row, "protocol", "") or "")
+        ),
         ui_group=row.ui_group or "",
         sort_order=int(row.sort_order or 0),
         status=int(row.status if row.status is not None else 1),
@@ -337,6 +355,10 @@ def provider_meta_of(row: Any) -> ProviderMeta:
         models_path=row.models_path or "/models",
         auth_header=row.auth_header or "Authorization",
         auth_prefix=row.auth_prefix or "",
+        extra_headers={
+            str(key): str(value)
+            for key, value in (getattr(row, "extra_headers", None) or {}).items()
+        },
     )
 
 
@@ -588,11 +610,26 @@ class Settings(BaseSettings):
     # 运行缓冲的存活时间与容量上限（超出上限从最老的帧开始丢）
     run_buffer_ttl_seconds: int = int(os.getenv("RUN_BUFFER_TTL_SECONDS", "3600"))
     run_buffer_max_frames: int = int(os.getenv("RUN_BUFFER_MAX_FRAMES", "2000"))
+    # 前端正文流聚合：连续 ai 文本达到字符数或等待时间后只写一条 SSE。
+    # 1 = 关闭字符聚合；0 = 关闭定时刷新。工具、思考、Todo、审批等帧始终立即刷新。
+    sse_text_batch_chars: int = int(os.getenv("SSE_TEXT_BATCH_CHARS", "10"))
+    sse_text_flush_ms: int = int(os.getenv("SSE_TEXT_FLUSH_MS", "40"))
     # 会话运行权的 TTL（持有者进程被 kill 后的兜底）与续期间隔
     run_lock_ttl_seconds: int = int(os.getenv("RUN_LOCK_TTL_SECONDS", "120"))
     run_poll_interval_seconds: float = float(os.getenv("RUN_POLL_INTERVAL_SECONDS", "0.2"))
+    # Agent run execution:
+    # inline     = current single-process behavior (standalone and single-node multi);
+    # distributed = ASGI gateway enqueues jobs, separate agent worker processes execute.
+    run_execution_mode: str = os.getenv("RUN_EXECUTION_MODE", "inline").strip().lower()
+    app_role: str = os.getenv("APP_ROLE", "all").strip().lower()
+    run_job_stream: str = os.getenv("RUN_JOB_STREAM", "agent-jobs")
+    run_job_group: str = os.getenv("RUN_JOB_GROUP", "agent-workers")
+    run_job_claim_idle_ms: int = int(os.getenv("RUN_JOB_CLAIM_IDLE_MS", "60000"))
+    agent_worker_concurrency: int = max(
+        1, int(os.getenv("AGENT_WORKER_CONCURRENCY", "1"))
+    )
 
-    # 意图分类（每轮一次）：强/弱关键字直通，其余交 LLM 判定，失败回落关键字。
+    # 意图分类（每轮一次）：强口令直通，其余交 JEV / LLM；失败进入 qa 意图澄清。
     # 分类与主智能体的差别只在参数：分类必须关思考（vLLM 只认 chat_template_kwargs
     # 那个键，实测 2.8~5.0s → 0.3s），主智能体不传该参数。同一模型两套参数，所以它的
     # **模型连接单独一行**（「意图识别（大模型）」，见 ``llm.build_classifier_model``）；
@@ -604,13 +641,13 @@ class Settings(BaseSettings):
     #: 对 91.2%；0.50 / 0.60 分别会问 6.7% / 14.1%。0.55 是“低置信准确率明显塌陷、
     #: 追问量约 10%”的折中。
     intent_clarify_confidence: float = 0.55
-    # 分类时附带的历史用户消息条数（指代要靠它，如「就按你说的弄」）
+    # 分类上下文里的完整用户轮次数（中断轮不计入，其中断消息仍会带上）
     intent_history_turns: int = 3
 
     # JEV（SystemOne，决策型模型）做意图判定 —— 二选一里的另一侧（见 server/intent.py）：
-    # 口令 → **JEV** → 关键字口径。凭据来自界面上的「意图识别（JEV）」那一行
+    # 强口令 → **JEV**；JEV 失败则转 qa 意图澄清。凭据来自界面上的「意图识别（JEV）」那一行
     # （2026-10-15 起：`TYPESAFE_*` 三个 .env 键作废，供应商锁定 typesafe）。
-    # SDK 是 `typesafe-sdk`，**懒加载**：没装这个包或那一行没配齐就跳过 JEV，落关键字口径。
+    # SDK 是 `typesafe-sdk`，**懒加载**：没装这个包或那一行没配齐就转 qa 澄清。
     intent_jev_enabled: bool = True
     typesafe_api_key: str = ""
     typesafe_base_url: str = ""
@@ -628,6 +665,8 @@ class Settings(BaseSettings):
     database_url: str = os.getenv("DATABASE_URL", "").strip()
     #: standalone 未显式给 DATABASE_URL 时的统一 SQLite 文件。
     sqlite_path: str = os.getenv("SQLITE_PATH", "").strip()
+    #: standalone schema 修复前备份目录；空＝SQLite 文件同级的 backups/。
+    sqlite_backup_dir: str = os.getenv("SQLITE_BACKUP_DIR", "").strip()
     #: 空＝standalone 使用 wsl，multi 使用 opensandbox。
     sandbox_provider: str = os.getenv("SANDBOX_PROVIDER", "").strip().lower()
 
@@ -886,6 +925,7 @@ class Settings(BaseSettings):
                 provider=key,
                 display_name=label,
                 default_base_url=(getattr(self, attr, "") or "") if attr else "",
+                protocol=protocol_for_provider(key),
                 sort_order=index * 10,
             )
             for index, (key, label, attr) in enumerate(PROVIDER_OPTIONS)
@@ -972,6 +1012,12 @@ class Settings(BaseSettings):
         return Path(raw).expanduser().resolve()
 
     @property
+    def standalone_backup_path(self) -> Path:
+        if self.sqlite_backup_dir:
+            return Path(self.sqlite_backup_dir).expanduser().resolve()
+        return self.standalone_database_path.parent / "backups"
+
+    @property
     def resolved_database_url(self) -> str:
         """当前部署实际使用的 SQLAlchemy URL。"""
         if self.database_url:
@@ -982,6 +1028,16 @@ class Settings(BaseSettings):
 
     def validate_deployment(self) -> None:
         """启动前校验部署档位，避免多 worker 静默退回单进程语义。"""
+        if self.run_execution_mode not in {"inline", "distributed"}:
+            raise ValueError("RUN_EXECUTION_MODE 只能是 inline / distributed")
+        if self.app_role not in {"all", "gateway", "worker"}:
+            raise ValueError("APP_ROLE 只能是 all / gateway / worker")
+        if self.run_execution_mode == "distributed" and self.is_standalone:
+            raise ValueError("standalone 固定使用 RUN_EXECUTION_MODE=inline")
+        if self.app_role == "worker" and self.run_execution_mode != "distributed":
+            raise ValueError("Agent worker 必须配置 RUN_EXECUTION_MODE=distributed")
+        if self.app_role == "gateway" and self.run_execution_mode != "distributed":
+            raise ValueError("API gateway 只能配合 RUN_EXECUTION_MODE=distributed")
         if self.deployment_mode not in DEPLOYMENT_MODES:
             raise ValueError(
                 f"DEPLOYMENT_MODE 只能是 {' / '.join(DEPLOYMENT_MODES)}"

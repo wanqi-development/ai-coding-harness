@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -9,6 +10,9 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ai_coding_harness.config import Settings
+from ai_coding_harness.db.standalone_schema import repair_standalone_schema
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -39,15 +43,37 @@ class Database:
         self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
 
     async def prepare(self) -> None:
-        """standalone 首次启动直接建业务表；multi 仍由 Alembic 管理。"""
+        """standalone 启动前建表并修复旧库；multi 仍由 Alembic 管理。"""
         if not self._settings.is_standalone:
             return
-        # 导入 models 以完成 Base.metadata 注册。
-        from ai_coding_harness.db import models as _models  # noqa: F401
-        from ai_coding_harness.db.base import Base
-
-        async with self._engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+        report = repair_standalone_schema(
+            self._settings.standalone_database_path,
+            backup_dir=self._settings.standalone_backup_path,
+        )
+        if report.backup_path is not None:
+            logger.warning(
+                "standalone SQLite 已备份并修复：backup=%s created=%s columns=%s",
+                report.backup_path,
+                report.created_tables,
+                report.added_columns,
+            )
+        if not report.plan.healthy:
+            detail = "；".join(
+                (
+                    *report.plan.blockers,
+                    *(
+                        f"缺表 {name}"
+                        for name in report.plan.missing_tables
+                    ),
+                    *(
+                        f"缺列 {fix.table}.{fix.column}"
+                        for fix in report.plan.column_fixes
+                    ),
+                )
+            )
+            raise RuntimeError(
+                f"standalone SQLite schema 修复失败：{detail or '未知结构错误'}"
+            )
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:

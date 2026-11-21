@@ -38,14 +38,14 @@
 空白格 = 该智能体不写这个目录：写文件类工具会被撤掉，`execute` 里的写动词 / 重定向
 在调用前被拦下。**没登记名字的智能体按最保守处理**（一律不写），而不是放开。
 
-> **这张表只管沙箱目录。** 仓库记忆（`/memories/<platform>/<owner>/<repo>.md`）在 StoreBackend 上，
-> 不在沙箱里、也不受上表约束：模型正文由 `orchestrate`（coding / rework）写；
+> **这张表只管沙箱目录。** 仓库记忆在 StoreBackend 上，不在沙箱里、也不受上表约束：
+> 主索引是 `/memories/<platform>/<owner>/<repo>/index.md`，功能、接口、架构和历史详情在同名目录
+> 目录下。模型正文由 `orchestrate`（coding）写；
 > PR 新增记录与状态由轮首 / 轮末平台同步写。`qa` 与 `plan` 没有写正文的工具。
 > 工具子集见 `tools/register.py` 的 `_FORM_TOOLS`。
 
-> 意图 `rework`（PR 跟进）**复用** `orchestrate` 这一行：它与 `coding` 共用装配，
-> 差别由逐轮意图指令和意图后的状态闸门决定。别名登记见
-> `src/ai_coding_harness/agent/profiles.py` 的 `FORM_ALIASES`。
+> 已有 PR 的审查、回评和继续修改也归 `coding`，因此工具与目录边界不变；差异只来自
+> 当前 work task 与 PR 状态，不靠逐轮意图文案或状态闸门。
 
 > 沙箱之外还有两个前缀，**不在沙箱里、也不受上表约束**：`/conversation_history/`
 > （会话压缩流水，deepagents 摘要中间件写）与 `/large_tool_results/`（过大的工具结果）。
@@ -56,8 +56,12 @@
 
 1. **`/ai_coding/.secrets/`**：存放平台注入的会话 git 令牌（Gitee / GitHub，0400）。智能体**绝不能读取、复制或引用**其内容；命令层按路径关键字直接拒绝，`read_file` / `ls` 这类文件接口也单独拦一道。凭据只由 askpass / create_pr / comment_pr 在受控路径内消费。
 2. **`/ai_coding/policies/`、`/ai_coding/skills/`**：平台预置的规则与技能，谁都不许改（`execute` 写到这两个目录同样被拒）。
-3. **`/ai_coding/project/`**：只有主控编码形态与 `coder` 可读写；出方案、分析、审查一律只读。
-4. **出方案不落文件**：方案经 `storePlan` 落库，不另存一份文件 —— 主控 `plan` 与子智能体 `planner` 同形，写工具都已撤掉。仓库记忆另走 `save_repo_memory`（StoreBackend），与沙箱文件不是一回事。
+3. **`/ai_coding/project/`**：只有主控编码形态与 `coder` 可自由读写源码。QA 的源码内容
+   仍只读，但可调用受控 `sync_repo_code` 执行 clone 或 fast-forward 更新；出方案与审查
+   不改工作区。
+4. **出方案不落文件**：方案经 `storePlan` 落库，不另存一份文件 —— 主控 `plan` 与子智能体
+   `planner` 同形，写工具都已撤掉。仓库记忆另走 `save_repo_memory` /
+   文档级 `save_repo_memory`（StoreBackend），与沙箱文件不是一回事。
 5. **`/ai_coding/output/` 谁也不写**：它**没有回传通路** —— API / 前端一处都不读它，卷也只挂 `project`，写进去的文件随沙箱销毁、用户取不到，落成文件等于把答案藏起来。结论、报告一律进回复；`/ai_coding/tmp/` 是中间过程文件（按角色给，见上表），`/ai_coding/review/` 是审查报告。
 ## 已知缺口
 
@@ -70,5 +74,5 @@
 ## 与 skill 的对应
 
 - `ai-coding-implementation`（coding）：写 `/ai_coding/project`，其余只读 —— 由主控编码形态与 `coder` 执行。
-- `repo-bootstrap-analysis`：project 只读，中间文件写 `/ai_coding/tmp`，**报告进回复、不落文件** —— 执行者（编码形态 / qa / `planner`）口径一致；`planner` 只跑其中的只读部分，产物并入方案。结论最终由 coding / rework 收尾写回仓库记忆。
+- `repo-bootstrap-analysis`：project 只读，中间文件写 `/ai_coding/tmp`，**报告进回复、不落文件** —— 执行者（编码形态 / qa / `planner`）口径一致；`planner` 只跑其中的只读部分，产物并入方案。结论最终由 coding 收尾写回仓库记忆。
 - `code-review`：project 只读，写 `/ai_coding/review` + `/ai_coding/tmp` —— 由 `reviewer` 执行。

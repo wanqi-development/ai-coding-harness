@@ -21,7 +21,9 @@ _LINUX_LAUNCHERS = (
     _ROOT / "scripts" / "linux" / "start-frontend.sh",
 )
 _STANDALONE_LAUNCHERS = (
+    _ROOT / "scripts" / "windows" / "_host-runtime.ps1",
     _ROOT / "scripts" / "windows" / "start-standalone.ps1",
+    _ROOT / "scripts" / "windows" / "start-wsl-standalone.ps1",
     _ROOT / "scripts" / "wsl" / "start-standalone.sh",
 )
 
@@ -74,6 +76,39 @@ def test_standalone_launchers_do_not_add_runtime_managers() -> None:
     assert "Get-Command npm.cmd" in combined
 
 
+def test_standalone_persistent_paths_are_resolved_on_windows() -> None:
+    helper = (_ROOT / "scripts" / "windows" / "_host-runtime.ps1").read_text(
+        encoding="utf-8"
+    )
+    wsl_launcher = (
+        _ROOT / "scripts" / "windows" / "start-wsl-standalone.ps1"
+    ).read_text(encoding="utf-8")
+    shell_launcher = (_ROOT / "scripts" / "wsl" / "start-standalone.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "HARNESS_HOST_HOME" in helper
+    assert "HARNESS_HOST_DATA_DIR" in helper
+    assert "HARNESS_HOST_LOG_DIR" in helper
+    assert "HARNESS_CREDENTIALS_DIR" in wsl_launcher
+    assert "HARNESS_BACKUP_DIR" in wsl_launcher
+    assert "backend.stdout.log" in wsl_launcher
+    assert "frontend.stdout.log" in wsl_launcher
+    assert '$env:TEMP' not in wsl_launcher
+    assert 'DATA_DIR="${HARNESS_DATA_DIR:-}"' in shell_launcher
+    assert 'LOG_DIR="${HARNESS_LOG_DIR:-}"' in shell_launcher
+    assert 'SQLITE_BACKUP_DIR="${BACKUP_DIR}"' in shell_launcher
+    assert "prepare_host_dir" in shell_launcher
+    assert 'install -d -m 700 "${DATA_DIR}"' not in shell_launcher
+    assert "typesafe_sdk" in shell_launcher
+    assert "pip install -e" in shell_launcher
+    bootstrap = (_ROOT / "scripts" / "wsl" / "bootstrap.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "prepare_host_dir" in bootstrap
+    assert 'install -d -m 700 -o "${HARNESS_USER}" -g "${HARNESS_USER}" \\' in bootstrap
+
+
 def test_python_environment_has_one_version_and_lock_source() -> None:
     assert (_ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.14"
     assert (_ROOT / "uv.lock").is_file()
@@ -94,11 +129,18 @@ def test_windows_start_uses_a_process_supervisor_with_logs() -> None:
     assert '$logDir = Join-Path $repoRoot "logs"' in supervisor
     assert '$launcherLog = Join-Path $logDir "launcher.log"' in supervisor
     assert '[IO.File]::WriteAllText($launcherLog, "", $launcherEncoding)' in supervisor
+    assert "function Initialize-LogDirectory" in supervisor
+    assert "HARNESS_LOG_DIR" in supervisor
+    assert "logs.archive-" not in supervisor
+    assert "Move-Item -LiteralPath $logDir" not in supervisor
     assert "Write-CapturedOutput" in supervisor
     assert '>> `"$launcherLog`" 2>&1' not in supervisor
     assert "launcher-state.json" in supervisor
     assert "service_log_dir" in supervisor
+    assert "shutdown_file" in supervisor
+    assert "HARNESS_SHUTDOWN_FILE" in supervisor
     assert "backend.log" in supervisor and "frontend.log" in supervisor
+    assert '$serviceLogDir = Join-Path $logDir "services"' in supervisor
     assert "$Process.HasExited" in supervisor
     assert "Wait-HttpReady" in supervisor
     assert 'Uri "http://localhost:$frontendPort/"' in supervisor
@@ -106,7 +148,11 @@ def test_windows_start_uses_a_process_supervisor_with_logs() -> None:
     assert 'Test-TcpPort -Port $frontendPort -HostName "localhost"' in supervisor
     assert "exit 1" in supervisor
     assert "backend_started_at" in stopper
+    assert "shutdown_file" in stopper
+    assert "stopped gracefully" in stopper
     assert "/T /F" in stopper
+    assert "Could not open the browser automatically" in supervisor
     assert "Skipping unsafe service log path" in stopper
+    assert "Preserving service logs" in stopper
     assert '"ai-coding-harness-"' in stopper
     assert "StartsWith(" in stopper
