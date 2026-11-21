@@ -54,6 +54,7 @@ async def probe_provider(payload: ProviderProbe, request: Request) -> ProviderPr
             path=meta.models_path if meta is not None else "/models",
             auth_header=meta.auth_header if meta is not None else "Authorization",
             auth_prefix=meta.auth_prefix if meta is not None else "Bearer ",
+            extra_headers=meta.extra_headers if meta is not None else None,
         )
     except Exception as exc:  # noqa: BLE001 —— 探测失败是**预期结果**之一，不能 500
         logger.info("探测厂商 /models 失败：%s: %s", type(exc).__name__, exc)

@@ -14,6 +14,7 @@ from ai_coding_harness.api.schemas import (
     ProviderUpsert,
 )
 from ai_coding_harness.config import (
+    PROVIDER_PROTOCOLS,
     Settings,
 )
 from ai_coding_harness.core.model_types import MODEL_TYPES, model_type_of
@@ -54,7 +55,10 @@ async def upsert_provider(
     这一步是为了让 ``Settings.providers`` 那份（反推供应商、读库失败时兜底）也跟上，
     于是**不用重启后端**。
     """
-    from ai_coding_harness.api.app import apply_model_providers  # 局部 import：避免装配期循环
+    from ai_coding_harness.api.app import (  # 局部 import：避免装配期循环
+        apply_model_endpoints,
+        apply_model_providers,
+    )
     from ai_coding_harness.db import dao
 
     key = provider.strip().lower()
@@ -68,6 +72,11 @@ async def upsert_provider(
         raise HTTPException(status_code=400, detail="显示名不能为空")
     if payload.status not in (0, 1):
         raise HTTPException(status_code=400, detail="status 只能是 1（启用）/ 0（停用）")
+    if payload.protocol not in PROVIDER_PROTOCOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"protocol 只能是：{' / '.join(PROVIDER_PROTOCOLS)}",
+        )
     models_path = payload.models_path.strip()
     if not models_path:
         raise HTTPException(status_code=400, detail="清单路径不能为空（默认 /models）")
@@ -78,6 +87,7 @@ async def upsert_provider(
             provider=key,
             display_name=label,
             default_base_url=payload.base_url.strip(),
+            protocol=payload.protocol,
             ui_group=payload.ui_group.strip(),
             sort_order=int(payload.sort_order),
             status=int(payload.status),
@@ -85,8 +95,10 @@ async def upsert_provider(
             models_path=models_path,
             auth_header=payload.auth_header.strip(),
             auth_prefix=payload.auth_prefix,
+            extra_headers=payload.extra_headers,
         )
     await apply_model_providers(settings, request.app.state.database)
+    await apply_model_endpoints(settings, request.app.state.database)
     logger.info("提供商目录已改写：%s（%s）", key, label)
     return await _all_options(request)
 
@@ -137,6 +149,7 @@ async def refresh_provider_models(
             path=meta.models_path,
             auth_header=meta.auth_header,
             auth_prefix=meta.auth_prefix,
+            extra_headers=meta.extra_headers,
         )
     except Exception as exc:  # 拉不到是预期结果之一，不是 500（回 409 并带上原因）
         logger.info("刷新模型清单失败：%s: %s", provider, exc)
@@ -207,6 +220,9 @@ async def reload_providers(request: Request) -> ModelConfigSnapshot:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     logger.info("提供商目录已按种子文件对齐：%d 家", count)
+    from ai_coding_harness.api.app import apply_model_endpoints
+
+    await apply_model_endpoints(settings, request.app.state.database)
     # 种子对齐也会把那串名字灌进模型详情表，内存里那份跟着刷一遍
     await _reload_provider_models(settings, request.app.state.database)
     async with request.app.state.database.session() as db:

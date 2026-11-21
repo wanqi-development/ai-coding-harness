@@ -12,6 +12,10 @@ import pytest
 
 from ai_coding_harness.agent import llm as llm_module
 from ai_coding_harness.agent.llm import _AGENT_KEY, build_classifier_model, build_model
+from ai_coding_harness.agent.model_adapters import (
+    wants_reasoning_effort,
+    wants_responses_api,
+)
 from ai_coding_harness.agent.profiles import PROFILED_INTENTS, profile_for
 from ai_coding_harness.agent.subagents import ROLE_NAMES
 from ai_coding_harness.config import FALLBACK_CONTEXT_WINDOW, ModelConfig, Settings
@@ -157,30 +161,63 @@ def test_the_classifier_also_respects_the_kimi_rule() -> None:
     assert build_classifier_model(settings).temperature == 1
 
 
-def test_the_classifier_builds_its_own_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """意图识别**不走**通用工厂：那一行有自己的开关（思考 / max_tokens / 不挂工具），
-    与主智能体按形态路由那套装配是两件事。"""
+def test_the_classifier_uses_the_shared_adapter_with_thinking_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """意图识别走统一入口，但显式关闭思考并限制输出 token。"""
     seen: dict[str, object] = {}
 
-    class FakeChatOpenAI:
-        def __init__(self, **kwargs: object) -> None:
-            seen.update(kwargs)
+    class FakeModel:
+        pass
 
-    monkeypatch.setattr(llm_module, "ChatOpenAI", FakeChatOpenAI)
+    def fake_build(config, options):
+        seen["config"] = config
+        seen["options"] = options
+        return FakeModel()
+
+    monkeypatch.setattr(llm_module, "build_chat_model", fake_build)
     settings = _settings(rows={"classifier": _row("kimi-k2.6")})
 
-    assert isinstance(build_classifier_model(settings), FakeChatOpenAI)
-    assert seen["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
-    assert "reasoning_effort" not in seen  # 关思考：不传这个键
+    assert isinstance(build_classifier_model(settings), FakeModel)
+    options = seen["options"]
+    assert options.thinking == "disabled"
+    assert options.max_tokens == 512
+    assert options.temperature_override == 1
 
 
-def test_the_classifier_turns_thinking_off_and_uses_zero_temperature() -> None:
+def test_the_classifier_does_not_add_a_private_switch_for_unknown_providers() -> None:
     """意图识别是「选一个词」：思考既慢又会把正文挤空；温度 0 才是确定性口径。"""
     model = build_classifier_model(_settings(rows={"classifier": _row("m-cls")}))
 
     assert model.temperature == 0.0
     assert model.reasoning_effort is None
-    assert model.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert model.extra_body in (None, {})
+
+
+def test_vllm_classifier_keeps_the_qwen_chat_template_switch() -> None:
+    settings = _settings(
+        rows={"classifier": _row("qwen3-8b", provider="vllm")}
+    )
+
+    model = build_classifier_model(settings)
+
+    assert model.extra_body == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+
+
+def test_deepseek_classifier_uses_the_native_thinking_switch() -> None:
+    settings = _settings(
+        rows={
+            "classifier": _row(
+                "deepseek-flash", provider="deepseek"
+            )
+        }
+    )
+
+    model = build_classifier_model(settings)
+
+    assert model.extra_body == {"thinking": {"type": "disabled"}}
 
 
 @pytest.mark.parametrize("role", sorted(_EXPECTED))
@@ -238,7 +275,7 @@ def test_gpt5_keeps_the_chat_completions_thinking_contract() -> None:
     ],
 )
 def test_reasoning_effort_is_openai_only(name: str, expected: bool) -> None:
-    assert llm_module._wants_reasoning_effort(name) is expected
+    assert wants_reasoning_effort(name) is expected
 
 
 @pytest.mark.parametrize(
@@ -253,7 +290,7 @@ def test_reasoning_effort_is_openai_only(name: str, expected: bool) -> None:
     ],
 )
 def test_responses_api_is_gpt6_only(name: str, expected: bool) -> None:
-    assert llm_module._wants_responses_api(name) is expected
+    assert wants_responses_api(name) is expected
 
 
 def test_context_window_sets_profile() -> None:

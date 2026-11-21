@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from langchain.agents.middleware import (
     ExtendedModelResponse,
@@ -42,6 +43,8 @@ from ai_coding_harness.infra.circuit import (
     CircuitStore,
     MemoryCircuitStore,
 )
+from ai_coding_harness.safety.redact import redact
+from ai_coding_harness.tools.context import get_redact_terms
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +62,56 @@ def _model_name(model: BaseChatModel) -> str:
     return str(getattr(model, "model_name", None) or type(model).__name__)
 
 
+def _supplier_error_parts(payload: Any) -> tuple[str, list[str]]:
+    """Accept nested OpenAI errors, flattened gateway errors, and plain text."""
+    if isinstance(payload, str):
+        return payload.strip(), []
+    if not isinstance(payload, dict):
+        return "", []
+
+    nested = payload.get("error")
+    if isinstance(nested, dict):
+        source = nested
+    elif isinstance(nested, str):
+        return nested.strip(), []
+    else:
+        source = payload
+
+    detail = str(source.get("message") or source.get("detail") or "").strip()
+    metadata = [
+        f"{key}={source[key]}"
+        for key in ("type", "param", "code")
+        if source.get(key) not in (None, "")
+    ]
+    return detail, metadata
+
+
 def _error_summary(exc: Exception | None) -> str:
-    """异常摘要：类型 + 状态码（如 ``RateLimitError/429``），**不含异常原文**。"""
+    """异常摘要：类型 + 状态码 + 脱敏后的供应商 message。"""
     if exc is None:
         return "-"
     status = getattr(exc, "status_code", None)
-    if isinstance(status, int):
-        return f"{type(exc).__name__}/{status}"
-    return type(exc).__name__
+    summary = (
+        f"{type(exc).__name__}/{status}"
+        if isinstance(status, int)
+        else type(exc).__name__
+    )
+    detail, metadata = _supplier_error_parts(getattr(exc, "body", None))
+    response = getattr(exc, "response", None)
+    if not detail and response is not None:
+        try:
+            detail, metadata = _supplier_error_parts(response.json())
+        except ValueError:
+            detail, metadata = _supplier_error_parts(response.text)
+    if detail:
+        clean = redact(detail.replace(chr(10), " "), get_redact_terms())[:500]
+        summary += f" detail={clean}"
+        if metadata:
+            summary += " " + " ".join(metadata)
+    request_id = str(getattr(exc, "request_id", "") or "").strip()
+    if request_id:
+        summary += f" request_id={request_id}"
+    return summary
 
 
 # 默认那份状态：进程内、按**主导模型名**记、跨角色跨请求共享 —— 同一家坏了，用这家的所有

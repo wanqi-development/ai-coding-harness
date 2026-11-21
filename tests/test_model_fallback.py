@@ -30,6 +30,7 @@ from ai_coding_harness.agent.middleware import (
     FALLBACK_LOG_TAG,
     FallbackMiddleware,
     HistoryRepairMiddleware,
+    ReasoningHistoryMiddleware,
     StreamUsageMiddleware,
 )
 from ai_coding_harness.agent.middleware import fallback as fallback_module
@@ -168,6 +169,55 @@ class TestFallbackMiddleware:
 
         assert _error_summary(exc) == "RateLimitError/429"
         assert "sk-should-not-be-logged" not in _error_summary(exc)
+
+    def test_error_summary_keeps_a_sanitized_supplier_message(self):
+        exc = openai.RateLimitError(
+            "quota exceeded near sk-should-not-be-logged",
+            response=httpx.Response(
+                429,
+                request=httpx.Request("POST", f"{_UNREACHABLE}/chat/completions"),
+            ),
+            body={"error": {"message": "quota exceeded near sk-should-not-be-logged"}},
+        )
+
+        summary = _error_summary(exc)
+
+        assert "detail=quota exceeded" in summary
+        assert "sk-should-not-be-logged" not in summary
+
+    def test_error_summary_reads_a_flattened_supplier_error(self):
+        exc = openai.BadRequestError(
+            "unsupported parameter",
+            response=httpx.Response(
+                400,
+                request=httpx.Request("POST", f"{_UNREACHABLE}/responses"),
+            ),
+            body={
+                "message": "Unsupported parameter: 'temperature' is not supported",
+                "type": "invalid_request_error",
+                "param": "temperature",
+                "code": None,
+            },
+        )
+
+        summary = _error_summary(exc)
+
+        assert "detail=Unsupported parameter: 'temperature'" in summary
+        assert "param=temperature" in summary
+
+    def test_error_summary_falls_back_to_the_response_body(self):
+        response = httpx.Response(
+            400,
+            request=httpx.Request("POST", f"{_UNREACHABLE}/responses"),
+            json={"detail": "bad input"},
+            headers={"x-request-id": "req-123"},
+        )
+        exc = openai.BadRequestError("bad request", response=response, body=None)
+
+        summary = _error_summary(exc)
+
+        assert "detail=bad input" in summary
+        assert "request_id=req-123" in summary
 
     def test_error_summary_without_a_status_code(self):
         assert _error_summary(ValueError("boom")) == "ValueError"
@@ -547,7 +597,9 @@ class TestBuildFallback:
 
 
 class TestWiring:
-    def test_build_agent_mounts_the_fallback_innermost(self, monkeypatch: Any):
+    def test_build_agent_mounts_the_fallback_inside_the_policy_chain(
+        self, monkeypatch: Any
+    ):
         captured: dict[str, Any] = {}
         monkeypatch.setattr(
             graph_module, "create_deep_agent", lambda **kw: captured.update(kw)
@@ -568,9 +620,10 @@ class TestWiring:
         )
 
         middleware = captured["middleware"]
-        # 兜底是倒数第二层：降级重试不重跑边界与脱敏；最内侧是流式用量开关 ——
-        # 网关不认 stream_options 的 400 要在兜底里面就地重试，不能被记成主导故障。
-        assert middleware[-2] is sentinel
+        # 兜底位于主要中间件内侧：降级重试不重跑边界与脱敏；它后面只剩 reasoning
+        # 清理和流式用量降级。网关不认 stream_options 的 400 就在兜底里面重试。
+        assert middleware[-3] is sentinel
+        assert isinstance(middleware[-2], ReasoningHistoryMiddleware)
         assert isinstance(middleware[-1], StreamUsageMiddleware)
 
     def test_build_agent_without_a_fallback_changes_nothing(self, monkeypatch: Any):
@@ -589,7 +642,8 @@ class TestWiring:
             policy=policy_for(ORCHESTRATE_FORM),
         )
 
-        assert isinstance(captured["middleware"][-2], HistoryRepairMiddleware)
+        assert isinstance(captured["middleware"][-3], HistoryRepairMiddleware)
+        assert isinstance(captured["middleware"][-2], ReasoningHistoryMiddleware)
         assert isinstance(captured["middleware"][-1], StreamUsageMiddleware)
 
     def test_subagents_take_a_fallback_each(self):
@@ -604,7 +658,10 @@ class TestWiring:
         )
 
         by_name = {spec["name"]: spec for spec in specs}
-        assert by_name["planner"]["middleware"][-2] is sentinel
+        assert by_name["planner"]["middleware"][-3] is sentinel
+        assert isinstance(
+            by_name["planner"]["middleware"][-2], ReasoningHistoryMiddleware
+        )
         assert isinstance(
             by_name["planner"]["middleware"][-1], StreamUsageMiddleware
         )

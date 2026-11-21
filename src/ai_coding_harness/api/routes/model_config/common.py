@@ -154,6 +154,7 @@ async def fetch_provider_models(
     path: str = "/models",
     auth_header: str = "Authorization",
     auth_prefix: str = "Bearer ",
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[list[str], int]:
     """问厂商的模型清单接口：返回 ``(模型名清单, 窗口)``。
 
@@ -165,7 +166,12 @@ async def fetch_provider_models(
     """
     return parse_models(
         await _fetch_models_payload(
-            base_url, api_key, path=path, auth_header=auth_header, auth_prefix=auth_prefix
+            base_url,
+            api_key,
+            path=path,
+            auth_header=auth_header,
+            auth_prefix=auth_prefix,
+            extra_headers=extra_headers,
         )
     )
 
@@ -177,11 +183,17 @@ async def fetch_provider_model_entries(
     path: str = "/models",
     auth_header: str = "Authorization",
     auth_prefix: str = "Bearer ",
+    extra_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """同一条路，但**全都要**（带类型与窗口）——「刷新模型清单」写表用这个。"""
     return parse_model_entries(
         await _fetch_models_payload(
-            base_url, api_key, path=path, auth_header=auth_header, auth_prefix=auth_prefix
+            base_url,
+            api_key,
+            path=path,
+            auth_header=auth_header,
+            auth_prefix=auth_prefix,
+            extra_headers=extra_headers,
         )
     )
 
@@ -204,10 +216,13 @@ async def _fetch_models_payload(
     path: str,
     auth_header: str,
     auth_prefix: str,
+    extra_headers: dict[str, str] | None = None,
 ) -> Any:
     """把清单接口的原始 JSON 取回来（URL 与鉴权头的拼法只有这一处）。"""
     url = _models_url(base_url, path)
-    headers = {auth_header: f"{auth_prefix}{api_key}"} if api_key and auth_header else {}
+    headers = dict(extra_headers or {})
+    if api_key and auth_header:
+        headers[auth_header] = f"{auth_prefix}{api_key}"
     async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as client:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
@@ -296,8 +311,14 @@ def _row_payload(
         label=label,
         section=MODEL_AGENT_SECTION.get(key, "agents"),
         roles=list(MODEL_AGENT_ROLES.get(key, ())),
-        # 供应商：锁死的行（JEV）就是它；其余按 base_url 反推（纯界面提示，不存库）
-        provider=lock or provider_key_for((row.base_url or "") if stored else "", metas),
+        # 供应商：锁死的行（JEV）就是它；新行显式存，旧行按 base_url 兼容反推
+        provider=lock
+        or (
+            str(getattr(row, "provider", "") or "")
+            if stored and row is not None
+            else ""
+        )
+        or provider_key_for((row.base_url or "") if stored else "", metas),
         provider_locked=bool(lock),
         base_url=(row.base_url or "") if stored else "",
         model=(row.model_name or "") if stored else "",
@@ -342,7 +363,7 @@ def _snapshot(
             for role, key, reused in CODING_GROUP
         ],
         intent_mode=mode if mode in ("jev", "llm") else "jev",
-        # JEV 这一侧配齐了没有（地址 + key 两样）—— 没配齐时选了 JEV 会落关键字口径（严格二选一）
+        # JEV 这一侧配齐了没有（地址 + key 两样）—— 没配齐时选了 JEV 会进入 qa 澄清
         jev_configured=bool(
             jev_row is not None and jev_row.api_key and jev_row.base_url
         )
@@ -390,11 +411,14 @@ async def _borrowed_key(
         if user_id is not None:
             raise
     for row in rows:
-        if row.api_key and provider_key_for(row.base_url or "", metas) == provider:
+        row_provider = str(getattr(row, "provider", "") or "") or provider_key_for(
+            row.base_url or "", metas
+        )
+        if row.api_key and row_provider == provider:
             return row.api_key
     if user_id is None:
         for row in settings.agent_models.values():
-            if row.api_key and provider_key_for(row.base_url or "", metas) == provider:
+            if row.api_key and row.provider == provider:
                 return row.api_key
     env_key = str(getattr(settings, f"{provider}_api_key", "") or "")
     return env_key
@@ -456,11 +480,13 @@ def _option_of(meta: ProviderMeta) -> ProviderOption:
         key=meta.provider,
         label=meta.display_name,
         base_url=meta.default_base_url,
+        protocol=meta.protocol,
         ui_group=meta.ui_group,
         sort_order=meta.sort_order,
         models_path=meta.models_path,
         auth_header=meta.auth_header,
         auth_prefix=meta.auth_prefix,
+        extra_headers=meta.extra_headers,
         status=meta.status,
         is_dynamic_model_list=meta.is_dynamic_model_list,
     )

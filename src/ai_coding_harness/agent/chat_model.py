@@ -1,4 +1,4 @@
-"""ChatOpenAI 的补丁层：保留第三方网关的 ``reasoning_content``（思考正文）。
+"""ChatOpenAI 的补丁层：保留第三方网关的 ``reasoning_content`` 供实时展示。
 
 ``ChatOpenAI`` 只面向官方 OpenAI 规范 —— 模块 docstring 明写第三方字段
 （``reasoning_content`` / ``reasoning_details``）**不提取、不保留**；流式转换
@@ -6,14 +6,13 @@
 原始 chunk 里其实有这段文本（``delta.reasoning_content``），是 LangChain 这一层丢的。
 
 前端「思考过程」块依赖 v3 事件的 ``reasoning-delta``，而它来自
-``AIMessageChunk.content_blocks`` —— 所以这里要补**三处**：
+``AIMessageChunk.content_blocks`` —— 所以这里要补**两处**：
 
-1. ``ReasoningChatOpenAI._convert_chunk_to_generation_chunk``：从原始 chunk 的 delta
+1. ``ReasoningContentChatOpenAI._convert_chunk_to_generation_chunk``：从原始 chunk 的 delta
    取出 ``reasoning_content``，累加进 ``additional_kwargs``；
 2. ``ReasoningAIMessageChunk.content_blocks``：把这段文本还原成 reasoning 内容块。
-3. ``ReasoningChatOpenAI._get_request_payload``：下一轮把历史 assistant 消息里的
-   ``reasoning_content`` 写回请求。只收不发的模型会看到“有工具调用、没有思考”，
-   国产推理模型的工具续轮会因此丢上下文。
+历史思考不会写回下一次请求：不同轮次可能换模型、换协议，历史 reasoning 没有可移植的
+共同语义。``_get_request_payload`` 只负责把父类可能序列化出的 reasoning item 清掉。
 
 **只补 ``additional_kwargs`` 不够**：OpenAI 的 provider translator
 （``translate_content_chunk``）只产出 text / tool_call，压根不读这个键，v3 桥接层
@@ -34,6 +33,8 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.messages import content as types
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
+
+from ai_coding_harness.agent.reasoning_history import strip_reasoning_history
 
 
 def _reasoning_text(message: AIMessage | AIMessageChunk) -> str | None:
@@ -93,11 +94,11 @@ class ReasoningAIMessage(AIMessage):
         return _with_reasoning_block(self, list(super().content_blocks))
 
 
-class ReasoningChatOpenAI(ChatOpenAI):
-    """保留并回传第三方 ``reasoning_content`` 的 ChatOpenAI。
+class ReasoningContentChatOpenAI(ChatOpenAI):
+    """保留第三方 ``reasoning_content`` 供当轮展示的 ChatOpenAI。
 
     流式钩子先让上游照常解析 text / tool_calls，再把第三方的思考文本补进
-    ``additional_kwargs``。请求钩子负责把历史里的这段文本继续交给模型，形成完整往返。
+    ``additional_kwargs``。请求钩子只做反向清理，不把历史思考交给下一次调用。
     """
 
     def _convert_chunk_to_generation_chunk(
@@ -145,27 +146,47 @@ class ReasoningChatOpenAI(ChatOpenAI):
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """把 assistant 历史里的思考写回 Chat Completions 的 ``reasoning_content``。
+        """从请求副本中移除历史思考，保留正文与完整的工具调用配对。
 
-        父类会丢掉这个第三方字段；工具调用后的下一次请求因此看不到模型上一段的推理。
-        Responses API 的 reasoning item 已由上游按内容块序列化，这里只处理 messages 形态。
+        Adapter-level cleanup is defense in depth for calls that bypass agent
+        middleware, notably context summarization. It only changes the outbound
+        copy and never mutates checkpoint messages.
         """
         messages = self._convert_input(input_).to_messages()
+        cleaned = strip_reasoning_history(messages)
+        if cleaned is not None:
+            messages = cleaned
         payload = super()._get_request_payload(messages, stop=stop, **kwargs)
+        response_input = payload.get("input")
+        if self.use_responses_api and isinstance(response_input, list):
+            # Historical reasoning is intentionally not replayed, even when it
+            # has a provider-issued Responses id.
+            payload["input"] = [
+                item
+                for item in response_input
+                if not (
+                    isinstance(item, dict)
+                    and item.get("type") == "reasoning"
+                )
+            ]
         wire_messages = payload.get("messages")
         if not isinstance(wire_messages, list):
             return payload
 
-        for message, wire_message in zip(messages, wire_messages):
-            if (
-                not isinstance(message, AIMessage)
-                or not isinstance(wire_message, dict)
-                or wire_message.get("role") != "assistant"
-            ):
+        # Some compatible gateways preserve unknown message keys in a
+        # subclass. Remove them from the final wire shape as well.
+        for wire_message in wire_messages:
+            if not isinstance(wire_message, dict):
                 continue
-            reasoning = _reasoning_text(message)
-            if reasoning:
-                wire_message["reasoning_content"] = reasoning
+            for key in tuple(wire_message):
+                normalized = str(key).strip().lower()
+                if normalized in {
+                    "reasoning",
+                    "reasoning_content",
+                    "reasoning_details",
+                    "thinking",
+                }:
+                    wire_message.pop(key, None)
         return payload
 
     def _create_chat_result(

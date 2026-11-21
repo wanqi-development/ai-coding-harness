@@ -258,7 +258,7 @@ class TestModeMapping:
             assert resolve_context_mode(role) == CONTEXT_MODE_BURST
 
     def test_steady_roles(self):
-        for role in ("qa", "coding", "orchestrate", "rework"):
+        for role in ("qa", "coding", "orchestrate"):
             assert resolve_context_mode(role) == CONTEXT_MODE_STEADY
 
     def test_the_main_agent_uses_its_form(self):
@@ -266,7 +266,6 @@ class TestModeMapping:
         assert resolve_context_mode(MAIN_AGENT, "plan") == CONTEXT_MODE_BURST
         assert resolve_context_mode(MAIN_AGENT, "orchestrate") == CONTEXT_MODE_STEADY
         assert resolve_context_mode(MAIN_AGENT, "coding") == CONTEXT_MODE_STEADY
-        assert resolve_context_mode(MAIN_AGENT, "rework") == CONTEXT_MODE_STEADY
 
     def test_build_summarization_carries_the_resolved_mode(self):
         qa = build_summarization(

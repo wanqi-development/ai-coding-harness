@@ -12,6 +12,7 @@
 #   provider             必填。稳定键，只能用小写字母/数字/下划线；界面选它 → 带出下面这个地址
 #   display_name         必填。界面显示名（中文随便写）
 #   default_base_url     选它时带出的地址（可改；留空 = 要用户自己填）
+#   protocol             运行时协议：openai_compatible（默认）/ anthropic_messages
 #   ui_group             下拉里的分组名（同组排在一起）；留空 = 不分组
 #   sort_order           组内排序，小的在前
 #   status               1 = 启用（默认）；0 = 停用（界面上不出现）
@@ -19,6 +20,7 @@
 #                          它**不再**影响界面或探测 —— 「测试连接」能不能点只看「地址 + key」。
 #   models_path          「测试连接」拉列表的路径（默认 /models；有的网关不一样）
 #   auth_header/auth_prefix  鉴权头怎么写（默认 Authorization + "Bearer "；有的网关是 x-api-key）
+#   extra_headers        平台侧清单请求的额外头（Anthropic 需要 anthropic-version）
 #
 # 一句话：**模型名以「刷新清单」拉到的那份为准**（落表 provider_models）；拉不到就老实说拉不到，
 # 界面上手填。2026-10-15 删掉了「内置候选」（default_models）—— 那份静态名单会过期，
@@ -142,7 +144,12 @@ is_dynamic_model_list = true
 [[provider]]
 provider = "anthropic"
 display_name = "Anthropic Claude"
-default_base_url = ""              # TODO 源文件没给地址，请补
+default_base_url = "https://api.anthropic.com"
+protocol = "anthropic_messages"
+models_path = "/v1/models"
+auth_header = "x-api-key"
+auth_prefix = ""
+extra_headers = { anthropic-version = "2023-06-01" }
 ui_group = "海外厂商"
 sort_order = 130
 is_dynamic_model_list = true
@@ -161,6 +168,15 @@ display_name = "xAI Grok"
 default_base_url = "https://api.x.ai/v1"
 ui_group = "海外厂商"
 sort_order = 150
+is_dynamic_model_list = true
+
+[[provider]]
+provider = "vllm"
+display_name = "vLLM（本地部署）"
+# 本地地址按部署填写，例如 http://127.0.0.1:8000/v1
+default_base_url = ""
+ui_group = "自建 / 本地"
+sort_order = 800
 is_dynamic_model_list = true
 
 # ============================== 逃生口 ==============================
