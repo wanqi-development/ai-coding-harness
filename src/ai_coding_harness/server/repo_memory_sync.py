@@ -17,8 +17,9 @@ from ai_coding_harness.agent.middleware.memory_reconcile import (
     strip_legacy,
 )
 from ai_coding_harness.agent.middleware.memory_sections import (
+    SECTION_CHANGES,
     add_change,
-    empty_memory,
+    empty_sidecar,
     parse,
     render_memory,
 )
@@ -105,15 +106,20 @@ async def sync_repo_memory(
     backend: BackendProtocol,
     path: str,
     *,
+    index_path: str | None = None,
     owner: str,
     repo: str,
     pulls: Sequence[Mapping[str, Any]],
     now: str,
     summarize: PrSummaryFn | None = None,
 ) -> MemorySyncResult:
-    """把新 PR 摘要与状态差异写入记忆；无差异时不写盘。"""
+    """把 PR 摘要写入历史子文档，并同步主索引的 PR 头行。"""
     old = await _read_text(backend, path)
-    base = old if old is not None else empty_memory(owner, repo)
+    base = (
+        old
+        if old is not None
+        else empty_sidecar(f"变更记录：{owner}/{repo}", SECTION_CHANGES)
+    )
     fresh = new_pulls(base, pulls)
 
     summaries: Mapping[int, PrMemorySummary] = {}
@@ -149,6 +155,18 @@ async def sync_repo_memory(
     changed = result.changed or bool(added) or old is None
     if changed:
         await _write_text(backend, path, old, result.text)
+    if index_path is not None:
+        index_old = await _read_text(backend, index_path)
+        if index_old is not None:
+            index_result = reconcile(index_old, pulls, now=now)
+            if index_result.changed:
+                await _write_text(
+                    backend,
+                    index_path,
+                    index_old,
+                    index_result.text,
+                )
+                changed = True
     return MemorySyncResult(
         text=result.text,
         changed=changed,

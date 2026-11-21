@@ -1,14 +1,16 @@
-"""把本轮意图与澄清状态转成指令，注入主智能体的模型调用。
+"""Inject dynamic repository/work-task state and clarification instructions.
 
-意图是每轮请求的（``configurable.intent``，由 server 层注入），而智能体是每轮现建的
-（``SessionManager.get_agent``，不缓存），所以意图不能写进构建期的 system prompt ——
-只能在这里逐次注入。注入只作用于本次模型调用，不写入对话历史与 checkpoint。
+The selected intent chooses the agent profile and tools before this middleware runs.
+Its label is intentionally not injected into the model prompt: repeating “you are
+coding” adds noise and does not add capability. This middleware injects only
+the facts that change per turn: repository PR state, the active work task, and the
+clarification block.
 
 **能力不在这里注入。** 每轮的工具与子智能体确实不同，但把「本轮有什么」写成运行期
 文本只是给 ``task`` 打补丁：模型照样会拿历史里的旧结论当真（2026-10-19 真机：
 块里写着「task：有」，它仍在思考里说工具清单里没有）。现在统一由
 ``prompts._BASE_HEAD`` 的通用规则约束（历史轮次的工具可用性不作数），具体动作由
-``intent_directive`` 给出。当前时间也不再注入 —— 仓库记忆的文件头由平台写，
+动态任务状态给出。当前时间也不再注入 —— 仓库记忆的文件头由平台写，
 散文里的日期让模型用 ``execute date`` 取。
 
 只实现异步钩子 ``awrap_model_call``：服务端统一走 ``astream_events``。只写同步版
@@ -26,11 +28,9 @@ from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResp
 from langchain_core.messages import SystemMessage
 
 from ai_coding_harness.agent.clarification import CLARIFY_CLOSE, CLARIFY_INTENTS, CLARIFY_OPEN
-from ai_coding_harness.agent.prompts import intent_directive
 from ai_coding_harness.tools.context import (
     get_clarification,
     get_configurable,
-    get_intent,
 )
 
 # 平台面向国内 Gitee 用户，日志与记忆里的日期都按这个时区口径
@@ -104,7 +104,7 @@ def repo_state_block(state: Any) -> str:
     pulls = tuple(getattr(state, "open_prs", ()) or ())
     lines = ["## 本轮仓库状态（平台已经查过，不要重复查）"]
     if not known:
-        lines.append("- PR 状态查询失败：本轮不能安全区分 coding 与 rework。")
+        lines.append("- PR 状态查询失败；只读问答仍可继续。")
     elif not pulls:
         lines.append("- 当前没有 open PR。")
     else:
@@ -119,7 +119,7 @@ def repo_state_block(state: Any) -> str:
                 sha = str(head.get("sha") or "").strip()[:8]
             else:
                 sha = ""
-            review = "已有评论，后续只走 rework" if pull.get("_has_comments") else "暂无评论，coding 可继续收尾"
+            review = "已有评论" if pull.get("_has_comments") else "暂无评论"
             target = f"分支 {branch}" if branch else ""
             if sha:
                 target = f"{target}，head {sha}" if target else f"head {sha}"
@@ -130,8 +130,37 @@ def repo_state_block(state: Any) -> str:
     return "\n".join(lines)
 
 
-class IntentMiddleware(AgentMiddleware):
-    """在系统消息末尾追加本轮意图指令与澄清块。"""
+def work_task_block(state: Any) -> str:
+    """Current durable code task; no abstract intent label is injected."""
+    task = getattr(state, "work_task_payload", None) if state is not None else None
+    if not isinstance(task, Mapping):
+        return ""
+    submissions = task.get("submissions")
+    lines = [
+        "## 当前代码任务（平台已查过，不要重复创建）",
+        f"- task_id：{task.get('task_id')}",
+        f"- 状态：{task.get('status')}",
+        f"- 累计摘要：{task.get('current_summary') or task.get('requirement_summary') or '-'}",
+        f"- 分支：{task.get('branch') or '-'}",
+        f"- 目标分支：{task.get('base_ref') or '-'}",
+        f"- 最新提交：{task.get('latest_commit_sha') or '-'}",
+        f"- 最新远端 head：{task.get('latest_head_sha') or '-'}",
+        f"- PR：{task.get('pull_request_id') or '-'}",
+    ]
+    if isinstance(submissions, list) and submissions:
+        lines.append("- coder 提交：")
+        for item in submissions[-5:]:
+            if not isinstance(item, Mapping):
+                continue
+            lines.append(
+                f"  - {str(item.get('commit_sha') or '')[:8]} "
+                f"{str(item.get('summary') or '').strip()}"
+            )
+    return "\n".join(lines)
+
+
+class TurnContextMiddleware(AgentMiddleware):
+    """Append dynamic task/PR state and clarification blocks."""
 
     async def awrap_model_call(
         self,
@@ -139,13 +168,12 @@ class IntentMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
         base = request.system_message
-        intent = get_intent()
         state = get_configurable("turn_state")
         allowed = getattr(state, "allowed_intents", ()) or None
         parts = (
             base.text if base else "",
             repo_state_block(state),
-            intent_directive(intent),
+            work_task_block(state),
             # 澄清轮放最最后：它要压过 qa 的常规“回答问题”指令
             clarification_block(get_clarification(), allowed),
         )

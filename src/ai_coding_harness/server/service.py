@@ -3,6 +3,8 @@
 API 路由只做 HTTP 转换，业务逻辑集中在这一层。
 """
 
+from typing import Any
+
 from deepagents.backends import StoreBackend
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -17,6 +19,7 @@ from .turn import changes as turn_changes
 from .turn import intent as turn_intent
 from .turn import records as turn_records
 from .turn import usage as turn_usage
+from .turn.approvals import TurnApprovalMixin
 from .turn.changes import TurnChangesMixin
 from .turn.clarify import TurnClarifyMixin
 from .turn.common import (
@@ -48,6 +51,7 @@ from .turn.usage import TurnUsageMixin
 
 class HarnessService(
     TurnRunnerMixin,
+    TurnApprovalMixin,
     TurnIntentMixin,
     TurnClarifyMixin,
     TurnRecordsMixin,
@@ -68,7 +72,7 @@ class HarnessService(
         self._settings = settings
         self._manager = manager
         self._db = database
-        #: 判定瀑布的第二关（口令 → **JEV** → 大模型 → 关键字口径）。``None`` ＝ 没配 / SDK
+        #: 判定瀑布的第二关（强口令 → **JEV**；失败转 qa 澄清）。``None`` ＝ 没配 / SDK
         #: 装不上，这一关直接跳过 —— 判定器缺一层不该影响服务可用性。
         self._intent_jev = intent_jev
         self._intent_jev_by_user: dict[int, IntentDecider] = {}
@@ -122,6 +126,10 @@ class HarnessService(
         decider = self._intent_jev_by_user.pop(user_id, None)
         if decider is not None:
             await decider.aclose()
+
+    async def capture_restart_recovery(self, session: Any) -> str | None:
+        """Save the active workspace before graceful shutdown."""
+        return await self._manager.capture_restart_recovery(session)
 
 
 __all__ = [

@@ -9,17 +9,17 @@
 
 这个模块**不含 IO、不经过模型**：调用方给当前全文和一份结构化增量，拿回合并后的全文。
 
-四节（老模板的标题也认，读到就归到对应节）：
+主索引四节（老模板的标题也认，读到就归到对应节）：
 
 ===========  ==========================================
 ``basic``    仓库基本信息（稳定事实）
-``changes``  变更记录（一行一条，最新在上）
-``gaps``     当前缺口（按模块，整节替换）
-``decisions``长期约束（原「关键决策」，整节替换）
+``directory``目录与模块（语义导航）
+``architecture`` 压缩架构图
+``catalog``  记忆详情目录（路径 + 摘要）
 ===========  ==========================================
 
-「当前缺口」与「长期约束」是**整节替换**语义：它们回答的是「现在」，过时的必须能删掉。
-只有「变更记录」是追加（按 PR 编号去重，超出条数从最旧的滚出窗口）。
+``changes`` / ``gaps`` / ``decisions`` 仍在子文档中使用，保持旧标题与合并规则。
+「当前缺口」与「长期约束」是**整节替换**语义；「变更记录」按 PR 去重并滚动保留。
 """
 
 from __future__ import annotations
@@ -27,16 +27,38 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-#: 四节的稳定键（工具入参用它们，不用中文标题）
+#: 主索引与子文档使用的稳定键（工具入参用它们，不用中文标题）
 SECTION_BASIC = "basic"
+SECTION_DIRECTORY = "directory"
+SECTION_ARCHITECTURE = "architecture"
+SECTION_CATALOG = "catalog"
 SECTION_CHANGES = "change"
 SECTION_GAPS = "gaps"
 SECTION_DECISIONS = "decisions"
-SECTIONS = (SECTION_BASIC, SECTION_CHANGES, SECTION_GAPS, SECTION_DECISIONS)
+SECTIONS = (
+    SECTION_BASIC,
+    SECTION_DIRECTORY,
+    SECTION_ARCHITECTURE,
+    SECTION_CATALOG,
+    SECTION_CHANGES,
+    SECTION_GAPS,
+    SECTION_DECISIONS,
+)
+
+#: 始终注入的主索引只保留稳定事实、导航与压缩架构；详情放在子文档。
+INDEX_SECTIONS: tuple[str, ...] = (
+    SECTION_BASIC,
+    SECTION_DIRECTORY,
+    SECTION_ARCHITECTURE,
+    SECTION_CATALOG,
+)
 
 #: 渲染时用的标题（第三节改名「长期约束」：只收会影响以后怎么做的决定）
 HEADINGS: dict[str, str] = {
     SECTION_BASIC: "## 一、仓库基本信息",
+    SECTION_DIRECTORY: "## 二、目录与模块",
+    SECTION_ARCHITECTURE: "## 三、架构概览",
+    SECTION_CATALOG: "## 四、记忆目录",
     SECTION_CHANGES: "## 二、变更记录（最新在上）",
     SECTION_GAPS: "## 三、当前缺口（按模块）",
     SECTION_DECISIONS: "## 四、长期约束",
@@ -47,6 +69,12 @@ _TITLE_KEYS: tuple[tuple[str, str], ...] = (
     ("仓库基本信息", SECTION_BASIC),
     ("项目概览", SECTION_BASIC),
     ("约定与注意事项", SECTION_BASIC),
+    ("目录与模块", SECTION_DIRECTORY),
+    ("目录结构", SECTION_DIRECTORY),
+    ("架构概览", SECTION_ARCHITECTURE),
+    ("整体架构", SECTION_ARCHITECTURE),
+    ("记忆目录", SECTION_CATALOG),
+    ("功能目录", SECTION_CATALOG),
     ("变更记录", SECTION_CHANGES),
     ("当前缺口", SECTION_GAPS),
     ("当前进度", SECTION_GAPS),
@@ -62,22 +90,26 @@ _EMPTY = "（暂无）"
 #: 变更记录最多留几条（旧的滚出窗口；历史在代码平台上，需要时按 PR 查）
 MAX_CHANGES = 8
 
-#: 精简注入（planner / coder / coding / plan 主控）要的三节：
-#: 基本信息（怎么做才符合仓库）+ 当前缺口（还差什么）+ 长期约束（不能怎么做）。
-#: **变更记录不在内** —— 那是「历史发生过什么」，这四个角色没有一处靠它干活。
-DIGEST_KEYS: tuple[str, ...] = (SECTION_BASIC, SECTION_GAPS, SECTION_DECISIONS)
+#: 主索引已经只含导航信息，因此非 reviewer 角色都可以直接拿这份索引；
+#: 功能、缺口、约束和变更详情由 ``read_repo_memory`` 按需加载。
+DIGEST_KEYS: tuple[str, ...] = INDEX_SECTIONS
 
 
 def empty_memory(owner: str, repo: str) -> str:
-    """首次建档的最小骨架：四节标题 + 平台维护的头行。"""
+    """首次建档的最小主索引：只含稳定事实、目录、架构和记忆导航。"""
     return (
         f"# 仓库记忆：{owner}/{repo}\n\n"
         "> 最后更新：—　｜　最近 PR：—\n\n"
         "## 一、仓库基本信息\n\n"
-        "## 二、变更记录（最新在上）\n\n"
-        "## 三、当前缺口（按模块）\n\n"
-        "## 四、长期约束\n"
+        "## 二、目录与模块\n\n"
+        "## 三、架构概览\n\n"
+        "## 四、记忆目录\n"
     )
+
+
+def empty_sidecar(title: str, section: str) -> str:
+    """子文档的最小骨架；子文档不重复平台维护的 PR 头行。"""
+    return f"# {title}\n\n{HEADINGS[section]}\n"
 
 
 def _key_of(title: str) -> str | None:
@@ -145,6 +177,11 @@ def render_memory(doc: MemoryDoc) -> str:
         lines.append(HEADINGS[section.key] if section.key else section.heading)
         lines.extend(section.body)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def replace_section(doc: MemoryDoc, key: str, content: str) -> None:
+    """用一段 Markdown 整节替换指定节（只用于明确的导航类章节）。"""
+    doc.set_body(key, (content or "").strip().splitlines() or [_EMPTY])
 
 
 def _normalize_blank(lines: list[str]) -> list[str]:
@@ -316,11 +353,17 @@ def digest(text: str, keys: tuple[str, ...] = DIGEST_KEYS) -> str:
     names = " / ".join(
         {
             SECTION_BASIC: "仓库基本信息",
+            SECTION_DIRECTORY: "目录与模块",
+            SECTION_ARCHITECTURE: "架构概览",
+            SECTION_CATALOG: "记忆目录",
             SECTION_GAPS: "当前缺口",
             SECTION_DECISIONS: "长期约束",
         }[key]
         for key in keys
         if any(section.key == key for section in picked)
     )
-    lines.append(f"> 本节选只含：{names}；变更记录没有注入（需要历史时回报给主控 / 由主控查 PR）。")
+    lines.append(
+        f"> 本节选只含：{names}；功能详情、时序图、接口、缺口和历史在子文档中，"
+        "需要时按「记忆目录」的路径加载。"
+    )
     return "\n".join(_normalize_blank(lines)) + "\n"
