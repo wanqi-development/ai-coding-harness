@@ -19,11 +19,400 @@
 | api/ HTTP 接口 | ✅ 完成 |
 | safety/ 安全 | ✅ 完成（全局底线 + 按智能体的工具 / 目录边界） |
 | observability/ 可观测 | ✅ 完成 |
-| tests/ 测试 | ✅ 完成（1336 条全过） |
+| tests/ 测试 | ✅ 完成（1447 条全过） |
 
 ## 修改记录
 
+### 2026-11-21
+
+#### 修复 standalone 依赖缺失与 SQLite 嵌套事务
+
+- Standalone 启动时检查 `deepagents / langgraph / typesafe_sdk`，venv 缺依赖时按当前
+  `pyproject.toml` 执行一次 editable 修复；已补装 `typesafe-sdk`。
+- LangGraph checkpointer 与 Store 不再共用一个 `aiosqlite` 连接；两者现在分别持有连接，
+  避免各自执行 `BEGIN/COMMIT` 时互相破坏事务。
+- aiosqlite 以 `isolation_level=None` 打开，由 LangGraph 显式管理事务，修复
+  `cannot start a transaction within a transaction` 和部分 `cannot commit - no transaction`
+  错误。
+- QA 提示词与工具权限对齐：QA 可以直接用文档级 `save_repo_memory` 沉淀经过代码验证的分析，
+  不再错误地声称“仓库记忆只读”。
+- 仓库记忆新增独立的 `risks` 文档：`gaps` 只记录已确认缺失或未完成的能力，
+  `risks` 记录安全、数据完整性、并发和兼容性等潜在不利后果。QA 可写两类，但仍不能写
+  `decision`；两类写入都必须提供 `source_paths` 或 `verified_commit`。
+- QA 新增受控 `sync_repo_code`：项目为空时 clone，已有仓库只允许 fast-forward 更新；
+  有未提交修改、本地领先提交或目标不是 Git 仓库时拒绝覆盖。
+- 仓库记忆主索引迁到 `<platform>/<owner>/<repo>/index.md`，不再兼容或回退旧 `repo.md`。
+- 右侧“记忆”页改为左侧文档树、右侧 Markdown 内容，默认展示 `index.md`。
+
+### 2026-11-20
+
+#### Standalone 持久目录移到 Windows，并修复旧 SQLite Schema
+
+- Windows standalone 启动器新增 `HARNESS_HOST_HOME`，默认使用
+  `%LOCALAPPDATA%\ai-coding-harness`，统一管理 `data / logs / credentials / backups`。
+- SQLite、api/agent 日志、backend/frontend stdout 和管理员凭据不再默认写入 WSL home；
+  WSL 只保留需要 Linux 权限与文件系统语义的临时 sandbox 会话。
+- WSL 启动脚本通过 `wslpath` 使用 Windows 路径；首次升级会使用 SQLite backup API 迁移旧库，
+  并复制旧日志，不删除源数据。
+- 新增 standalone SQLite Schema 检查与修复：启动前备份旧库、创建缺表、补齐 nullable/defaulted
+  新列；无法安全补齐时拒绝启动。
+- 修复旧库缺少 `model_endpoints.provider`、`model_providers.protocol`、
+  `model_providers.extra_headers` 导致 `GET /model-config` 500 的问题。
+- 新增 `check-schema`、`repair-standalone-schema --dry-run` 和正式修复命令。
+
+### 2026-11-18
+
+#### 仓库记忆升级为“主索引 + 按需详情”
+
+- **主索引**：仍使用原 `/memories/<platform>/<owner>/<repo>.md` 路径，只保留仓库基本信息、
+  语义目录与模块、压缩架构图和记忆目录。旧四节文件会惰性迁移，变更、缺口和约束移入子文档。
+- **详情文档**：新增 `architecture/`、`domains/`、`features/`、`contracts/`、`operations/`、
+  `decisions/`、`working/`、`history/`；功能文档支持流程图、时序图和代码依据。
+- **按需加载**：模型侧只保留 `read_repo_memory` 和文档级 `save_repo_memory`。
+  功能和详情不再默认注入，主索引只提供路径、摘要与关键词。
+- **权限边界**：QA 可写经过代码验证的分析文档；plan、planner、coder、reviewer 只读；
+  plan 回合不触发记忆迁移或 PR 记忆同步。PR 历史仍由平台维护。
+- **Domain/Feature**：feature 必须声明主要 domain，平台自动把功能路径写入领域索引；
+  跨模块功能仍只保留一份 feature 文档。
+- **PR 同步**：变更记录写入 `history/changes.md`，主索引只同步平台维护的 PR 头行。
+- **前端**：右侧“记忆”页列出详情文档，并按需读取 Markdown/Mermaid。
+
+### 2026-11-11
+
+#### 可选拆分 ASGI SSE Gateway 与 Agent Worker
+
+- **执行模式**：新增 `RUN_EXECUTION_MODE=inline|distributed`。`inline` 保持原有单进程
+  RunHub；`standalone` 固定 inline，因此单机 SQLite + WSL 部署行为不变。`distributed`
+  仅允许 multi PostgreSQL + Redis 部署。
+- **Gateway**：`APP_ROLE=gateway` 时，`POST /chat` 只创建 Redis Stream job、打开共享
+  RunBuffer 并返回 SSE；Gateway 不执行 Agent。SSE、重连、取消、pending clarification /
+  git approval 查询仍在 API 进程。
+- **Worker**：新增 `ai_coding_harness.worker_main` CLI 与 `ai-coding-worker` 入口。
+  Worker 使用 Redis consumer group 领取任务，重建 Session，执行 LangGraph、模型、工具
+  和沙箱操作，把帧写入同一 Redis RunBuffer，最后写入 PG 记录并 ACK。
+- **可靠投递**：每会话有 queued marker 防重复提交；job 使用 Redis pending/ACK；
+  `active-job` 心跳每 30 秒续期，避免长任务被其他 worker 误领取；worker 崩溃后
+  在 claim idle + active TTL 都超时后重投。
+- **配置一致性**：worker 每个 job 前重新加载模型端点、提供商、模型窗口和运行期设置，
+  避免 Gateway 设置变更后 worker 长时间使用旧配置。
+- **单机兼容**：`DEPLOYMENT_MODE=standalone / RUN_EXECUTION_MODE=inline /
+  APP_ROLE=all` 继续使用进程内运行，不需要 Redis 或 worker。
+- **部署**：新增 [docs/asgi-worker-split.md](docs/asgi-worker-split.md)、Linux worker
+  启动脚本和 `.env.example` 配置说明；前端 API/SSE 协议不变。
+- **验证**：新增分布式 RunHub、Redis job 去重/ACK、active heartbeat、worker 生命周期
+  和部署模式测试；后端全量 **1447 passed**，前端构建通过。
+
+### 2026-11-05
+
+#### Git 危险命令改为 allow / approval / deny 三层策略
+
+- **策略入口**：新增 `safety/git_policy.py`，按 shell 分段解析 Git，支持 `-C`、`-c`、
+  组合短参数、refspec、嵌套 `sh -c`，不再依靠分散正则判断 Git。
+- **自动允许**：status/log/diff、add/commit、普通 push、fetch、普通 checkout/switch、
+  `clean -n`、已合并分支 `branch -d` 等正常开发命令。
+- **中断审批**：`reset --hard/--keep`、指定文件 checkout/restore、`clean -f`、
+  force-with-lease、非保护分支删除、branch -D、tag/stash 删除、rebase/amend 等。
+  审批前自动保存 status、staged/unstaged patch、HEAD、branch 与 clean dry-run。
+- **直接拒绝**：filter-repo/filter-branch、update-ref、reflog expire、prune、
+  `gc --prune=now`、mirror push、裸 force push、受保护分支强推/删除、`--no-verify`、
+  外部仓库路径与不可枚举的远端 ref。
+- **同一轮恢复**：BoundaryMiddleware 在 execute 前暂停，SSE 下发 `approval` 帧；
+  前端单选弹窗提供拒绝、允许本次执行、终止本轮。选择通过
+  `POST /sessions/{id}/git-approval` 写入 PG，当前 Agent run 轮询后继续同一个 tool call，
+  不调用 `POST /chat`，不生成新的用户记录。
+- **持久化**：新增 `git_approvals` 表与 Alembic `f1a2b3c4d5e6`；审批绑定 command hash、
+  tool_call_id、branch、HEAD，一次性消费，过期或运行结束后不可继续执行。
+- **界面**：新增 `GitApprovalDialog.vue`；关闭弹窗后保留审批状态和重新打开入口，刷新页面
+  可从 pending approval 恢复。
+- **验证**：Git 策略矩阵、命令绕过、审批一次性、允许/拒绝/终止和前端生产构建通过；
+  后端全量 **1441 passed**。
+
+#### 意图失败转 QA 澄清，移除独立 PR 授权与弱关键字兜底
+
+- **意图边界**：删除 `DEFAULT_INTENT`、弱关键字 `classify()` 兜底和 `SOURCE_FALLBACK`。
+  分类只走“强口令 → 所选 JEV / 大模型”；未配置、超时、报错、非法标签或低置信度统一
+  返回 `qa + needs_clarification`，复用现有意图澄清流程。
+- **PR 职责**：删除 `pr_delivery_authorized()`、`TurnState.pr_authorized` 和 `create_pr`
+  的自然语言授权门禁。意图确定后，由主控结合 work task、完整上下文和本轮目标判断是否
+  交付；`create_pr` 只做 task、submission、branch/base 等技术校验。
+- **三层上下文**：`recent_dialogue()` 改为取最近三个未中断完整用户轮次，再附带窗口内
+  所有中断消息。中断轮不占用三个完整轮次名额，中断 assistant 内容标记为
+  `assistant_interrupted`，避免失败轮把更早的关键目标挤出窗口。
+- **验证**：新增“完整三轮 + 中断消息”回归、模型失败转 QA、低置信度澄清和前端构建；
+  后端全量 **1397 passed**，Ruff 与 diff 检查通过。
+
+#### 修复输入框回车发送后文本未清空
+
+- **根因**：发送前只清了按会话保存的草稿状态，没有同步清 textarea 当前值；中文输入法确认
+  Enter 也可能在清空后通过 composition 更新把文本写回。
+- **改动**：发送时同帧清空当前会话草稿和 textarea DOM；Enter 改走显式键盘处理器，
+  拦截 `isComposing` 与 `compositionstart/end`，输入法确认 Enter 不再触发发送。
+- **验证**：前端草稿测试 **3 passed**；TypeScript / Vite 生产构建通过。
+
+#### 修复 work task 把 head 写成 base 导致 PR 无法创建
+
+- **现象**：会话 `32ed64e1` 验证通过后创建 PR 失败，GitHub 返回
+  `No commits between feature/retrieval-result-contract and feature/retrieval-result-contract`。
+- **根因**：`openWorkTask` 建任务时信任调用方传入的 `base_ref`，把头分支写进了任务；
+  后续 `recordTaskSubmission` 使用 `task.base_ref or base_ref`，没有用 coder 已验证的
+  `main` 修正坏值；`create_pr` 又强制从任务根记录读取，并缺少 `head == base` 本地校验。
+- **修复**：
+  - 创建/续接任务时，从最新 submission 修复空的或 `base_ref == branch` 的坏记录；
+    无 active task、无 open PR 时禁止用 `relation=same` 静默新建任务。
+  - `recordTaskSubmission` 拒绝空 ref、`branch == base_ref` 和与任务已有有效 base 冲突的提交；
+    submission 的 `main` 可以修复旧任务中把头当 base 的坏值。
+  - `create_pr` 以最新已验证 submission 的 branch/base 为权威，要求与任务记录一致，
+    并在请求 GitHub 前拒绝相同 head/base。
+  - 提示词补充：`base_ref` 必须是目标分支，不能填当前 feature/head 分支。
+- **数据修复**：session 45 / task 1 已从
+  `feature/retrieval-result-contract -> feature/retrieval-result-contract` 修正为
+  `feature/retrieval-result-contract -> main`。
+- **验证**：新增坏 base、旧任务修复、无任务 `same`、任务/submission 不一致和
+  head/base 相同测试；后端全量 **1407 passed**，Ruff 与 diff 检查通过。
+
+### 2026-11-04
+
+#### 代码任务持久化、PR 交付归主控、移除意图文案注入
+
+- **任务模型**：新增 `work_tasks` 与 `task_submissions` 表。每次开始写代码前，主控必须用
+  `openWorkTask(relation=same|new|unclear)` 建立或绑定任务；coder 完成后 commit + push，
+  主控用 `recordTaskSubmission` 保存不可变提交和本次摘要，并维护跨提交的累计摘要。
+- **需求冲突**：已有 active task 时，`same` 继续当前任务；明显的新需求用 `new`，工具会拒绝
+  并提示先完成当前任务、创建并合并 PR；`unclear` 只向用户确认一次。外部 PR 不再自动阻断
+  本轮，真正冲突只由 work task 与用户需求判断。
+- **PR 职责**：`create_pr` 从 coder 工具中移除，只归主控。主控从 work task 读取 branch/base，
+  在用户明确点击或说“创建 PR”后创建或复用 PR；coder 只负责代码、验证、commit、push 与
+  submission 数据。
+- **Review 去门禁**：reviewer 仍用 `save_review` 持久化 P0-P3、报告和代码版本，但审查只
+  提供建议，不再阻断创建 PR。界面不再因 findings 隐藏创建按钮，提示改为由用户决定继续修改
+  或交付；合并仍由用户手工完成。
+- **意图收敛**：`TASK_TYPES` 收敛为 `qa / plan / coding`。已有 PR 的审查、回评和继续
+  修改统一归 coding，由主控决定派 coder 还是 reviewer。删除逐轮 `intent_directive` 与
+  `configurable.intent` 的提示词注入，只保留 PR 快照、当前 work task 和澄清块等事实上下文。
+- **数据库**：PostgreSQL 已应用 Alembic `d0e1f2a3b4c5 -> e1f2a3b4c5d6`；本次按约定未重启服务。
+- **验证**：后端全量 **1402 passed**；前端 Node 测试 **3 passed**，TypeScript / Vite 生产
+  构建通过；Ruff 通过；提示词冲突扫描 0 条。
+
+### 2026-11-03
+
+#### 修复 ztoken SystemOne 无法解析 SDK 压缩请求
+
+- **现象**：使用 `typesafe-sdk` 调 JEV 返回 400：“参数中没有 model，或者不是标准
+  json 格式”；相同 JSON 用 Postman 直接调用正常返回 `rework`。
+- **根因**：Python 3.14 下 `typesafe-sdk` 默认对超过 1 KiB 的请求体启用 zstd 压缩。
+  真实分类 prompt 超过该阈值，而 ztoken 的 SystemOne 网关不解析 zstd 请求体。
+- **改动**：JEV 客户端显式使用 `compression=False`；同一 SDK、同一完整 prompt 已实测
+  成功返回 `rework`，避免实现回退到另一套手写 HTTP 协议。
+- **验证**：JEV 相关定向测试通过；真实 SystemOne 请求返回
+  `choice=rework, confidence=0.95`。
+
+#### 按 provider 关闭意图分类模型的思考
+
+- **现象**：`deepseek-flash` 作为意图分类模型时偶发超过 5 秒，日志只留下
+  `source=fallback reason=TimeoutError`，随后默认落到 `coding`。
+- **根因**：关闭思考此前统一发送 vLLM 的
+  `chat_template_kwargs.enable_thinking=false`；DeepSeek 忽略该字段，仍生成约 246 个
+  reasoning token。实测同样提示当前耗时约 3 秒，而正确参数约 1 秒且 reasoning 为 0。
+- **改动**：关闭思考参数按 provider 路由。`vllm` 保留 Qwen 的
+  `chat_template_kwargs`；DeepSeek 使用 `thinking.type=disabled`；未知兼容网关不再发送
+  vLLM 私有字段。新增 `vllm` 提供商目录项；分类器异常现在记录模型、超时、异常类型和错误。
+- **验证**：相关 210 项测试通过；真实 DeepSeek 分类调用 1.023 秒、输出 1 token、无
+  reasoning token；Ruff 通过。
+
+#### 按会话隔离输入框草稿
+
+- **现象**：同时有两个活跃会话时，在 A 会话输入框写入的内容会出现在 B 会话输入框。
+- **根因**：前端只有一个全局 `input` ref，切换会话只替换消息与工作区，没有切换草稿状态；
+  发送失败时也直接写回“当前会话”，可能在请求返回前切换会话后污染另一个会话。
+- **改动**：草稿改为按 `session_id` 保存的内存映射；当前输入框通过 computed 读取当前会话；
+  发送前只清空发起请求的会话，失败时也只还原到该会话。删除会话、退出登录和认证失效时
+  同步清理对应草稿。
+- **验证**：新增 3 条 Node/Vue 草稿隔离测试，前端 TypeScript / Vite 生产构建通过。
+
+#### 审查前置、PR 最后创建
+
+- **流程**：代码或文档改完先由 reviewer 调用 `save_review` 独立持久化审查；门禁通过只表示
+  `can_create_pr`，不会自动提交 PR。用户可以继续提出改动，明确点击「创建 PR」或说“创建
+  PR”后，coder 才提交、推送并创建 PR，随后 reviewer 再审查最终 PR Diff。
+- **版本门禁**：Review 绑定 `base_sha`、工作区相对 base 的 diff 指纹与未跟踪文件指纹；
+  同内容从本地候选变成 commit 时仍有效，内容一变化旧审查立即失效。未解决 P0 与被接受的
+  P1 之外的 P1 阻断创建。
+- **提醒**：本地门禁通过时提示“下一步请创建 PR；合并后本阶段任务完成”；最终 PR 审查通过
+  时提示合并。仍有 P0/P1 时只提示先处理并重审，不提示合并。
+- **授权**：`create_pr` 同时校验当前用户消息的明确授权与最新有效审查；创建按钮发送的也是
+  一条显式但最后发生的用户指令。纯文档仍跳过 planner，但保留本地 review。
+- **界面**：新增可回放的 Review 卡片，显示 P0-P3、findings、审查报告、版本和下一步；实时
+  SSE `review` 帧与刷新后的历史记录使用同一结构。
+- **数据库**：新增 `reviews`、`review_findings` 与 Alembic
+  `d0e1f2a3b4c5`；业务库已升级到该版本，现有服务进程未重启。
+- **验证**：后端全量 1417 passed；提示词冲突扫描 0；前端 TypeScript / Vite 生产构建通过。
+
+### 2026-11-02
+
+#### 修复重复 SSE 订阅占满浏览器连接导致右栏 pending
+
+- **现象**：系统运行一段时间后，右侧代码 / PR / 日志 / Token 请求在浏览器里一直是
+  pending，但后端健康检查和同类接口直接请求均为 200。
+- **根因**：同一会话累计了 5 条并行的 `/chat/{id}/stream` 长连接。项目经 HTTP/1.1
+  Vite 代理访问后端，浏览器对同源只有约 6 条连接；长连接占满后，右侧普通请求只能在
+  浏览器队列中等待，根本没有到达后端。
+- **改动**：
+  - 打开会话或回到新建页前先 abort 旧订阅；
+  - 同一会话已有活动订阅时不再重复 `attachRunning`；
+  - `attachRunning` 在发请求前就登记中断句柄，避免并发 attach 竞态；
+  - 每次订阅带 generation，旧流的延时收尾不能再清掉新流的 loading；
+  - 登录失效和组件卸载时主动断开订阅。
+- **验证**：前端 TypeScript / Vite 生产构建通过；后端日志确认右栏接口单次约 20–220ms，
+  不存在后端卡死。
+
+#### 移除“默认打开的右栏标签”设置
+
+- **口径**：右栏每次进入固定从「代码」开始，去掉默认标签这项本机偏好；手动切换标签的
+  交互保持不变。
+- **改动**：删除设置页选项与选项常量，移除 `prefs.ts` 中的 `defaultPanelTab` 状态、
+  `ui.panelTab` localStorage 读写和 setter；`App.vue` 的初始标签改为固定 `code`。
+- **验证**：全仓库检索无残留引用；前端 TypeScript / Vite 生产构建通过。
+
+#### 修复 GPT-6 工具续轮 400，并补全供应商错误原因
+
+- **现象**：GPT-6 Luna / Sol 首次调用正常，绑定工具或进入工具续轮后返回
+  `BadRequestError/400`；兜底日志仍只显示异常类型和状态码。
+- **根因**：
+  - GPT-6 不支持请求参数 `temperature`，供应商明确返回
+    `Unsupported parameter: 'temperature' is not supported with this model`；
+  - 该网关把 OpenAI 错误体展平为 `{"message": ..., "param": "temperature"}`，而日志摘要
+    只读取标准嵌套的 `{"error": {"message": ...}}`，因此详情被丢掉。
+- **改动**：
+  - GPT-6 的 Adapter 不再发送 `temperature`，主模型和关闭思考的分类调用都一致；
+  - 错误摘要同时支持嵌套错误、扁平错误、`detail` 字段和 `response.json()/text()`，
+    并记录脱敏后的 `type` / `param` / `code` / `request_id`。
+- **验证**：用真实 GPT 配置复现工具续轮 400；修复后同一合成工具续轮成功，请求中不再包含
+  `temperature`。相关 94 passed、全量后端 1395 passed；Ruff 通过。
+
+#### 修复 PR 状态把 QA 回合误拦截
+
+- **现象**：GitHub 会话中存在归属未知的 open PR 后，用户即使只问仓库现状也会收到
+  “本轮已停止工作”，没有进入 QA 智能体。
+- **根因**：PR 状态被同时用于限制分类候选和拦截执行。外部 PR 先把意图强制改写成
+  `qa`，随后同一条 ownership block 又把已经降级为 QA 的回合直接终止，形成自相矛盾的
+  闭环；用户真正想执行的写意图也被静默隐藏。
+- **改动**：
+  - 意图分类恢复看全部任务类型，先识别用户真实想做什么；
+  - PR 状态单独作为执行闸门：`qa` 在任何 PR 状态下无条件放行，`coding` / `plan` /
+    `rework` 继续按快照限制；
+  - 归属未知的提示改成“写操作已暂停，只读问答仍可继续”，不再声称整轮停止；
+  - handoff 重判与澄清仍使用可执行候选，不会绕过状态限制。
+- **验证**：新增外部 PR 下 QA 放行、coding 识别后仍拦截以及未知归属原因透传测试；
+  意图/PR 相关 50 passed、全量后端 1391 passed；Ruff 通过。
+
+#### 思考只用于当轮展示，不再回传历史 reasoning
+
+- **决策**：reasoning 可以帮助用户观察当轮执行过程，但不同轮次可能切换模型与协议，
+  `reasoning_content`、Responses reasoning item 与 Anthropic thinking block 没有统一的
+  历史语义。回传收益不足，且会导致 400、伪造协议字段或把上一家模型的内部状态交给下一家。
+- **改动**：
+  - 新增协议无关的请求投影，在模型调用前剥离历史 AI 消息中的 reasoning / thinking
+    内容块及 `reasoning_content`、`reasoning_details`、`thinking` 附加字段；
+  - 主智能体、三个子智能体、兜底模型和摘要调用都经过同一套清理；
+  - `ReasoningContentChatOpenAI` 继续解析第三方流式思考供前端展示，但
+    `_get_request_payload` 不再写回 `reasoning_content`，Responses input 中的历史
+    reasoning item 无论是否带协议 ID 都移除；
+  - 只修改单次请求副本，checkpoint 中的原始消息保持不变；正文、工具调用、工具结果
+    与无关元数据原样保留。
+- **验证**：Chat Completions、Responses、Anthropic thinking 三种历史形状均有回归覆盖；
+  定向测试 93 passed、全量后端 1387 passed；Ruff 与前端生产构建通过。
+
+#### 修复 GPT 工具续轮 400：过滤无协议 ID 的旧 reasoning item
+
+- **现象**：GPT-6 Luna / Sol 的首次调用正常，工具调用后的下一轮固定
+  `BadRequestError/400`，随后由 GLM 兜底；用户直接调用 GPT 正常。
+- **根因**：会话历史混合了 Chat Completions 兼容模型的 `reasoning_content`。
+  转成 Responses API input 后会生成只有 `{"type":"reasoning"}`、没有供应商协议 `id`
+  的 reasoning item；Responses API 不接受这种历史项，而全新请求不带该历史所以正常。
+- **改动**：Responses API 请求序列化时过滤缺少协议 `id` 的 reasoning item；原生
+  Responses reasoning item 保留。普通 Chat Completions 历史仍完整保留
+  `reasoning_content`。供应商错误日志现在只提取脱敏后的 `error.message`，不再只剩
+  `BadRequestError/400`。该临时回传策略随后被上一节的“历史 reasoning 一律不回传”取代。
+- **验证**：当前 checkpoint 本地审计从大量 missing reasoning IDs 降为 0；合成工具续轮
+  正常；新增 Responses 历史清理与脱敏错误摘要测试。
+
+#### 修复 write_todos 实时结果不刷新
+
+- **现象**：`write_todos` 执行成功，后端也持续产生 todos 全量帧，但页面要刷新后才更新。
+- **根因**：前端收到 todos 帧时只原地修改嵌套数组，没有进入统一渲染调度。
+- **改动**：替换整个 todos part 后主动 `schedule()`；实时树与落库后的树保持相同形状。
+- **验证**：Redis run buffer 中确认有实时 todos 帧；TypeScript / Vite 生产构建通过。
+
+#### 意图模式只初始化选中的判定器
+
+- **现象**：用户选择「大模型」后，每轮仍报 `typesafe_sdk` 未加载。
+- **根因**：`_detect_intent()` 在调用 `detect_intent()` 前无条件求值
+  `_jev_for()` 与 `_classifier_for()`；虽然最终 `mode="llm"` 不执行 JEV，但构造 JEV 的
+  import 已先发生。
+- **改动**：按 `intent_mode` 惰性构建唯一需要的判定器；`llm` 不碰 JEV，`jev` 不构建分类
+  模型，`handoffTask` 的重判固定只走大模型。正式锁定 `typesafe-sdk 0.7.5`，选择 JEV 时
+  SDK 也可用。
+- **验证**：新增模式隔离测试，覆盖 `llm`、`jev` 与 `handoffTask` 重判。
+
+#### 重启前保存工作区并在重启后恢复未提交工作
+
+- **现象**：重启发生在 coder 修改过程中；工作区卷保留了改动，但下一次 rework 因
+  `__HARNESS_WORKTREE_DIRTY__` 被同步门禁直接拦截，无法继续。
+- **根因**：旧工作区同步把「dirty」一律视为本地分叉；同时 `stop.bat` 用 `/F` 强杀后端，
+  lifespan 的收尾逻辑没有机会执行。
+- **改动**：
+  - `stop.bat` 先写 `shutdown.request`，后端通过 Uvicorn `should_exit` 优雅退出，超时后才
+    强制回收。
+  - `RunHub.shutdown()` 等待运行任务收尾，再把未提交改动的 status、staged patch、
+    unstaged patch 与 HEAD 写入工作区 `.git/harness-recovery/`，不污染工作区或分支。
+  - rework 同步先 fetch 并校验 PR head；若工作区仍正好位于目标 head，则保留未提交工作并
+    继续进入 Agent，不再丢弃或拒绝。只有 head 已变化且工作区 dirty 时才安全拦截。
+- **边界**：不会自动重放任意中断中的工具调用，因为工具可能已有外部副作用；恢复从持久化
+  checkpoint、会话记录和工作区现状继续，下一次 rework/「继续」可接着完成。
+
 ### 2026-10-31
+
+#### 修复 logs 目录完整性级别导致 agent.log 无输出
+
+- **现象**：服务启动成功、控制台有日志，但 `logs/api.log` 与 `logs/agent.log` 停在旧时间；
+  前端日志接口只能读到旧快照。启动日志明确显示主文件与 PID 备用文件均为
+  `PermissionError`。
+- **根因**：`logs/` 由不同完整性级别创建，目录是 Medium Integrity；项目 venv Python 在
+  当前 Windows 执行上下文中以 Low Integrity 运行。普通用户 ACL 看起来可写，但
+  Mandatory Integrity Control 的 No-Write-Up 仍拒绝写入；项目根目录和 Python 新建目录
+  都是 Low Integrity，因此其他位置可写。
+- **改动**：日志目录修复采用一次性迁移，不再放进日常启动流程。启动监督器只在 `logs`
+  不存在时创建目录，绝不因为探针结果移动既有日志；当前机器的旧目录已人工保留为
+  `logs/archive/`，新的 `logs` 与 Python 写入者处于同一完整性级别。
+- **验证**：重启后 `api.log` 持续增长，`agent.log` 收到 agent 前缀日志，前后端健康检查均
+  返回 200；启动器契约测试 11 passed。
+
+#### 模型接入改为 Provider 协议 Adapter
+
+- **动机**：`ReasoningChatOpenAI` 只解决 OpenAI-compatible 网关的 `reasoning_content`，
+  不能代表 Anthropic 等原生协议；只靠 `base_url` 反推厂商会把手写网关和原生厂商混在一起。
+- **改动**：
+  - 新增唯一入口 `build_chat_model()`：`openai_compatible` 进入
+    `ReasoningContentChatOpenAI`，`anthropic_messages` 在 Adapter 内部通过
+    `init_chat_model` 创建 `ChatAnthropic`。
+  - 主模型、兜底模型和意图分类共用入口；分类只是传入 `thinking="disabled"`。
+  - provider 目录新增 `protocol` 与 `extra_headers`；模型行显式保存 `provider`，旧行继续按
+    `base_url` 反推。
+  - Anthropic 默认使用 Messages 协议、`x-api-key`、`anthropic-version` 和 `/v1/models`。
+  - 设置页增加运行时协议选择、额外请求头 JSON 编辑，并在模型弹窗展示所选协议。
+  - 新增 Alembic 迁移并锁定 `langchain-anthropic` 1.7.7。
+- **验证**：全量测试 **1380 passed**；Vite/TypeScript 生产构建通过；真实
+  PostgreSQL 已升级到 `c9d0e1f2a3b4`，迁移后后端 `/health` 与前端均返回 200。
+
+#### 重命名 OpenAI-compatible reasoning 模型类
+
+- **动机**：`ReasoningChatOpenAI` 容易被理解为只处理 OpenAI 官方模型的思考协议，实际补的是
+  OpenAI-compatible 网关里第三方扩展字段 `reasoning_content`。
+- **改动**：硬重命名为 `ReasoningContentChatOpenAI`，同步更新构造入口、类型断言、测试和
+  模块说明。它是 OpenAI-compatible 传输适配器，不代表 OpenAI 厂商，也不覆盖 Anthropic
+  Messages 协议。
+- **验证**：v3 事件回归测试改为直接继承 `ReasoningContentChatOpenAI`，确认
+  `astream_events(version="v3")` 仍产出 `reasoning-delta`。
 
 #### 日志文件不可写时不再阻断后端启动
 
