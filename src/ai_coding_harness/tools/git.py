@@ -37,6 +37,7 @@ from ai_coding_harness.tools.pr_client import (
     pull_state,
     pull_summary,
 )
+from ai_coding_harness.tools.work_task import WorkTaskContext
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ def build_pr_tools(
     *,
     database: Database | None = None,
     session_id: int | None = None,
+    work_task_ctx: WorkTaskContext | None = None,
 ) -> list[BaseTool]:
     """Build the ``create_pr`` / ``comment_pr`` / ``list_pr_comments`` tools bound to a session repo."""
     client = build_git_client(settings, repo)
@@ -107,16 +109,16 @@ def build_pr_tools(
         *,
         source: str = dao.PR_SOURCE_AGENT,
         mark_synced: bool = False,
-    ) -> str | None:
+    ) -> tuple[str | None, int | None]:
         """把平台事实写进 PR 表；返回给模型看的失败提示。"""
         if database is None or session_id is None:
-            return None
+            return None, None
         try:
             number = int(data.get("number") or 0)
         except (TypeError, ValueError):
-            return "PR 已创建，但登记失败：平台返回的 PR 编号不合法。"
+            return "PR 已创建，但登记失败：平台返回的 PR 编号不合法。", None
         if number <= 0:
-            return "PR 已创建，但登记失败：平台没有返回 PR 编号。"
+            return "PR 已创建，但登记失败：平台没有返回 PR 编号。", None
         summary = pull_summary(data)
         head = data.get("head") if isinstance(data.get("head"), dict) else {}
         base = data.get("base") if isinstance(data.get("base"), dict) else {}
@@ -124,7 +126,7 @@ def build_pr_tools(
         plan_id = state.plan_id if isinstance(state, TurnState) else None
         try:
             async with database.session() as db:
-                await dao.upsert_pull_request(
+                pull = await dao.upsert_pull_request(
                     db,
                     platform=repo.platform.value,
                     owner=repo.owner,
@@ -144,11 +146,17 @@ def build_pr_tools(
                 )
         except Exception:
             logger.exception("PR 已创建但登记失败：%s/%s#%s", repo.owner, repo.repo, number)
-            return f"PR 已创建，但登记到归属表失败（#{number}）。请检查数据库。"
-        return None
+            return f"PR 已创建，但登记到归属表失败（#{number}）。请检查数据库。", None
+        return None, pull.id
 
     @tool
-    async def create_pr(title: str, head: str, base: str, body: str) -> str:
+    async def create_pr(
+        title: str,
+        body: str,
+        task_id: int | None = None,
+        head: str = "",
+        base: str = "",
+    ) -> str:
         """在代码平台（Gitee / GitHub，按本会话仓库所在平台）上创建 Pull Request。
 
         幂等：若该 head → base 已有**未关闭**的 PR，则直接复用并返回它的编号与链接，
@@ -156,10 +164,55 @@ def build_pr_tools(
 
         Args:
             title: PR 标题。
-            head: 源分支（你刚 push 的分支）。
-            base: 目标分支（合并目标，如 master / main）。
+            task_id: 主控代码任务编号。新流程必须提供，head/base 从任务记录读取。
+            head: 兼容字段；调用方不应依赖自行填写。
+            base: 兼容字段；调用方不应依赖自行填写。
             body: PR 描述（改动内容、原因、验证结果）。
         """
+        state = get_configurable("turn_state")
+        work_task_id: int | None = None
+        if work_task_ctx is not None:
+            if task_id is None:
+                return (
+                    "创建 PR 被拒绝：主控必须传入 task_id；"
+                    "分支和目标分支从 PG 任务记录读取。"
+                )
+            async with work_task_ctx.database.session() as db:
+                current = await dao.get_work_task(
+                    db,
+                    session_id=work_task_ctx.session_id,
+                    task_id=task_id,
+                )
+            if current is None:
+                return f"创建 PR 被拒绝：当前会话没有任务 #{task_id}。"
+            task, submissions = current
+            if not submissions:
+                return "创建 PR 被拒绝：任务还没有 coder 提交记录。"
+            if not task.latest_head_sha or not task.latest_commit_sha:
+                return "创建 PR 被拒绝：任务缺少已验证的 commit/head。"
+            if task.latest_head_sha != task.latest_commit_sha:
+                return "创建 PR 被拒绝：最新提交还没有成功 push。"
+            if not task.branch or not task.base_ref:
+                return "创建 PR 被拒绝：任务缺少 branch/base_ref。"
+            latest = submissions[-1]
+            head = latest.branch.strip()
+            base = latest.base_ref.strip()
+            if not head or not base:
+                return "创建 PR 被拒绝：最新 submission 缺少 branch/base_ref。"
+            if task.branch != head or task.base_ref != base:
+                return (
+                    "创建 PR 被拒绝：任务记录与最新 submission 的 branch/base 不一致"
+                    f"（task={task.branch!r}->{task.base_ref!r}，"
+                    f"submission={head!r}->{base!r}）。"
+                )
+            work_task_id = task.id
+        if not head.strip() or not base.strip():
+            return "创建 PR 被拒绝：缺少 head/base。"
+        if head.strip() == base.strip():
+            return (
+                f"创建 PR 被拒绝：head 与 base 不能相同（{head!r}）。"
+                "请修正任务的 branch/base_ref 后重试。"
+            )
         try:
             existing = await client.find_open_pull(head=head, base=base)
         except httpx.HTTPStatusError as exc:
@@ -170,10 +223,17 @@ def build_pr_tools(
             existing = None
         if existing is not None:
             number = int(existing.get("number") or 0)
-            state = get_configurable("turn_state")
             if number > 0 and isinstance(state, TurnState):
                 state.pr = number
-            warning = await register_pull(existing, mark_synced=True)
+            warning, pull_id = await register_pull(existing, mark_synced=True)
+            if work_task_ctx is not None and work_task_id is not None and pull_id is not None:
+                async with work_task_ctx.database.session() as db:
+                    await dao.link_work_task_pull(
+                        db,
+                        session_id=work_task_ctx.session_id,
+                        task_id=work_task_id,
+                        pull_request_id=pull_id,
+                    )
             return (
                 f"PR 已存在，直接复用：{existing.get('html_url')}"
                 f"（编号 {number or '?'}，未新建）"
@@ -187,10 +247,17 @@ def build_pr_tools(
         if "error" in data:
             return f"创建 PR 失败：{data['error']}"
         number = int(data.get("number") or 0)
-        state = get_configurable("turn_state")
         if number > 0 and isinstance(state, TurnState):
             state.pr = number
-        warning = await register_pull(data, mark_synced=True)
+        warning, pull_id = await register_pull(data, mark_synced=True)
+        if work_task_ctx is not None and work_task_id is not None and pull_id is not None:
+            async with work_task_ctx.database.session() as db:
+                await dao.link_work_task_pull(
+                    db,
+                    session_id=work_task_ctx.session_id,
+                    task_id=work_task_id,
+                    pull_request_id=pull_id,
+                )
         return (
             f"PR 已创建：{data.get('html_url')}（编号 {number or '?'}）"
             + (f"\n{warning}" if warning else "")

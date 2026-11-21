@@ -6,9 +6,8 @@
 （谁能用哪些工具、能往哪些目录写）在 ``safety/policy.py``；两层都在
 ``OpenSandboxBackend.aexecute`` 与边界中间件上生效。
 
-全部按 ``re.IGNORECASE`` 匹配（既有行为），所以 git 那几条大小写通吃（``-d`` 与 ``-D``
-同拒）。实现 skill 本来就禁止 ``reset --hard`` / ``clean`` / ``rm`` / ``mv``，与这些规则
-不冲突。
+全部按 ``re.IGNORECASE`` 匹配。Git 命令的三级策略在 ``safety/git_policy.py``，
+这里只保留与智能体无关的系统底线与凭据路径。
 """
 
 from __future__ import annotations
@@ -36,20 +35,6 @@ DANGEROUS_COMMANDS: list[tuple[str, str]] = [
     # --- 提权 -------------------------------------------------------------
     # 只认命令位置的 sudo：`git commit -m "去掉 sudo 依赖"` 这类正当命令不该被拦。
     (r"(?:^|[;&|\n(]\s*)sudo\s", "提权执行（sudo）"),
-    # --- 破坏性 git：不毁沙箱，但毁掉本轮改了一半的工作 -------------------
-    # 沙箱是会话级的、用户看不到里面，被 reset 掉的改动没有别处可找回。
-    (
-        r"git\s+push\b[^;&|\n]*(?<!\w)(-f|--force|--force-with-lease)(?![\w-])",
-        "强推（git push --force）",
-    ),
-    (r"git\s+push\b[^;&|\n]*\s\+\S", "强推（+refspec）"),
-    (r"git\s+reset\b[^;&|\n]*--hard", "丢弃改动（git reset --hard）"),
-    (r"git\s+clean\b[^;&|\n]*(?:--force\b|-[a-z]*f)", "强制清理未跟踪文件（git clean -f）"),
-    (
-        r"git\s+(?:checkout|restore)\b[^;&|\n]*(?:--\s+)?\.(?:\s|$)",
-        "丢弃改动（git checkout / restore .）",
-    ),
-    (r"git\s+branch\b[^;&|\n]*\s-D\b", "强删分支（git branch -D）"),
 ]
 
 
