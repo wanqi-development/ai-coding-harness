@@ -6,11 +6,12 @@ import logging
 from dataclasses import replace
 from typing import Any
 
-from langchain_core.language_models import ModelProfile
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import ChatOpenAI
 
-from ai_coding_harness.agent.chat_model import ReasoningChatOpenAI
+from ai_coding_harness.agent.model_adapters import (
+    ModelBuildOptions,
+    build_chat_model,
+)
 from ai_coding_harness.config import (
     FALLBACK_CONTEXT_WINDOW,
     MODEL_AGENT_LABEL,
@@ -259,89 +260,26 @@ def _config_for(
     return _row_config(row, window=resolve_window(settings, role, user_id))
 
 
-def _wants_reasoning_effort(model: str) -> bool:
-    """只有 OpenAI 的推理模型吃 ``reasoning_effort``。
-
-    智谱 glm-5.3-flash 带这个键会把思考流关掉（实测 ``high`` → 0 字、``medium`` → 400），
-    DeepSeek / Kimi / Qwen 也都不需要它。只按模型名认 OpenAI 推理家族：``gpt-5*`` /
-    ``o1*`` / ``o3*`` / ``o4*``。
-    """
-    name = (model or "").strip().lower()
-    return name.startswith(("gpt-5", "o1", "o3", "o4"))
-
-
-def _wants_responses_api(model: str) -> bool:
-    """GPT-6 通过 Responses API 返回可展示的 reasoning summary。
-
-    2026-10-28 实测：``gpt-6-luna`` / ``gpt-6.1-sol`` 走 Chat Completions 时只有
-    reasoning token，没有可读思考；切到 Responses API 并显式请求
-    ``summary="detailed"`` 后才返回 ``response.reasoning_summary_text.delta``。
-    这是模型/接口能力差异，不是全局默认，其他仍走 Chat Completions。
-    """
-    name = (model or "").strip().lower()
-    return name.startswith("gpt-6")
-
-
 def _model_from(cfg: ModelConfig, *, label: str) -> BaseChatModel:
-    """按一份配置建模型实例（OpenAI 兼容）。``label`` 只用于报错时指认是谁。
-
-    思考参数有三种口径：GPT-6 走 Responses API 并请求 reasoning summary；其他
-    ``extra_body`` 的 ``thinking`` 保留（glm / deepseek 接受，qwen 默认开启）；
-    ``reasoning_effort`` **只给 Chat Completions 的 OpenAI 推理模型**。
-
-    GPT-5 保持原 Chat Completions 口径：2026-10-20 实测智谱 glm-5.3-flash 不带该键时
-    ``reasoning_content`` 正常返回，带上 ``high`` 思考内容变成 0，``medium`` 直接 400
-    （「该模型始终思考，不支持关闭思考」）。
-
-    **温度按模型名兜一层**（``config.temperature_for``）：界面上的行没有温度这一格，
-    而 kimi 系**只收 1**（传 0.3 直接 400）—— 2026-10-15 那次分析轮就是主模型失败后
-    兜底到 kimi、被温度挡下、整轮挂掉。
-    """
+    """按一份配置走协议 Adapter 建模型；``label`` 只用于报错时指认是谁。"""
     if not cfg.model:
         raise ValueError(f"{label} 的模型名未配置")
     if not cfg.api_key or not cfg.base_url:
         raise ValueError(f"{label} 缺少 api_key 或 base_url，请到设置页补全这一行")
-    # 用带 reasoning 补丁的 ChatOpenAI：第三方网关的 ``reasoning_content`` 在
-    # LangChain 的流式转换里会被丢掉，见 ``agent/chat_model.py``。
-    if _wants_responses_api(cfg.model):
-        model_options: dict[str, Any] = {
-            "use_responses_api": True,
-            "output_version": "responses/v1",
-            "reasoning": {"effort": "high", "summary": "detailed"},
-            # 完整历史已包含 Responses reasoning item；继续走本地 checkpoint，
-            # 不把会话状态隐式转交给网关的 previous_response_id。
-            "use_previous_response_id": False,
-        }
-    else:
-        thinking: dict[str, Any] = {"extra_body": {"thinking": {"type": "enabled"}}}
-        if _wants_reasoning_effort(cfg.model):
-            thinking["reasoning_effort"] = "high"
-        model_options = thinking
-    model = ReasoningChatOpenAI(
-        model=cfg.model,
-        api_key=cfg.api_key or None,
-        base_url=cfg.base_url or None,
-        temperature=temperature_for(cfg.model, cfg.temperature),
-        # 流式最后一帧也要 usage（输入/输出 tokens）。默认只有 api.openai.com 会自动开，
-        # 自定义网关一律不发送 stream_options.include_usage —— 日志里那行「（无用量信息）」
-        # 就是这么来的。网关不认这个字段时由 StreamUsageMiddleware 按地址降级重试。
-        stream_usage=True,
-        streaming=True,
-        **model_options,
+    return build_chat_model(
+        cfg,
+        ModelBuildOptions(
+            thinking="enabled",
+            streaming=True,
+            stream_usage=True,
+        ),
     )
-    if cfg.context_window > 0:
-        # 压缩中间件的 fraction 触发器要求模型带 max_input_tokens —— 这一格就是它读的
-        # （比例线 85%，另有一条绝对上限与它 OR，见 `agent/summarization.py`）。
-        # 没这一格时那边会退回纯绝对值那一档：上游见到 fraction 而拿不到 profile 是
-        # 直接 ValueError，不是忽略。
-        model.profile = ModelProfile(max_input_tokens=cfg.context_window)
-    return model
 
 
 def build_model(
     settings: Settings, *, role: str, user_id: int | None = None
 ) -> BaseChatModel:
-    """按**角色**构造模型（OpenAI 兼容）。角色路由见 ``_AGENT_KEY``，构造细节见
+    """按**角色**构造模型。角色路由见 ``_AGENT_KEY``，协议构造见
     ``_model_from``。这一行没配模型时抛 ``ValueError``（文案见 ``_unconfigured``）。"""
     return _model_from(_config_for(settings, role, user_id), label=f"角色 {role!r}")
 
@@ -365,7 +303,8 @@ def build_fallback(
     if row is None or not row.model:
         return None
     primary = _row_for(settings, role, user_id)
-    if primary is not None and (row.base_url, row.model) == (
+    if primary is not None and (row.provider, row.base_url, row.model) == (
+        primary.provider,
         primary.base_url,
         primary.model,
     ):
@@ -392,8 +331,8 @@ def build_classifier_model(
     —— 它依供应商而异，换个模型服务得重新确认。主智能体不传该参数，两者只能是两个实例。
 
     取值顺序：① 「意图识别（大模型）」那一行 → ② ``unified``（统一模型的场景下它就是
-    「默认大模型」）→ 都没有就抛错 —— 调用方接住之后落**关键字口径**（判定是增强，
-    不是新的故障点，见 ``server/turn/intent.py``）。
+    「默认大模型」）→ 都没有就抛错 —— 调用方接住之后进入 **qa 意图澄清**
+    （见 ``server/turn/intent.py``）。
     """
     rows = model_rows_for(settings, user_id)
     cfg = rows.get("classifier") or rows.get("unified")
@@ -405,19 +344,13 @@ def build_classifier_model(
     critical_param = cfg.api_key or cfg.base_url
     if not critical_param:
         raise ValueError("api_key and base_url are required")
-    # **不走** ``init_chat_model``：意图识别这一路要自己的开关（关/开思考、``max_tokens``、
-    # 不挂工具），和主智能体那套按形态路由的装配是两件事。独立构造也让这里的参数不会被
-    # 通用工厂的默认值悄悄改掉。
-    return ChatOpenAI(
-        model=cfg.model,
-        api_key=cfg.api_key,
-        base_url=cfg.base_url,
-        # 判定要确定性 → 温度 0；但 kimi 系**只收 1**（传 0 直接 400），那一层由
-        # ``config.temperature_for`` 兜住（与主智能体同一口径）
-        temperature=temperature_for(cfg.model, 0),
-        max_tokens=_CLASSIFIER_MAX_TOKENS,
-        # 关思考得说 vLLM 的方言：顶层未知字段（包括 DeepSeek 那套 ``thinking``）它
-        # 一律静默忽略，模型照旧把 ``<think>…</think>`` 内联写在正文里 —— 首行不是意图词，
-        # 解析必然失败，还白占 token。换这个键后实测 2.8~5.0s → 0.3s，解析直接命中。
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    return build_chat_model(
+        cfg,
+        ModelBuildOptions(
+            thinking="disabled",
+            streaming=False,
+            stream_usage=False,
+            max_tokens=_CLASSIFIER_MAX_TOKENS,
+            temperature_override=temperature_for(cfg.model, 0),
+        ),
     )

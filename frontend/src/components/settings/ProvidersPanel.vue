@@ -24,10 +24,12 @@ const notice = ref('')
 const editing = ref<ProviderUpsert | null>(null)
 const editingKey = ref('')
 const isNew = ref(false)
+const extraHeadersText = ref('{}')
 
 /** 一句话把这一行的关键信息说清：地址 + 清单路径（两样都可能被改，界面上要看得见）。 */
 function line(meta: ProviderOption): string {
-  return [meta.base_url || '（没配地址）', meta.models_path || '/models'].join(' · ')
+  const protocol = meta.protocol === 'anthropic_messages' ? 'Anthropic Messages' : 'OpenAI Compatible'
+  return [meta.base_url || '（没配地址）', protocol, meta.models_path || '/models'].join(' · ')
 }
 
 async function load() {
@@ -45,11 +47,13 @@ function blank(): ProviderUpsert {
   return {
     label: '',
     base_url: '',
+    protocol: 'openai_compatible',
     ui_group: '',
     sort_order: 0,
     models_path: '/models',
     auth_header: 'Authorization',
     auth_prefix: 'Bearer ',
+    extra_headers: {},
     status: 1,
     is_dynamic_model_list: true,
   }
@@ -60,6 +64,7 @@ function openNew() {
   editing.value = blank()
   editingKey.value = ''
   isNew.value = true
+  extraHeadersText.value = '{}'
 }
 
 function openEdit(meta: ProviderOption) {
@@ -67,16 +72,19 @@ function openEdit(meta: ProviderOption) {
   editing.value = {
     label: meta.label,
     base_url: meta.base_url,
+    protocol: meta.protocol,
     ui_group: meta.ui_group,
     sort_order: meta.sort_order,
     models_path: meta.models_path,
     auth_header: meta.auth_header,
     auth_prefix: meta.auth_prefix,
+    extra_headers: meta.extra_headers,
     status: meta.status,
     is_dynamic_model_list: meta.is_dynamic_model_list,
   }
   editingKey.value = meta.key
   isNew.value = false
+  extraHeadersText.value = JSON.stringify(meta.extra_headers ?? {}, null, 2)
 }
 
 function closeDialog() {
@@ -111,6 +119,17 @@ async function save() {
   error.value = ''
   notice.value = ''
   try {
+    const parsedHeaders = JSON.parse(extraHeadersText.value || '{}')
+    if (
+      !parsedHeaders ||
+      Array.isArray(parsedHeaders) ||
+      typeof parsedHeaders !== 'object' ||
+      Object.values(parsedHeaders).some((value) => typeof value !== 'string')
+    ) {
+      error.value = '额外请求头必须是 JSON 对象，值必须是字符串'
+      return
+    }
+    draft.extra_headers = parsedHeaders as Record<string, string>
     providers.value = await putProvider(key, draft)
     notice.value = isNew.value ? `已新增「${draft.label}」。` : `「${draft.label}」已保存，刷新即生效。`
     closeDialog()
@@ -187,6 +206,13 @@ async function save() {
             <span class="field-label">显示名</span>
             <input v-model="editing.label" class="input" placeholder="如 JEV / GLM（智谱）" />
           </label>
+          <label class="field">
+            <span class="field-label">运行时协议</span>
+            <select v-model="editing.protocol" class="input">
+              <option value="openai_compatible">OpenAI Compatible</option>
+              <option value="anthropic_messages">Anthropic Messages</option>
+            </select>
+          </label>
           <div class="field-inline">
             <label class="field">
               <span class="field-label">分组</span>
@@ -223,6 +249,15 @@ async function save() {
               <input v-model="editing.auth_prefix" class="input" placeholder="Bearer （有的网关留空）" />
             </label>
           </div>
+          <label class="field">
+            <span class="field-label">额外请求头（JSON）</span>
+            <textarea
+              v-model="extraHeadersText"
+              class="input"
+              rows="3"
+              placeholder='{"anthropic-version":"2023-06-01"}'
+            ></textarea>
+          </label>
           <p class="field-note">
             清单地址 = 默认地址 + 清单路径（路径写成 http 开头就整段用它）。实测：GLM 要 /v1/models、
             qwen 要 https://dashscope.aliyuncs.com/api/v1/models。

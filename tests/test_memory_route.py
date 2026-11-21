@@ -52,6 +52,17 @@ class _FakeStore:
         return SimpleNamespace(value=self._value)
 
 
+class _MultiStore:
+    def __init__(self, values: dict[str, str]) -> None:
+        self.values = values
+        self.reads: list[tuple[tuple[str, ...], str]] = []
+
+    async def aget(self, namespace: tuple[str, ...], key: str) -> Any:
+        self.reads.append((tuple(namespace), key))
+        value = self.values.get(key)
+        return None if value is None else SimpleNamespace(value={"content": value})
+
+
 class _FakeDb:
     @asynccontextmanager
     async def session(self, *_a: Any, **_kw: Any):
@@ -66,6 +77,12 @@ def _app(store: _FakeStore, *, repo: Any = "auto") -> FastAPI:
     app.state.store = store
     app.state.settings = Settings(_env_file=None)
     app.state.sessions = {}
+    return app
+
+
+def _app_with_store(store: Any) -> FastAPI:
+    app = _app(_FakeStore(None))
+    app.state.store = store
     return app
 
 
@@ -116,7 +133,7 @@ async def test_it_reads_the_key_the_composite_actually_wrote(monkeypatch) -> Non
     key = memory_store_key(PLATFORM, OWNER, REPO, settings.memories_prefix)
     assert body["content"] == MEMORY, "全文原样返回"
     assert body["path"] == logical, "回给前端的路径是逻辑路径"
-    assert key == f"/{PLATFORM}/{OWNER}/{REPO}.md", "store 里存的是剥掉前缀的那半截"
+    assert key == f"/{PLATFORM}/{OWNER}/{REPO}/index.md", "store 里存的是剥掉前缀的那半截"
     assert store.reads == [(MEMORIES_NAMESPACE, key)], "namespace 与 key 都要对"
     # 与 ``build_composite_backend`` 里那条路由同一个常量（那边也用的它，改一处就两边一起变）
     assert MEMORIES_NAMESPACE == ("memories",)
@@ -143,6 +160,55 @@ async def test_a_legacy_list_content_is_joined(monkeypatch) -> None:
 
     assert resp.status_code == 200
     assert "第二行" in resp.json()["content"]
+
+
+async def test_memory_index_exposes_documents_and_one_document_can_be_read(
+    monkeypatch,
+) -> None:
+    _patch_session(monkeypatch, _repo_row())
+    index = """# 仓库记忆：acme/demo
+
+## 四、记忆目录
+- `features/refund.md` — 退款流程 ｜ 关键词：refund, 退款
+"""
+    store = _MultiStore(
+        {
+            f"/{PLATFORM}/{OWNER}/{REPO}/index.md": index,
+            f"/{PLATFORM}/{OWNER}/{REPO}/features/refund.md": (
+                "# 退款流程\n\n```mermaid\nsequenceDiagram\n  User->>API: refund\n```"
+            ),
+        }
+    )
+    app = _app_with_store(store)
+
+    snapshot = await _get(app, f"/sessions/{SESSION_ID}/memory")
+    document = await _get(
+        app,
+        f"/sessions/{SESSION_ID}/memory/document?path=features%2Frefund.md",
+    )
+
+    assert snapshot.status_code == 200
+    assert snapshot.json()["documents"] == [
+        {
+            "path": "features/refund.md",
+            "summary": "退款流程",
+            "keywords": ["refund", "退款"],
+        }
+    ]
+    assert document.status_code == 200
+    assert "sequenceDiagram" in document.json()["content"]
+
+
+async def test_memory_document_outside_the_index_is_404(monkeypatch) -> None:
+    _patch_session(monkeypatch, _repo_row())
+    app = _app_with_store(_MultiStore({}))
+
+    resp = await _get(
+        app,
+        f"/sessions/{SESSION_ID}/memory/document?path=features%2Fsecret.md",
+    )
+
+    assert resp.status_code == 404
 
 
 async def test_a_bad_id_is_400_and_a_missing_session_is_404(monkeypatch) -> None:

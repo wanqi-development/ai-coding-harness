@@ -184,7 +184,7 @@ class TestFallbackAndClassifier:
         assert llm_mod.build_classifier_model(only_unified).model_name == "one-for-all"
 
     def test_without_any_classifier_row_it_raises(self):
-        """意图识别那一关没配 → 抛错，由调用方落关键字口径（判定是增强，不是故障点）。"""
+        """意图识别那一关没配 → 抛错，由调用方转 qa 澄清（判定是增强，不是故障点）。"""
         with pytest.raises(ValueError, match="「意图识别（大模型）」这一行还没配置模型"):
             llm_mod.build_classifier_model(_settings(agent_models={"qa": _cfg("m-qa")}))
 
@@ -243,7 +243,7 @@ class TestProviderSeed:
 
         assert {
             "deepseek", "qwen", "glm", "kimi", "doubao", "hunyuan",
-            "openai", "gpt", "gemini", "grok", "custom",
+            "openai", "gpt", "gemini", "grok", "vllm", "custom",
         } <= set(by_key), "界面上的「提供商」下拉就照这份文件建"
         deepseek = by_key["deepseek"]
         assert deepseek.display_name == "DeepSeek"
@@ -514,6 +514,7 @@ def _row_of(meta: config_mod.ProviderMeta) -> Any:
         provider=meta.provider,
         display_name=meta.display_name,
         default_base_url=meta.default_base_url,
+        protocol=meta.protocol,
         ui_group=meta.ui_group,
         sort_order=meta.sort_order,
         status=meta.status,
@@ -521,6 +522,7 @@ def _row_of(meta: config_mod.ProviderMeta) -> Any:
         models_path=meta.models_path,
         auth_header=meta.auth_header,
         auth_prefix=meta.auth_prefix,
+        extra_headers=dict(meta.extra_headers),
     )
 
 
@@ -569,6 +571,7 @@ def _patch_dao(
         provider,
         display_name,
         default_base_url="",
+        protocol="openai_compatible",
         ui_group="",
         sort_order=0,
         status=1,
@@ -576,6 +579,7 @@ def _patch_dao(
         models_path="/models",
         auth_header="Authorization",
         auth_prefix="Bearer ",
+        extra_headers=None,
     ):
         """整行覆盖（与真 DAO 同语义）：没有这家就插一行，有就全字段写过去。"""
         row = next((item for item in rows_provider if item.provider == provider), None)
@@ -584,6 +588,7 @@ def _patch_dao(
             rows_provider.append(row)
         row.display_name = display_name
         row.default_base_url = default_base_url
+        row.protocol = protocol
         row.ui_group = ui_group
         row.sort_order = sort_order
         row.status = status
@@ -591,6 +596,7 @@ def _patch_dao(
         row.models_path = models_path
         row.auth_header = auth_header
         row.auth_prefix = auth_prefix
+        row.extra_headers = extra_headers or {}
 
     async def upsert_model_row(db, *, provider, model, model_type="chat", context_window=0,
                                source="manual", status=1):
@@ -603,13 +609,14 @@ def _patch_dao(
         rows = list(models_table.values())
         return [row for row in rows if provider is None or row.provider == provider]
 
-    async def upsert(db, *, user_id=None, agent, base_url=None, model_name=None, api_key=None,
-                     context_window=None):
+    async def upsert(db, *, user_id=None, agent, base_url=None, provider=None,
+                     model_name=None, api_key=None, context_window=None):
         row = store.get(agent) or SimpleNamespace(
-            agent=agent, base_url=None, model_name=None, api_key=None, context_window=0
+            agent=agent, base_url=None, provider=None, model_name=None,
+            api_key=None, context_window=0,
         )
         for field, value in (
-            ("base_url", base_url), ("model_name", model_name),
+            ("base_url", base_url), ("provider", provider), ("model_name", model_name),
             ("api_key", api_key), ("context_window", context_window),
         ):
             if value is not None:
@@ -743,7 +750,9 @@ class TestApi:
         table = _patch_dao(monkeypatch, {}, providers=rows)
         seen: dict[str, str] = {}
 
-        async def fake_entries(base_url, api_key, *, path, auth_header, auth_prefix):
+        async def fake_entries(
+            base_url, api_key, *, path, auth_header, auth_prefix, extra_headers=None
+        ):
             seen["url"] = route._models_url(base_url, path)
             return [{"model": "glm-5.3", "model_type": "chat", "context_window": 1_048_576}]
 
@@ -1606,3 +1615,31 @@ class TestTextOnlyFilter:
         assert metas["qwen"].models_path.startswith("https://")
     assert route.mask_key("short") == "*****"
     assert route.mask_key("") == "" and route.mask_key(None) == ""
+
+
+async def test_saving_a_provider_persists_it_and_drives_runtime_protocol(monkeypatch):
+    """模型行显式 provider 决定 Adapter；旧 base_url 反推只用于兼容。"""
+    store: dict[str, Any] = {}
+    _patch_dao(monkeypatch, store)
+    settings = _settings()
+
+    response = await _call(
+        _app(settings),
+        "PUT",
+        "/model-config",
+        json={
+            "rows": {
+                "plan": {
+                    "provider": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                    "model": "claude-sonnet-4-5",
+                    "api_key": "sk-ant",
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert store["plan"].provider == "anthropic"
+    assert settings.agent_models["plan"].provider == "anthropic"
+    assert settings.agent_models["plan"].protocol == config_mod.ANTHROPIC_PROTOCOL

@@ -44,14 +44,11 @@ import {
   CHAT_WIDTH_LABEL,
   chatWidth,
   codeSize,
-  defaultPanelTab,
   setChatWidth,
   setCodeSize,
-  setDefaultPanelTab,
   setTheme,
   themeMode,
   type ChatWidth,
-  type PanelTab,
   type ThemeMode,
 } from '../../lib/prefs'
 import type { SettingsPanel } from '../../lib/viewState'
@@ -81,14 +78,6 @@ const THEME_OPTIONS: { key: ThemeMode; label: string }[] = [
 const WIDTH_OPTIONS: { key: ChatWidth; label: string }[] = (
   ['compact', 'standard', 'wide'] as ChatWidth[]
 ).map((key) => ({ key, label: CHAT_WIDTH_LABEL[key] }))
-
-const TAB_OPTIONS: { key: PanelTab; label: string }[] = [
-  { key: 'code', label: '代码' },
-  { key: 'memory', label: '记忆' },
-  { key: 'pulls', label: 'PR' },
-  { key: 'logs', label: '日志' },
-  { key: 'usage', label: 'Token' },
-]
 
 function resetLayout() {
   if (!window.confirm('把左右两栏的宽度与收起状态都清回默认？')) return
@@ -375,7 +364,7 @@ function openRoleRow(key: string) {
 /** JEV 那一行的次行文案：它不是聊天模型，没有「生效值」这一说。 */
 function jevDetail(row: ModelConfigRow): string {
   if (!row.model && !row.base_url && !row.has_key) {
-    return '未配置：选了 JEV 会落关键字口径'
+    return '未配置：选了 JEV 会进入 qa 意图澄清'
   }
   const parts = [row.model || 'SDK 默认模型']
   if (row.base_url) parts.push(row.base_url)
@@ -671,6 +660,7 @@ async function saveRow(row: ModelConfigRow) {
   if (!draft) return
   const shared = sharedKeyFor(row, draft)
   const item: Record<string, unknown> = {}
+  if (draft.provider !== row.provider) item.provider = draft.provider
   if (draft.base_url !== row.base_url) item.base_url = draft.base_url
   if (draft.model !== row.model) item.model = draft.model
   if (draft.api_key) item.api_key = draft.api_key
@@ -981,18 +971,6 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <section class="section">
               <h3>界面</h3>
               <div class="set-row">
-                <span class="set-label">默认打开的右栏标签</span>
-                <select
-                  class="input set-control"
-                  :value="defaultPanelTab"
-                  @change="setDefaultPanelTab(($event.target as HTMLSelectElement).value as PanelTab)"
-                >
-                  <option v-for="item in TAB_OPTIONS" :key="item.key" :value="item.key">
-                    {{ item.label }}
-                  </option>
-                </select>
-              </div>
-              <div class="set-row">
                 <span class="set-label">窗口布局</span>
                 <div class="set-control">
                   <button class="btn" type="button" @click="resetLayout">恢复默认布局</button>
@@ -1161,7 +1139,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                 </div>
               </div>
               <p v-if="intentMode === 'jev' && !data?.jev_configured" class="field-note field-note-warn">
-                JEV 这一侧还没配齐（base_url + api_key）：意图判定会落关键字口径
+                JEV 这一侧还没配齐（base_url + api_key）：意图判定会进入 qa 意图澄清
               </p>
               <ModelEntry
                 v-if="jevRow"

@@ -13,11 +13,15 @@ from ai_coding_harness.config import Settings
 if TYPE_CHECKING:
     from psycopg_pool import AsyncConnectionPool
 
-_SQLITE_CONNECTIONS: dict[str, Any] = {}
+_SQLITE_CONNECTIONS: dict[tuple[str, str], Any] = {}
 
 # 连接空闲超过该秒数即回收。库经 SSH 隧道访问，隧道抖动后池里的连接会「开着但已死」，
 # 定期回收能减少取到这类连接的窗口。
 _POOL_MAX_IDLE = 300.0
+
+
+def _sqlite_key(purpose: str, path: Path) -> tuple[str, str]:
+    return purpose, str(path.expanduser().resolve())
 
 
 async def _open_pool(conninfo: str) -> AsyncConnectionPool:
@@ -45,15 +49,21 @@ async def _open_pool(conninfo: str) -> AsyncConnectionPool:
     return pool
 
 
-async def _sqlite_connection(path: Path) -> Any:
+async def _sqlite_connection(path: Path, *, purpose: str) -> Any:
     import aiosqlite
 
-    key = str(path.expanduser().resolve())
+    key = _sqlite_key(purpose, path)
     existing = _SQLITE_CONNECTIONS.get(key)
     if existing is not None:
         return existing
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = await aiosqlite.connect(key, check_same_thread=False)
+    connection = await aiosqlite.connect(
+        key[1],
+        check_same_thread=False,
+        # LangGraph's SQLite implementations issue explicit BEGIN/COMMIT.
+        # sqlite3's default implicit transaction mode would issue a second BEGIN.
+        isolation_level=None,
+    )
     await connection.execute("PRAGMA journal_mode=WAL")
     await connection.execute("PRAGMA synchronous=NORMAL")
     await connection.execute("PRAGMA busy_timeout=5000")
@@ -66,12 +76,18 @@ async def build_checkpointer(settings: Settings) -> BaseCheckpointSaver:
     if settings.is_standalone:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-        connection = await _sqlite_connection(settings.standalone_database_path)
+        connection = await _sqlite_connection(
+            settings.standalone_database_path,
+            purpose="checkpointer",
+        )
         saver = AsyncSqliteSaver(connection)
         await saver.setup()
         saver._harness_closeable = connection  # type: ignore[attr-defined]
         saver._harness_sqlite_path = str(  # type: ignore[attr-defined]
             settings.standalone_database_path.expanduser().resolve()
+        )
+        saver._harness_sqlite_key = _sqlite_key(  # type: ignore[attr-defined]
+            "checkpointer", settings.standalone_database_path
         )
         return saver
 
@@ -89,12 +105,18 @@ async def build_store(settings: Settings) -> BaseStore:
     if settings.is_standalone:
         from langgraph.store.sqlite.aio import AsyncSqliteStore
 
-        connection = await _sqlite_connection(settings.standalone_database_path)
+        connection = await _sqlite_connection(
+            settings.standalone_database_path,
+            purpose="store",
+        )
         store = AsyncSqliteStore(connection)
         await store.setup()
         store._harness_closeable = connection  # type: ignore[attr-defined]
         store._harness_sqlite_path = str(  # type: ignore[attr-defined]
             settings.standalone_database_path.expanduser().resolve()
+        )
+        store._harness_sqlite_key = _sqlite_key(  # type: ignore[attr-defined]
+            "store", settings.standalone_database_path
         )
         return store
 
@@ -118,9 +140,9 @@ async def close_persistence(*objects: BaseCheckpointSaver | BaseStore) -> None:
         closer = getattr(closeable, "close", None)
         if closer is None:
             continue
-        sqlite_path = getattr(item, "_harness_sqlite_path", None)
-        if sqlite_path is not None:
-            _SQLITE_CONNECTIONS.pop(str(sqlite_path), None)
+        sqlite_key = getattr(item, "_harness_sqlite_key", None)
+        if sqlite_key is not None:
+            _SQLITE_CONNECTIONS.pop(sqlite_key, None)
         result = closer()
         if hasattr(result, "__await__"):
             await result

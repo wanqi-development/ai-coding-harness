@@ -49,6 +49,7 @@ from ai_coding_harness.safety.redact import (
 )
 from ai_coding_harness.server import service as service_mod
 from ai_coding_harness.server.intent import IntentDecision
+from ai_coding_harness.server.repo_state import PullSnapshot
 from ai_coding_harness.server.service import HarnessService
 from ai_coding_harness.tools.git import GiteeRepo
 from tests.v3_events import FakeAgent, RunLogFeed, reasoning, tool_finish, tool_start
@@ -498,6 +499,11 @@ class TestServiceOutputs:
             manager=_BoomManager([]),
             database=_FakeDb(),
         )
+
+        async def empty_snapshot(_session: Any) -> PullSnapshot:
+            return PullSnapshot(())
+
+        monkeypatch.setattr(svc, "_repo_snapshot", empty_snapshot)
         session = SimpleNamespace(
             public_id=uuid.uuid4(),
             db_id=1,
@@ -608,13 +614,17 @@ class TestEntryRejection:
         assert CRED_TERM in out[0]["content"]
         assert FAKE not in "\n".join(str(e) for e in spy.records)
 
-    async def test_clean_message_still_runs(self, spy):
+    async def test_clean_message_still_runs(self, spy, monkeypatch):
         """别拦过头：普通消息照常派给智能体、照常命名会话。"""
         manager = _TrackingManager([text_delta("好")])
         message = "实现一个 /hello 接口"
-        out = [
-            e async for e in _service(manager).chat(_session_with_token(FAKE), message)
-        ]
+        svc = _service(manager)
+
+        async def empty_snapshot(_session: Any) -> PullSnapshot:
+            return PullSnapshot(())
+
+        monkeypatch.setattr(svc, "_repo_snapshot", empty_snapshot)
+        out = [e async for e in svc.chat(_session_with_token(FAKE), message)]
 
         assert manager.requested == 1
         # 跑完一轮的最后两帧是「本轮的账」（usage）与 done

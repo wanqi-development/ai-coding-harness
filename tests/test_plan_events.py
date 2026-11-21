@@ -202,6 +202,7 @@ async def _run(
     *,
     intent: str = "coding",
     initial_pr_refs: dict[str, str] | None = None,
+    state: TurnState | None = None,
 ) -> list[dict]:
     svc = HarnessService(
         settings=FAKE_SETTINGS, manager=_FakeManager(events), database=_FakeDb()
@@ -214,13 +215,24 @@ async def _run(
         e
         async for e in svc._run_agent(
             session, runtime, "做点事", intent, terms,
-            state=TurnState(message="做点事"),
+            state=state or TurnState(message="做点事"),
             initial_pr_refs=initial_pr_refs,
         )
     ]
 
 
 class TestPlanEventWiring:
+    async def test_save_review_emits_the_structured_review_card(self):
+        review = {"review_id": 7, "status": "completed", "findings": []}
+        state = TurnState(message="做点事")
+        state.review_payload = review
+
+        out = await _run(_tool_call("save_review"), state=state)
+
+        assert [event for event in out if event["type"] == "review"] == [
+            {"type": "review", "review": review}
+        ]
+
     async def test_custom_handoff_run_events_are_forwarded(self):
         out = await _run([_run_event()])
         runs = [e for e in out if e["type"] == "run"]

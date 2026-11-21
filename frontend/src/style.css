@@ -1344,6 +1344,17 @@ body.resizing {
   margin: 0 auto;
   width: 100%;
 }
+
+.git-approval-reopen {
+  grid-column: 1 / -1;
+  justify-self: start;
+  padding: 6px 10px;
+  border: 1px solid #d97706;
+  border-radius: 8px;
+  background: rgba(217, 119, 6, 0.08);
+  color: #b45309;
+  cursor: pointer;
+}
 .composer-input {
   flex: 1;
   resize: none;

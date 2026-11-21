@@ -44,18 +44,18 @@ from ai_coding_harness.safety.redact import (
 )
 from ai_coding_harness.server.intent import (
     SOURCE_CLARIFY_CHOICE,
-    SOURCE_PR_OWNERSHIP,
+    TASK_TYPES,
     IntentDecision,
     clarification_decision,
-    gate_intent_for_state,
 )
-from ai_coding_harness.server.pr_workspace import pull_refs, sync_pull_workspace, target_pull
-from ai_coding_harness.server.repo_state import describe_snapshot, intent_candidates
+from ai_coding_harness.server.pr_workspace import pull_refs, sync_pull_workspace
+from ai_coding_harness.server.repo_state import describe_snapshot
 from ai_coding_harness.session.manager import (
     Session,
     SessionRuntime,
     WorkspaceError,
 )
+from ai_coding_harness.tools.review import SAVE_REVIEW_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -165,24 +165,22 @@ class TurnRunnerMixin:
         dialogue = await self._dialogue(session)
         # 每轮实时查一次全量 PR；同一份列表用于记忆同步与意图候选。
         snapshot = await self._repo_snapshot(session)
-        if snapshot is not None:
-            try:
-                await self._sync_repo_memory_before_turn(session, snapshot.pulls)
-            except Exception:
-                logger.exception("轮前仓库记忆同步失败（本轮继续，轮末会再试）")
-        allowed_intents = intent_candidates(snapshot)
+        active_work: dict[str, Any] | None = None
+        try:
+            async with self._db.session() as db:
+                current_task = await dao.active_work_task(
+                    db, session_id=session.db_id
+                )
+                if current_task is not None:
+                    active_work = dao.work_task_payload(*current_task)
+        except Exception:
+            logger.exception("读取当前代码任务失败（本轮仍继续）")
         repo_status = describe_snapshot(snapshot)
         # 每轮一份：累加器挂在服务实例上（重判要跨调用累加），所以必须逐轮清零 ——
         # 不清就会把上一轮的判定开销带到这一轮的账上。
         self._intent_usage = {}
         self._last_usage_frame = 0.0
-        if snapshot is not None and snapshot.blocked_reason:
-            decision = IntentDecision(
-                "qa",
-                SOURCE_PR_OWNERSHIP,
-                snapshot.blocked_reason,
-            )
-        elif chosen is not None:
+        if chosen is not None:
             message, chosen_intent, chosen_label = chosen
             decision = IntentDecision(
                 chosen_intent,
@@ -196,19 +194,13 @@ class TurnRunnerMixin:
                 previous_reply,
                 previous_intent,
                 dialogue,
-                allowed_intents=allowed_intents,
+                allowed_intents=TASK_TYPES,
                 repo_state=repo_status,
                 user_id=getattr(session, "user_id", None),
             )
-        state_block: str | None = None
-        gate = gate_intent_for_state(decision.intent, allowed_intents)
-        if snapshot is not None and snapshot.blocked_reason:
-            state_block = snapshot.blocked_reason
-        elif gate.intent is None:
-            state_block = gate.reason
         # 低置信度：先转 qa 向用户确认，避免拿一个猜出来的形态直接干活。
         clarification: dict[str, Any] | None = None
-        if state_block is None and (
+        if (
             clarified := clarification_decision(
                 decision, self._settings.intent_clarify_confidence
             )
@@ -219,6 +211,12 @@ class TurnRunnerMixin:
                 "candidates": list(clarified.candidates),
             }
         intent = decision.intent
+        # Plan 严格只读：只有 qa 分析或 coding 轮次才允许平台同步/迁移仓库记忆。
+        if snapshot is not None and intent != "plan":
+            try:
+                await self._sync_repo_memory_before_turn(session, snapshot.pulls)
+            except Exception:
+                logger.exception("轮前仓库记忆同步失败（本轮继续）")
         logger.info(
             "意图分析：intent=%s source=%s 理由=%s pr_state=%s public_id=%s",
             intent,
@@ -248,18 +246,6 @@ class TurnRunnerMixin:
         )
         await self._name_session(session, message)
 
-        if state_block is not None:
-            await self._record(
-                session,
-                type="assistant",
-                summary=state_block,
-                content=state_block,
-                extra={"intent": intent, "aborted": "intent_state_gate"},
-            )
-            yield {"type": "ai", "content": state_block}
-            yield {"type": "done"}
-            return
-
         # 每轮一份运行时状态：循环守卫拿它数重复，``handoffTask`` 拿它重判意图并把原话
         # 交给另一个形态（分类模型与超时都在这一层，所以回调也从这里给）。
         # 智能体是长期存活对象，逐轮变化的东西只能经 config 注入。
@@ -271,7 +257,8 @@ class TurnRunnerMixin:
                 tuple(snapshot.owned_open_prs) if snapshot is not None else ()
             ),
             pr_state_known=snapshot is not None,
-            allowed_intents=allowed_intents,
+            allowed_intents=TASK_TYPES,
+            work_task_payload=active_work,
             # 回调契约是 (message, history)：把 session 与「助手上一轮末尾」先绑进去，
             # 让重判也能看到「用户在回答哪个问题」（不绑的话它只看得到用户那几句）。
             rejudge=partial(
@@ -280,7 +267,7 @@ class TurnRunnerMixin:
                 previous_reply=previous_reply,
                 previous_intent=previous_intent,
                 dialogue=dialogue,
-                allowed_intents=allowed_intents,
+                allowed_intents=TASK_TYPES,
                 repo_state=repo_status,
             ),
         )
@@ -297,9 +284,21 @@ class TurnRunnerMixin:
             yield {"type": "done"}
             return
 
-        rework_refs: dict[str, str] | None = None
-        if intent == "rework" and snapshot is not None:
-            target = target_pull(message, snapshot.owned_open_prs)
+        active_pr_refs: dict[str, str] | None = None
+        active_pull_id = (
+            int(active_work.get("pull_request_id"))
+            if active_work is not None and active_work.get("pull_request_id")
+            else None
+        )
+        if active_pull_id is not None and snapshot is not None:
+            target = next(
+                (
+                    pull
+                    for pull in snapshot.owned_open_prs
+                    if int(pull.get("_pull_id") or 0) == active_pull_id
+                ),
+                None,
+            )
             if target is not None:
                 synced = await sync_pull_workspace(
                     runtime,
@@ -316,7 +315,7 @@ class TurnRunnerMixin:
                         type="assistant",
                         summary=synced.message,
                         content=synced.message,
-                        extra={"intent": intent, "aborted": "rework_sync"},
+                        extra={"intent": intent, "aborted": "pr_workspace_sync"},
                     )
                     yield {"type": "ai", "content": synced.message}
                     yield {"type": "done"}
@@ -335,13 +334,21 @@ class TurnRunnerMixin:
                             session.public_id,
                             target.get("number"),
                         )
-                logger.info(
-                    "rework 工作区已同步：public_id=%s pr=%s head=%s",
-                    session.public_id,
-                    target.get("number"),
-                    head_sha[:8],
-                )
-                rework_refs = pull_refs(target)
+                if synced.preserved:
+                    logger.info(
+                        "当前任务保留重启前未提交工作：public_id=%s pr=%s head=%s",
+                        session.public_id,
+                        target.get("number"),
+                        head_sha[:8],
+                    )
+                else:
+                    logger.info(
+                        "当前任务工作区已同步：public_id=%s pr=%s head=%s",
+                        session.public_id,
+                        target.get("number"),
+                        head_sha[:8],
+                    )
+                active_pr_refs = pull_refs(target)
 
         try:
             async for event in self._run_agent(
@@ -352,11 +359,11 @@ class TurnRunnerMixin:
                 terms,
                 state=state,
                 clarification=clarification,
-                initial_pr_refs=rework_refs,
+                initial_pr_refs=active_pr_refs,
                 started_at=started_at,
             ):
                 yield event
-            # 轮末打底：只有 coding / rework 共用的 orchestrate 形态才有要沉淀的事实。
+            # 轮末打底：只有 coding orchestrate 形态才有要沉淀的事实。
             if profile_for(intent).form in _MEMORY_WRITE_FORMS:
                 await self._refresh_repo_memory(session, runtime)
         except Exception as exc:
@@ -401,16 +408,14 @@ class TurnRunnerMixin:
         initial_pr_refs: dict[str, str] | None = None,
         started_at: float | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        # 装配形态按本轮意图定：qa / analysis 只读，plan / review 单智能体（主控自己出
-        # 方案 / 自己审），coding 与 rework 挂三个子智能体（两者共用一套装配，表见
-        # agent/profiles.py）。同一会话换形态不影响历史 —— thread 是共享的。
+        # 装配形态按本轮意图定：qa / plan 单智能体，coding 挂三个子智能体
+        # （表见 agent/profiles.py）。同一会话换形态不影响历史 —— thread 是共享的。
         agent = self._manager.get_agent(runtime, session, profile_for(intent))
         if started_at is None:
             started_at = time.perf_counter()
         config = RunnableConfig(
             configurable={
                 "thread_id": self._manager.thread_id(session),
-                "intent": intent,
                 # 低置信度澄清：qa 的中间件读它，决定要不要先追问
                 "clarification": clarification,
                 # 智能体是长期存活对象，词表只能逐轮经 config 注入（脱敏中间件读它）
@@ -445,7 +450,7 @@ class TurnRunnerMixin:
         # 才说得出「正在编码」而不是笼统的「正在处理子任务」。收尾那帧也得带 —— 不带的话
         # 子智能体一返回，提示就翻回泛化文案，而主智能体还要想几秒才开口。
         delegated: dict[str, str] = {}
-        # coding 由 create_pr 入参提供参照；rework 在进入 Agent 前由目标 PR 快照提供。
+        # 当前任务已有 PR 时在进入 Agent 前由目标 PR 快照提供参照。
         pr_refs = dict(initial_pr_refs) if initial_pr_refs else None
 
         # v3 的 astream_events 返回的是协程，得先 await 出流（v2 直接就是流）
@@ -535,6 +540,8 @@ class TurnRunnerMixin:
                         live = self._live_usage(session, intent, run_log)
                         if live is not None:
                             yield {"type": "usage", "usage": live}
+                        if called == SAVE_REVIEW_TOOL and state.review_payload:
+                            yield {"type": "review", "review": state.review_payload}
                         if called in _PLAN_TOOLS:
                             # 方案刚被改过，重读一份最新快照推给前端（全量、幂等；同一状态推一次）。
                             # 前端把它渲染成聊天里那条「方案」链接（就地展开全文），不再有独立面板；
@@ -548,6 +555,17 @@ class TurnRunnerMixin:
                                 yield {"type": "plan", "plan": latest}
                 elif method == "custom":
                     payload = payload_of(event)
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("kind") == "git_approval"
+                        and isinstance(payload.get("approval"), dict)
+                    ):
+                        yield {
+                            "type": "approval",
+                            "approval": _redact_run_payload(
+                                payload["approval"], terms
+                            ),
+                        }
                     if (
                         isinstance(payload, dict)
                         and payload.get("kind") == RUN_EVENT_KIND

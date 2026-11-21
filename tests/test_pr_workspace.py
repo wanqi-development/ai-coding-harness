@@ -99,3 +99,26 @@ async def test_sync_returns_the_synced_pull() -> None:
 
     assert result.ok is True
     assert result.pull is pull
+
+
+async def test_sync_preserves_dirty_work_when_head_already_matches() -> None:
+    class _Sandbox:
+        async def run(self, command, *, timeout):
+            assert "git fetch origin" in command
+            return SimpleNamespace(
+                exit_code=0,
+                stdout="__HARNESS_WORKTREE_PRESERVED__\n__HARNESS_SYNCED__\n",
+                stderr="",
+            )
+
+    pull = _pull(24)
+    result = await sync_pull_workspace(
+        SimpleNamespace(sandbox=_Sandbox()),
+        repo_url="https://gitee.com/acme/demo.git",
+        repo_dir="/ai_coding/project/demo",
+        pull=pull,
+    )
+
+    assert result.ok is True
+    assert result.preserved is True
+    assert "保留" in result.message

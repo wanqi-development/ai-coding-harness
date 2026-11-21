@@ -126,11 +126,33 @@ fi
 HARNESS_HOME="$(getent passwd "${HARNESS_USER}" | cut -d: -f6)"
 APP_HOME="${HARNESS_HOME}/.ai-coding-harness"
 VENV="${APP_HOME}/venv"
-DB_PATH="${APP_HOME}/harness.sqlite3"
-ADMIN_CREDENTIALS_FILE="${ADMIN_CREDENTIALS_FILE:-${APP_HOME}/logs/initial-admin.txt}"
+DATA_DIR="${HARNESS_DATA_DIR:-${APP_HOME}/data}"
+LOG_DIR="${HARNESS_LOG_DIR:-${APP_HOME}/logs}"
+CREDENTIALS_DIR="${HARNESS_CREDENTIALS_DIR:-${APP_HOME}/credentials}"
+BACKUP_DIR="${HARNESS_BACKUP_DIR:-${APP_HOME}/backups}"
+DB_PATH="${HARNESS_SQLITE_PATH:-${DATA_DIR}/harness.sqlite3}"
+ADMIN_CREDENTIALS_FILE="${ADMIN_CREDENTIALS_FILE:-${CREDENTIALS_DIR}/initial-admin.txt}"
 
 install -d -m 700 -o "${HARNESS_USER}" -g "${HARNESS_USER}" \
-  "${APP_HOME}" "${APP_HOME}/sessions" "${APP_HOME}/logs"
+  "${APP_HOME}" "${APP_HOME}/sessions"
+
+prepare_host_dir() {
+  local path="$1"
+  mkdir -p "${path}"
+  case "${path}" in
+    /mnt/*)
+      ;;
+    *)
+      chown "${HARNESS_USER}:${HARNESS_USER}" "${path}"
+      chmod 700 "${path}"
+      ;;
+  esac
+}
+
+prepare_host_dir "${DATA_DIR}"
+prepare_host_dir "${LOG_DIR}"
+prepare_host_dir "${CREDENTIALS_DIR}"
+prepare_host_dir "${BACKUP_DIR}"
 
 if [ ! -f "${REPO_ROOT}/.env" ]; then
   install -m 600 -o "${HARNESS_USER}" -g "${HARNESS_USER}" \
@@ -167,10 +189,11 @@ if needs_admin; then
     PYTHONPATH="${REPO_ROOT}/src" \
     DEPLOYMENT_MODE=standalone \
     SQLITE_PATH="${DB_PATH}" \
+    SQLITE_BACKUP_DIR="${BACKUP_DIR}" \
     SANDBOX_PROVIDER=wsl \
     WSL_USER="${HARNESS_USER}" \
     WSL_ROOT="${APP_HOME}/sessions" \
-    LOG_DIR="${APP_HOME}/logs" \
+    LOG_DIR="${LOG_DIR}" \
     "${VENV}/bin/python" -m ai_coding_harness.manage \
     ensure-standalone-admin \
     --username admin \

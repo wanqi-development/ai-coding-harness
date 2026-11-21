@@ -1,15 +1,13 @@
-"""无缓存 PR 快照与状态候选。"""
+"""无缓存 PR 快照。"""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 from ai_coding_harness.server import repo_state
-from ai_coding_harness.server.intent import gate_intent_for_state
 from ai_coding_harness.server.repo_state import (
     PullSnapshot,
     describe_snapshot,
-    intent_candidates,
 )
 
 
@@ -73,31 +71,6 @@ class TestSnapshot:
 
         assert [pull["number"] for pull in snapshot.open_prs] == [1]
         assert snapshot.has_open_prs is True
-
-    def test_candidates_follow_the_live_snapshot(self) -> None:
-        assert intent_candidates(None) == ("qa",)
-        assert intent_candidates(PullSnapshot((_pull(1, has_comments=False),))) == (
-            "qa",
-            "coding",
-        )
-        assert intent_candidates(PullSnapshot((_pull(1, has_comments=True),))) == (
-            "qa",
-            "rework",
-        )
-        assert intent_candidates(PullSnapshot((_pull(1, state="merged"),))) == (
-            "qa",
-            "plan",
-            "coding",
-        )
-
-    def test_one_reviewed_pr_blocks_coding_even_if_another_is_unreviewed(self) -> None:
-        snapshot = PullSnapshot(
-            (
-                _pull(1, has_comments=False),
-                _pull(2, has_comments=True),
-            )
-        )
-        assert intent_candidates(snapshot) == ("qa", "rework")
 
     def test_description_is_explicitly_live(self) -> None:
         assert "本轮实时查询" in describe_snapshot(PullSnapshot(()))
@@ -209,7 +182,7 @@ class TestSnapshot:
         assert snapshot.open_prs[0]["_source"] == "legacy_agent"
         assert snapshot.open_prs[0]["_plan_id"] is None
 
-    async def test_external_open_pull_hard_blocks_the_snapshot(
+    async def test_external_open_pull_is_described_without_blocking_the_turn(
         self, monkeypatch
     ) -> None:
         pull = _pull(12, author="other-user")
@@ -261,7 +234,7 @@ class TestSnapshot:
 
         assert snapshot.open_prs[0]["_source"] == "external"
         assert "#12" in (snapshot.blocked_reason or "")
-        assert intent_candidates(snapshot) == ("qa",)
+        assert "不按 PR 归属自动阻断本轮" in (snapshot.blocked_reason or "")
 
     def test_owned_snapshot_exposes_head_and_plan(self) -> None:
         owned = {
@@ -275,29 +248,3 @@ class TestSnapshot:
 
         assert snapshot.owned_open_prs[0]["_plan_id"] == 57
         assert snapshot.has_open_prs is True
-
-
-class TestGate:
-    def test_pending_pr_blocks_coding_and_plan_but_allows_rework(self) -> None:
-        allowed = ("qa", "rework")
-
-        assert gate_intent_for_state("rework", allowed).intent == "rework"
-        coding = gate_intent_for_state("coding", allowed)
-        plan = gate_intent_for_state("plan", allowed)
-
-        assert coding.intent is None
-        assert "coding 已暂停" in coding.reason
-        assert plan.intent is None
-
-    def test_rework_without_a_pr_is_blocked(self) -> None:
-        result = gate_intent_for_state("rework", ("qa", "plan", "coding"))
-        assert result.intent is None
-        assert "当前没有可返工的 PR" in result.reason
-
-    def test_unreviewed_open_pr_keeps_coding_available(self) -> None:
-        allowed = ("qa", "coding")
-
-        assert gate_intent_for_state("coding", allowed).intent == "coding"
-        rework = gate_intent_for_state("rework", allowed)
-        assert rework.intent is None
-        assert "当前没有可返工的 PR" in rework.reason

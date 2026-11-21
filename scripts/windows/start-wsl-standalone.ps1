@@ -4,12 +4,14 @@ param(
     [string]$HarnessUser = $(if ($env:WSL_USER) { $env:WSL_USER } else { "harness" }),
     [int]$BackendPort = 8000,
     [int]$FrontendPort = 5173,
+    [string]$HarnessHostHome = $env:HARNESS_HOST_HOME,
     [switch]$Bootstrap,
     [switch]$SkipVerify,
     [switch]$NoFrontend
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_host-runtime.ps1")
 
 function Invoke-WslChecked {
     param(
@@ -64,6 +66,14 @@ function Invoke-Wsl {
     Invoke-WslChecked -Arguments $Arguments | Out-Null
 }
 
+function ConvertTo-ChildArgument {
+    param([string]$Value)
+    if ($Value -match '[\s"]') {
+        return '"' + $Value.Replace('"', '\"') + '"'
+    }
+    return $Value
+}
+
 if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
     throw "WSL is not installed. Run: wsl --install"
 }
@@ -84,6 +94,10 @@ if ($distros -notcontains $Distro) {
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $repoRootForWsl = $repoRoot.Replace("\", "/")
+if ($HarnessHostHome) {
+    $env:HARNESS_HOST_HOME = $HarnessHostHome
+}
+$runtime = Get-HarnessHostRuntime
 # Resolve as root so the first run works before the harness user exists.
 $pathResult = Invoke-WslChecked -CaptureOutput -Arguments @(
     "-d", $Distro, "-u", "root", "--",
@@ -93,12 +107,42 @@ $wslRepo = ($pathResult.Output -join "`n").Trim()
 if (-not $wslRepo) {
     throw "Cannot resolve repository path inside WSL."
 }
+$wslPathResult = Invoke-WslChecked -CaptureOutput -Arguments @(
+    "-d", $Distro, "-u", $HarnessUser, "--",
+    "wslpath", "-a", "-u", $runtime.Root.Replace("\", "/")
+)
+$wslHostHome = ($wslPathResult.Output -join "`n").Trim()
+if (-not $wslHostHome) {
+    throw "Cannot resolve HARNESS_HOST_HOME inside WSL."
+}
+function Convert-HostPathToWsl {
+    param([string]$Path)
+    $result = Invoke-WslChecked -CaptureOutput -Arguments @(
+        "-d", $Distro, "-u", $HarnessUser, "--",
+        "wslpath", "-a", "-u", $Path.Replace("\", "/")
+    )
+    $value = ($result.Output -join "`n").Trim()
+    if (-not $value) {
+        throw "Cannot resolve host path inside WSL: $Path"
+    }
+    return $value
+}
+$wslData = Convert-HostPathToWsl $runtime.Data
+$wslLogs = Convert-HostPathToWsl $runtime.Logs
+$wslCredentials = Convert-HostPathToWsl $runtime.Credentials
+$wslBackups = Convert-HostPathToWsl $runtime.Backups
 
 if ($Bootstrap) {
     Write-Host "[1/4] Bootstrap WSL toolchain ..."
     Invoke-Wsl -Arguments @(
         "-d", $Distro, "-u", "root", "--",
-        "env", "HARNESS_USER=$HarnessUser", "WSL_DISTRO=$Distro",
+        "env",
+        "HARNESS_USER=$HarnessUser",
+        "WSL_DISTRO=$Distro",
+        "HARNESS_DATA_DIR=$wslData",
+        "HARNESS_LOG_DIR=$wslLogs",
+        "HARNESS_CREDENTIALS_DIR=$wslCredentials",
+        "HARNESS_BACKUP_DIR=$wslBackups",
         "bash", "$wslRepo/scripts/wsl/bootstrap.sh"
     )
 }
@@ -111,17 +155,29 @@ if (-not $SkipVerify) {
     )
 }
 
-$backendOut = Join-Path $env:TEMP "harness-wsl-backend.out.log"
-$backendErr = Join-Path $env:TEMP "harness-wsl-backend.err.log"
-$frontendOut = Join-Path $env:TEMP "harness-wsl-frontend.out.log"
-$frontendErr = Join-Path $env:TEMP "harness-wsl-frontend.err.log"
+$backendOut = Join-Path $runtime.Logs "backend.stdout.log"
+$backendErr = Join-Path $runtime.Logs "backend.stderr.log"
+$frontendOut = Join-Path $runtime.Logs "frontend.stdout.log"
+$frontendErr = Join-Path $runtime.Logs "frontend.stderr.log"
+foreach ($logPath in @($backendOut, $backendErr, $frontendOut, $frontendErr)) {
+    Reset-HarnessLogFile -Path $logPath
+}
 
 $backendArgs = @(
     "-d", $Distro, "-u", $HarnessUser, "--",
-    "env", "PORT=$BackendPort",
+    "env",
+    "PORT=$BackendPort",
+    "HARNESS_HOST_HOME=$wslHostHome",
+    "HARNESS_DATA_DIR=$wslData",
+    "HARNESS_LOG_DIR=$wslLogs",
+    "HARNESS_CREDENTIALS_DIR=$wslCredentials",
+    "HARNESS_BACKUP_DIR=$wslBackups",
     "bash", "$wslRepo/scripts/wsl/start-standalone.sh"
 )
-$backend = Start-Process -FilePath "wsl.exe" -ArgumentList $backendArgs `
+$backendArgLine = ($backendArgs | ForEach-Object {
+    ConvertTo-ChildArgument $_
+}) -join " "
+$backend = Start-Process -FilePath "wsl.exe" -ArgumentList $backendArgLine `
     -WindowStyle Hidden -RedirectStandardOutput $backendOut `
     -RedirectStandardError $backendErr -PassThru
 $frontend = $null
@@ -192,6 +248,8 @@ try {
 
     Write-Host ""
     Write-Host "Standalone harness is running."
+    Write-Host "Data: $($runtime.Data)"
+    Write-Host "Logs: $($runtime.Logs)"
     Write-Host "Backend log: $backendOut"
     if ($frontend) {
         Write-Host "Frontend log: $frontendOut"

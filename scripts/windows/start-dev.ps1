@@ -13,14 +13,38 @@ $taskkillExe = Join-Path $env:SystemRoot "System32\taskkill.exe"
 $logDir = Join-Path $repoRoot "logs"
 $launcherLog = Join-Path $logDir "launcher.log"
 $statePath = Join-Path $logDir "launcher-state.json"
-$serviceLogDir = Join-Path $env:TEMP (
-    "ai-coding-harness-" + [guid]::NewGuid().ToString("N")
-)
+$serviceLogDir = Join-Path $logDir "services"
 $launcherEncoding = New-Object System.Text.UTF8Encoding($false)
 $backend = $null
 $frontend = $null
+$projectPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 
-New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+function Initialize-LogDirectory {
+    if (Test-Path -LiteralPath $logDir) {
+        return $true
+    }
+
+    $code = @'
+import os
+from pathlib import Path
+
+root = Path(os.environ["HARNESS_LOG_DIR"])
+root.mkdir(parents=True, exist_ok=True)
+'@
+    $env:HARNESS_LOG_DIR = $logDir
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $projectPython -c $code *> $null
+    $ok = $LASTEXITCODE -eq 0
+    $ErrorActionPreference = $previousPreference
+    Remove-Item Env:HARNESS_LOG_DIR -ErrorAction SilentlyContinue
+    return $ok
+}
+
+if (-not (Initialize-LogDirectory)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+
 New-Item -ItemType Directory -Path $serviceLogDir -Force | Out-Null
 [IO.File]::WriteAllText($launcherLog, "", $launcherEncoding)
 
@@ -195,8 +219,10 @@ try {
     $env:HARNESS_SKIP_PREFLIGHT = "1"
     $backendServiceLog = Join-Path $serviceLogDir "backend.log"
     $frontendServiceLog = Join-Path $serviceLogDir "frontend.log"
+    $shutdownRequest = Join-Path $serviceLogDir "shutdown.request"
 
     Write-LauncherLog "Starting backend on ${backendHost}:$backendPort"
+    $env:HARNESS_SHUTDOWN_FILE = $shutdownRequest
     $backend = Start-Process -FilePath $cmdExe `
         -ArgumentList "/d /c `"call `"$backendBat`" >> `"$backendServiceLog`" 2>&1`"" `
         -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru
@@ -220,10 +246,19 @@ try {
         frontend_port = $frontendPort
         launcher_log = $launcherLog
         service_log_dir = $serviceLogDir
+        shutdown_file = $shutdownRequest
     }
     $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8
     Write-LauncherLog "All services are ready. Run stop.bat to stop them."
-    Start-Process "http://localhost:$frontendPort"
+    try {
+        Start-Process "http://localhost:$frontendPort"
+    }
+    catch {
+        # Browser launch is a convenience, not a service-health condition.
+        Write-LauncherLog -Level WARN -Message (
+            "Could not open the browser automatically: $($_.Exception.Message)"
+        )
+    }
     exit 0
 }
 catch {
@@ -235,6 +270,5 @@ catch {
     if ($null -ne $backend -or $null -ne $frontend) {
         Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $serviceLogDir -Recurse -Force -ErrorAction SilentlyContinue
     exit 1
 }

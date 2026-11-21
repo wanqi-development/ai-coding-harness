@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -24,12 +25,14 @@ from ai_coding_harness.auth.middleware import AuthMiddleware
 from ai_coding_harness.auth.service import AuthService
 from ai_coding_harness.auth.user_service import UserAdminService
 from ai_coding_harness.config import (
+    DEFAULT_PROVIDER_PROTOCOL,
     PROVIDER_SEED_PATH,
     ModelConfig,
     Settings,
     apply_runtime_settings,
     load_provider_seed,
     model_metas_of,
+    provider_key_for,
     provider_metas_of,
 )
 from ai_coding_harness.db import Database
@@ -37,6 +40,8 @@ from ai_coding_harness.infra.circuit import RedisCircuitStore
 from ai_coding_harness.infra.redis_cache import build_redis, command_guard_seconds
 from ai_coding_harness.observability.logging import setup_logging
 from ai_coding_harness.observability.tracing import setup_tracing
+from ai_coding_harness.server.distributed_runs import DistributedRunHub
+from ai_coding_harness.server.run_queue import RedisRunQueue
 from ai_coding_harness.server.run_store import RedisRunBuffer, RedisRunLock
 from ai_coding_harness.server.runs import RunHub
 from ai_coding_harness.server.service import HarnessService
@@ -76,6 +81,12 @@ async def apply_model_endpoints(settings: Settings, database: Database) -> None:
     except Exception:
         logger.exception("读模型连接表失败，本次启动只用 .env 里的模型配置")
         return
+    try:
+        async with database.session() as db:
+            provider_rows = await dao.list_model_providers(db)
+    except Exception:
+        logger.warning("读提供商协议失败，模型行退回按 base_url 推导 provider", exc_info=True)
+        provider_rows = []
     # 读成功才清空：读库失败时保留上一份（清空等于把上一份配置也弄没了）
     settings.agent_models = {}
     settings.user_agent_models = {}
@@ -84,6 +95,27 @@ async def apply_model_endpoints(settings: Settings, database: Database) -> None:
     settings.typesafe_api_key = ""
     settings.typesafe_base_url = ""
     settings.typesafe_model_name = "jev-latest"
+    provider_metas = (
+        provider_metas_of(provider_rows)
+        if provider_rows
+        else settings.provider_metas()
+    )
+
+    def runtime_model(row: Any, *, model_override: str | None = None) -> ModelConfig:
+        stored_provider = str(getattr(row, "provider", "") or "").strip()
+        provider = stored_provider or provider_key_for(row.base_url or "", provider_metas)
+        meta = next(
+            (candidate for candidate in provider_metas if candidate.provider == provider),
+            None,
+        )
+        return ModelConfig(
+            model=model_override if model_override is not None else (row.model_name or ""),
+            api_key=row.api_key or "",
+            base_url=row.base_url or "",
+            provider=provider or "custom",
+            protocol=meta.protocol if meta is not None else DEFAULT_PROVIDER_PROTOCOL,
+            context_window=int(row.context_window or 0),
+        )
     for row in rows:
         user_id = getattr(row, "user_id", None)
         if user_id is None:
@@ -99,12 +131,7 @@ async def apply_model_endpoints(settings: Settings, database: Database) -> None:
                 continue
             if not (row.model_name or "").strip():
                 continue
-            settings.agent_models[row.agent] = ModelConfig(
-                model=row.model_name or "",
-                api_key=row.api_key or "",
-                base_url=row.base_url or "",
-                context_window=int(row.context_window or 0),
-            )
+            settings.agent_models[row.agent] = runtime_model(row)
             continue
         if row.agent == "intent_mode":
             mode = (row.model_name or "").strip().lower()
@@ -113,12 +140,12 @@ async def apply_model_endpoints(settings: Settings, database: Database) -> None:
             continue
         if row.agent != "jev" and not (row.model_name or "").strip():
             continue
-        settings.user_agent_models.setdefault(int(user_id), {})[row.agent] = ModelConfig(
-            model=(row.model_name or "").strip()
-            or ("jev-latest" if row.agent == "jev" else ""),
-            api_key=row.api_key or "",
-            base_url=row.base_url or "",
-            context_window=int(row.context_window or 0),
+        settings.user_agent_models.setdefault(int(user_id), {})[row.agent] = (
+            runtime_model(
+                row,
+                model_override=(row.model_name or "").strip()
+                or ("jev-latest" if row.agent == "jev" else ""),
+            )
         )
     logger.info(
         "模型连接已从库里加载：%d 个用户各自一份配置",
@@ -282,34 +309,68 @@ def create_app(settings: Settings) -> FastAPI:
             database=database,
             intent_jev=app.state.intent_jev,
         )
-        app.state.runs = RunHub(
-            app.state.service,
-            buffer=(
-                RedisRunBuffer(
-                    redis,
-                    prefix=settings.redis_prefix,
-                    ttl_seconds=settings.run_buffer_ttl_seconds,
-                    max_frames=settings.run_buffer_max_frames,
-                    cooldown_seconds=settings.redis_degrade_cooldown_seconds,
-                    guard_seconds=command_guard_seconds(settings),
-                )
-                if redis
-                else None
-            ),
-            lock=(
-                RedisRunLock(
-                    redis,
-                    prefix=settings.redis_prefix,
-                    ttl_seconds=settings.run_lock_ttl_seconds,
-                    cooldown_seconds=settings.redis_degrade_cooldown_seconds,
-                    guard_seconds=command_guard_seconds(settings),
-                )
-                if redis
-                else None
-            ),
-            poll_interval=settings.run_poll_interval_seconds,
-            renew_interval=max(settings.run_lock_ttl_seconds / 4, 1.0),
+        redis_buffer = (
+            RedisRunBuffer(
+                redis,
+                prefix=settings.redis_prefix,
+                ttl_seconds=settings.run_buffer_ttl_seconds,
+                max_frames=settings.run_buffer_max_frames,
+                cooldown_seconds=settings.redis_degrade_cooldown_seconds,
+                guard_seconds=command_guard_seconds(settings),
+            )
+            if redis
+            else None
         )
+        redis_lock = (
+            RedisRunLock(
+                redis,
+                prefix=settings.redis_prefix,
+                ttl_seconds=settings.run_lock_ttl_seconds,
+                cooldown_seconds=settings.redis_degrade_cooldown_seconds,
+                guard_seconds=command_guard_seconds(settings),
+            )
+            if redis
+            else None
+        )
+        app.state.run_jobs = (
+            RedisRunQueue(
+                redis,
+                prefix=settings.redis_prefix,
+                stream=settings.run_job_stream,
+                group=settings.run_job_group,
+                claim_idle_ms=settings.run_job_claim_idle_ms,
+                marker_ttl_seconds=settings.run_buffer_ttl_seconds,
+                active_ttl_seconds=max(60, settings.run_lock_ttl_seconds),
+            )
+            if redis and settings.run_execution_mode == "distributed"
+            else None
+        )
+        hub = (
+            DistributedRunHub(
+                app.state.service,
+                queue=app.state.run_jobs,
+                buffer=redis_buffer,
+                lock=redis_lock,
+                poll_interval=settings.run_poll_interval_seconds,
+                renew_interval=max(settings.run_lock_ttl_seconds / 4, 1.0),
+                text_batch_chars=settings.sse_text_batch_chars,
+                text_batch_flush_seconds=settings.sse_text_flush_ms / 1000,
+            )
+            if (
+                settings.run_execution_mode == "distributed"
+                and settings.app_role != "worker"
+            )
+            else RunHub(
+                app.state.service,
+                buffer=redis_buffer,
+                lock=redis_lock,
+                poll_interval=settings.run_poll_interval_seconds,
+                renew_interval=max(settings.run_lock_ttl_seconds / 4, 1.0),
+                text_batch_chars=settings.sse_text_batch_chars,
+                text_batch_flush_seconds=settings.sse_text_flush_ms / 1000,
+            )
+        )
+        app.state.runs = hub
         yield
         # 清理：先收掉在跑的轮次（否则它们会在连接池拆掉之后还去写库），再销毁会话。
         await app.state.runs.shutdown()

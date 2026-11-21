@@ -154,8 +154,21 @@ class SessionListItem(BaseModel):
     created_at: datetime
 
 
+class MemoryDocumentRef(BaseModel):
+    """One on-demand repository-memory document shown in the right panel."""
+
+    path: str
+    summary: str
+    keywords: list[str] = Field(default_factory=list)
+
+
+class MemoryDocumentSnapshot(BaseModel):
+    path: str
+    content: str
+
+
 class MemorySnapshot(BaseModel):
-    """仓库记忆（StoreBackend 上那份 Markdown）。
+    """仓库记忆主索引与按需文档目录。
 
     ``content`` 为 ``None`` ＝ 这个仓库**还没写过**记忆 —— 与「写过一个空文件」是两件事，
     前端据此显示空态而不是一片空白。
@@ -163,6 +176,7 @@ class MemorySnapshot(BaseModel):
 
     path: str
     content: str | None = None
+    documents: list[MemoryDocumentRef] = Field(default_factory=list)
 
 
 class LogLineItem(BaseModel):
@@ -256,7 +270,7 @@ class ModelConfigRow(BaseModel):
     section: str = "agents"
     #: 这一行服务哪些角色（``orchestrate`` / ``planner`` / ``coder`` / ``reviewer`` …）
     roles: list[str] = Field(default_factory=list)
-    #: 界面「提供商」那一栏现在选中的是谁（按 base_url 反推；**不存库**，纯界面提示）
+    #: 界面「提供商」那一栏选中的是谁；新数据显式存库，旧数据按 base_url 兼容反推
     provider: str = "custom"
     #: 供应商锁死（界面不让改）：JEV 那一行锁 ``typesafe``
     provider_locked: bool = False
@@ -360,6 +374,8 @@ class ProviderOption(BaseModel):
     key: str
     label: str
     base_url: str = ""
+    #: 运行时协议：openai_compatible / anthropic_messages
+    protocol: str = "openai_compatible"
     #: 下拉里的分组名（空＝不分组）
     ui_group: str = ""
     #: 组内排序（小的在前）—— 后端已排好，界面照画即可
@@ -369,6 +385,8 @@ class ProviderOption(BaseModel):
     #: 鉴权头怎么写（多数是 ``Authorization`` + ``Bearer ``；有的网关是 ``x-api-key``）
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer "
+    #: 平台侧请求（模型列表等）的额外请求头
+    extra_headers: dict[str, str] = Field(default_factory=dict)
     #: 1 启用 / 0 停用（停用的不进下拉，但**在「提供商」栏里看得到**，可以重新启用）
     status: int = 1
     #: 这家官方有没有 ``/models``（只是标注；「测试连接」不看它）
@@ -384,11 +402,13 @@ class ProviderUpsert(BaseModel):
 
     label: str
     base_url: str = ""
+    protocol: str = "openai_compatible"
     ui_group: str = ""
     sort_order: int = 0
     models_path: str = "/models"
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer "
+    extra_headers: dict[str, str] = Field(default_factory=dict)
     status: int = 1
     is_dynamic_model_list: bool = True
 
@@ -405,7 +425,7 @@ class ModelConfigSnapshot(BaseModel):
     coding_group: list[CodingGroupRole] = Field(default_factory=list)
     #: 意图识别走哪一关：``jev`` / ``llm``（**严格二选一**，不互相兜底）
     intent_mode: str = "jev"
-    #: JEV 这一侧配齐了没有（地址 + key 两样）；false 时界面说明「这一侧不可用，会落关键字口径」
+    #: JEV 这一侧配齐了没有（地址 + key 两样）；false 时界面说明「这一侧不可用，会进入 qa 澄清」
     jev_configured: bool = False
 
 
@@ -420,6 +440,7 @@ class ModelConfigRowUpdate(BaseModel):
     """一行的写入：**只有给了的字段才会被写**（不传＝不改；空串＝清掉）。"""
 
     base_url: str | None = None
+    provider: str | None = None
     model: str | None = None
     api_key: str | None = None
     #: 复用另一行已保存的 Key（不传明文；只允许同一用户、同一供应商与同一 base_url）
@@ -541,7 +562,7 @@ class UsageSnapshot(BaseModel):
 
     totals: UsageActor = Field(default_factory=lambda: UsageActor(key="total"))
     actors: list[UsageActor] = Field(default_factory=list)
-    #: **主控按形态**拆出来的用量（qa / analysis / plan / review / coding / rework）；
+    #: **主控按形态**拆出来的用量（qa / plan / coding / orchestrate）；
     #: 子智能体不在里面 —— 它们本来就是独立的执行主角（见 ``actors``）。
     by_form: dict[str, UsageActor] = Field(default_factory=dict)
     rounds: int = 0
@@ -607,6 +628,36 @@ class ClarificationInfo(BaseModel):
     options: list[ClarificationOption] = Field(default_factory=list)
     steps: list[ClarificationStep] = Field(default_factory=list)
     allow_other: bool = True
+
+
+class GitApprovalOption(BaseModel):
+    id: str
+    label: str
+    description: str = ""
+    tone: str = "neutral"
+
+
+class GitApprovalInfo(BaseModel):
+    """SSE ``approval`` frame and pending-approval endpoint payload."""
+
+    approval_id: str
+    request_hash: str
+    tool_call_id: str = ""
+    command: str
+    action: str = ""
+    risk: str = ""
+    status: str = "pending"
+    choice: str | None = None
+    options: list[GitApprovalOption] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    expires_at: datetime
+    resolved_at: datetime | None = None
+
+
+class GitApprovalResolveRequest(BaseModel):
+    approval_id: str
+    choice: str
 
 
 class PlanStepItem(BaseModel):

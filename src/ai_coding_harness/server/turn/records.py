@@ -11,7 +11,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ai_coding_harness.agent.llm import build_model
 from ai_coding_harness.agent.middleware.context_inject import now_stamp
-from ai_coding_harness.backends.composite import memory_path, memory_store_key
+from ai_coding_harness.agent.middleware.repo_memory_pack import ensure_memory_pack
+from ai_coding_harness.backends.composite import (
+    memory_document_path,
+    memory_document_store_key,
+    memory_path,
+    memory_store_key,
+)
 from ai_coding_harness.core.stream import (
     V3Translator,
 )
@@ -250,12 +256,14 @@ class TurnRecordsMixin:
         session: Session,
         backend: Any,
         path: str,
+        index_path: str,
         pulls: tuple[dict[str, Any], ...],
     ):
         """共享写入口：新 PR 摘要 + 状态对账 + 真实落盘。"""
         return await sync_repo_memory(
             backend,
             path,
+            index_path=index_path,
             owner=session.repo.owner,
             repo=session.repo.repo,
             pulls=pulls,
@@ -269,14 +277,28 @@ class TurnRecordsMixin:
         """每轮拦截点：在沙箱准备前直接读写持久 Store。"""
         if self._memory_backend is None:
             return None
-        path = memory_store_key(
+        index_path = memory_store_key(
             session.repo.platform.value,
             session.repo.owner,
             session.repo.repo,
             self._settings.memories_prefix,
         )
+        await ensure_memory_pack(
+            self._memory_backend,
+            index_path=index_path,
+            owner=session.repo.owner,
+            repo=session.repo.repo,
+            now=now_stamp(),
+        )
+        path = memory_document_store_key(
+            session.repo.platform.value,
+            session.repo.owner,
+            session.repo.repo,
+            "history/changes.md",
+            self._settings.memories_prefix,
+        )
         result = await self._sync_memory(
-            session, self._memory_backend, path, pulls
+            session, self._memory_backend, path, index_path, pulls
         )
         logger.info(
             "仓库记忆轮前同步：new=%s restated=%s pending=%s changed=%s",
@@ -290,11 +312,25 @@ class TurnRecordsMixin:
     async def _refresh_repo_memory(
         self, session: Session, runtime: SessionRuntime
     ) -> None:
-        """coding / rework 轮末再查一次 PR 并走同一套记忆同步。"""
-        path = memory_path(
+        """coding 轮末再查一次 PR 并走同一套记忆同步。"""
+        index_path = memory_path(
             session.repo.platform.value,
             session.repo.owner,
             session.repo.repo,
+            self._settings.memories_prefix,
+        )
+        await ensure_memory_pack(
+            runtime.backend,
+            index_path=index_path,
+            owner=session.repo.owner,
+            repo=session.repo.repo,
+            now=now_stamp(),
+        )
+        path = memory_document_path(
+            session.repo.platform.value,
+            session.repo.owner,
+            session.repo.repo,
+            "history/changes.md",
             self._settings.memories_prefix,
         )
         try:
@@ -306,7 +342,7 @@ class TurnRecordsMixin:
                 session_id=session.db_id,
             )
             result = await self._sync_memory(
-                session, runtime.backend, path, snapshot.pulls
+                session, runtime.backend, path, index_path, snapshot.pulls
             )
             logger.info(
                 "仓库记忆轮末同步：new=%s restated=%s pending=%s changed=%s",

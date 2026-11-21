@@ -7,6 +7,7 @@ from ai_coding_harness.db.models import (
     AppSetting,
     AuthSession,
     Clarification,
+    GitApproval,
     LocalCredential,
     ModelEndpoint,
     ModelProvider,
@@ -14,10 +15,14 @@ from ai_coding_harness.db.models import (
     ProviderModel,
     PullRequest,
     Repository,
+    Review,
+    ReviewFinding,
     SessionRecord,
     SessionRecordDetail,
+    TaskSubmission,
     User,
     UserIdentity,
+    WorkTask,
 )
 
 __all__ = [
@@ -27,6 +32,7 @@ __all__ = [
     "Base",
     "Clarification",
     "Database",
+    "GitApproval",
     "LocalCredential",
     "ModelEndpoint",
     "ModelProvider",
@@ -34,8 +40,12 @@ __all__ = [
     "ProviderModel",
     "PullRequest",
     "Repository",
+    "Review",
+    "ReviewFinding",
     "SessionRecord",
     "SessionRecordDetail",
+    "TaskSubmission",
     "User",
     "UserIdentity",
+    "WorkTask",
 ]

@@ -65,7 +65,7 @@ class TestTheRepoMemoryIsReadableBack:
 
         assert (
             memory_store_key("gitee", MEM_OWNER, MEM_REPO)
-            == f"/gitee/{MEM_OWNER}/{MEM_REPO}.md"
+            == f"/gitee/{MEM_OWNER}/{MEM_REPO}/index.md"
         )
         assert (
             store.get(MEMORIES_NAMESPACE, memory_store_key("gitee", MEM_OWNER, MEM_REPO))

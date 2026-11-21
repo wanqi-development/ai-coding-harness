@@ -78,6 +78,7 @@ from ai_coding_harness.agent.middleware.context_trim import (
     plan_context_trim_event,
     prune_context_trim_event,
 )
+from ai_coding_harness.agent.reasoning_history import strip_reasoning_history
 from ai_coding_harness.config import Settings
 from ai_coding_harness.observability.logging import MAIN_AGENT
 from ai_coding_harness.tools.context import get_configurable
@@ -360,6 +361,13 @@ class HarnessSummarizationMiddleware(SummarizationMiddleware):
             result = self._with_trim_event(result, None)
         return result
 
+    async def _acreate_summary(self, messages_to_summarize: list[Any]) -> str:
+        """Do not let historical reasoning leak through the summary request."""
+        cleaned = strip_reasoning_history(messages_to_summarize)
+        return await super()._acreate_summary(
+            cleaned if cleaned is not None else messages_to_summarize
+        )
+
     def _should_summarize_estimate(
         self, messages: Sequence[Any], total_tokens: int
     ) -> bool:
@@ -578,12 +586,12 @@ CONTEXT_MODE_LABELS = {
 }
 
 _STEADY_AGENTS = frozenset(
-    {"qa", "coding", "orchestrate", "rework"}
+    {"qa", "coding", "orchestrate"}
 )
 _BURST_AGENTS = frozenset(
     {"plan", "planner", "coder", "reviewer"}
 )
-_STEADY_FORMS = frozenset({"qa", "coding", "orchestrate", "rework"})
+_STEADY_FORMS = frozenset({"qa", "coding", "orchestrate"})
 _BURST_FORMS = frozenset({"plan"})
 
 

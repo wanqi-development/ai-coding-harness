@@ -1,29 +1,28 @@
-"""意图判定守卫：状态候选 → 口令 → JEV / 大模型 → 关键字兜底。"""
+"""Intent classification: recognition only; task conflicts are enforced later."""
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import typesafe_sdk
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
 from ai_coding_harness.server.intent import (
-    SOURCE_FALLBACK,
+    SOURCE_CLARIFY,
     SOURCE_JEV,
     SOURCE_LLM,
     TASK_TYPES,
     IntentDecision,
+    JevDecider,
     _system_prompt,
     _user_prompt,
     clarification_decision,
-    classify,
     detect_intent,
-    gate_intent_for_state,
     match_strong,
     parse_reply,
 )
@@ -93,13 +92,10 @@ class _FakeJev:
 
 
 class TestTaskSet:
-    def test_the_four_remaining_intents(self) -> None:
-        assert TASK_TYPES == ("coding", "rework", "plan", "qa")
-
-    def test_review_and_analysis_are_not_intents(self) -> None:
-        assert "review" not in TASK_TYPES
-        assert "analysis" not in TASK_TYPES
-        assert "sync" not in TASK_TYPES
+    def test_only_current_intents_remain(self) -> None:
+        assert TASK_TYPES == ("coding", "plan", "qa")
+        for old in ("rework", "review", "analysis", "sync"):
+            assert old not in TASK_TYPES
 
 
 class TestStrongKeywords:
@@ -109,106 +105,87 @@ class TestStrongKeywords:
         assert match_strong("按这个方案做吧") == "coding"
         assert match_strong("写技术文档") == "coding"
         assert match_strong("更新 README 并提 PR") == "coding"
-        assert match_strong("写 AGENT.md") == "coding"
-        assert match_strong("写 AGENTS.md") == "coding"
         assert match_strong("给我出一个写文档的方案") is None
         assert match_strong("先讨论文档结构，不要写") is None
-        assert (
-            match_strong("开始写代码", allowed_intents=("qa", "coding"))
-            == "coding"
-        )
-        assert match_strong("开始写代码", allowed_intents=("qa", "rework")) is None
 
-    def test_open_pr_review_and_fix_commands_are_rework(self) -> None:
+    def test_review_and_fix_requests_are_coding(self) -> None:
         for message in (
             "帮我代码审查一下",
             "按评审意见修改",
             "根据审查结论改代码",
+            "看看这个 PR 并修复P1",
         ):
-            assert match_strong(message, allowed_intents=("qa", "rework")) == "rework"
+            assert match_strong(message) == "coding"
 
     def test_sync_is_gone_from_the_keyword_table(self) -> None:
         assert match_strong("同步仓库") is None
-        assert classify("同步仓库", allowed_intents=("qa", "plan", "coding")) == "coding"
 
-    def test_coding_command_stays_coding_and_is_blocked_later(self) -> None:
+    def test_strong_coding_command_is_not_rewritten_by_pr_state(self) -> None:
+        import asyncio
+
         decision = asyncio.run(
             detect_intent(
                 "开始实施",
                 model=_FakeClassifier(),
-                allowed_intents=("qa", "rework"),
+                allowed_intents=TASK_TYPES,
+                repo_state="存在 open PR",
             )
         )
         assert decision.intent == "coding"
         assert decision.source == "keyword"
 
 
-class TestStateRestrictedClassification:
-    def test_the_prompt_only_lists_the_allowed_intents(self) -> None:
-        prompt = _system_prompt(("qa", "rework"), repo_state="有 1 个 open PR")
+class TestClassificationContext:
+    def test_prompt_can_list_only_requested_candidates(self) -> None:
+        prompt = _system_prompt(("qa",), repo_state="有 1 个 open PR")
 
         assert "当前仓库状态：有 1 个 open PR" in prompt
-        assert "rework：" in prompt
         assert "qa：" in prompt
         assert "coding：要写" not in prompt
         assert "plan：方案这个对象本身" not in prompt
 
-    async def test_jev_receives_the_restricted_candidate_set(self) -> None:
-        jev = _FakeJev("rework")
+    async def test_jev_receives_repo_state_and_candidates(self) -> None:
+        jev = _FakeJev("coding")
 
         decision = await detect_intent(
-            "这个 PR 再看看",
+            "这个 PR 再看看并修复",
             jev=jev,
-            allowed_intents=("qa", "rework"),
+            allowed_intents=TASK_TYPES,
             repo_state="有 2 个 open PR",
             mode="jev",
         )
 
-        assert decision.intent == "rework"
+        assert decision.intent == "coding"
         assert decision.source == SOURCE_JEV
-        assert jev.allowed == ("qa", "rework")
+        assert jev.allowed == TASK_TYPES
         assert jev.repo_state == "有 2 个 open PR"
 
-    async def test_the_llm_cannot_return_a_disallowed_intent(self) -> None:
+    async def test_llm_cannot_return_a_disallowed_intent(self) -> None:
         model = _FakeClassifier(reply="coding\n想写代码")
 
         decision = await detect_intent(
             "帮我看一下",
             model=model,
             mode="llm",
-            allowed_intents=("qa", "rework"),
+            allowed_intents=("qa",),
         )
 
-        assert decision.source == SOURCE_FALLBACK
+        assert decision.source == SOURCE_CLARIFY
         assert decision.intent == "qa"
+        assert decision.needs_clarification
         assert "coding：" not in model.prompts[0]
 
-    async def test_the_llm_returns_an_allowed_intent(self) -> None:
-        model = _FakeClassifier(reply="rework\n处理 PR")
-
+    async def test_model_unavailable_goes_to_qa_clarification(self) -> None:
         decision = await detect_intent(
-            "帮我看看这个 PR 的设计",
-            model=model,
+            "一句没有口令的话",
+            model=None,
             mode="llm",
-            allowed_intents=("qa", "rework"),
+            allowed_intents=TASK_TYPES,
         )
 
-        assert decision.intent == "rework"
-        assert decision.source == SOURCE_LLM
-
-    def test_keyword_fallback_uses_the_only_safe_candidate(self) -> None:
-        assert classify("一句没有口令的话", allowed_intents=("qa",)) == "qa"
-
-
-class TestGate:
-    def test_function_gate_blocks_coding_and_plan_when_a_pr_is_open(self) -> None:
-        assert gate_intent_for_state("coding", ("qa", "rework")).intent is None
-        assert gate_intent_for_state("plan", ("qa", "rework")).intent is None
-
-    def test_function_gate_blocks_rework_without_a_pr(self) -> None:
-        result = gate_intent_for_state("rework", ("qa", "plan", "coding"))
-        assert result.intent is None
-        assert "当前没有可返工的 PR" in result.reason
+        assert decision.intent == "qa"
+        assert decision.source == SOURCE_CLARIFY
+        assert decision.needs_clarification
 
 
 class TestContext:
@@ -216,21 +193,20 @@ class TestContext:
         text = _user_prompt(
             "继续",
             ["上一轮"],
-            ["rework(评审提)"],
-            previous_intent="rework",
+            ["coding(审查)"],
+            previous_intent="coding",
             dialogue=[{"role": "assistant", "content": "要修哪条？"}],
             repo_state="有 1 个 open PR",
         )
 
         assert "当前仓库状态：有 1 个 open PR" in text
-        assert "上一轮判定：rework" in text
-        assert "最近三个用户轮次内的完整会话记录" in text
+        assert "上一轮判定：coding" in text
+        assert "最近三个未中断完整用户轮次" in text
         assert "以下正文未截断" in text
-        assert "rework(评审提)" in text
-        assert "当前未完成任务" not in text
+        assert "coding(审查)" in text
 
     def test_low_confidence_clarification_is_still_qa(self) -> None:
-        decision = IntentDecision("rework", SOURCE_LLM, confidence=0.31)
+        decision = IntentDecision("coding", SOURCE_LLM, confidence=0.31)
 
         clarified = clarification_decision(decision, 0.55)
 
@@ -249,13 +225,7 @@ class TestParsing:
         assert parsed.candidates == (("plan", 0.11),)
 
     def test_disallowed_labels_are_rejected(self) -> None:
-        assert (
-            parse_reply(
-                "review\n0.8\n-\n审查",
-                allowed_intents=("qa", "rework"),
-            )
-            is None
-        )
+        assert parse_reply("review\n0.8\n-\n审查", allowed_intents=TASK_TYPES) is None
 
     def test_legacy_two_line_reply_still_parses(self) -> None:
         parsed = parse_reply("plan\n先给步骤")
@@ -266,26 +236,51 @@ class TestParsing:
 
 
 class TestFailures:
-    async def test_classifier_error_falls_back(self) -> None:
+    def test_jev_client_disables_sdk_zstd_compression(self, monkeypatch) -> None:
+        seen: dict[str, Any] = {}
+
+        class FakeTypeSafeClient:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+        monkeypatch.setattr(
+            typesafe_sdk, "AsyncTypeSafeClient", FakeTypeSafeClient
+        )
+
+        JevDecider(
+            api_key="test-key",
+            base_url="https://api.ztoken.pro",
+            model="jev-latest",
+        )
+
+        assert seen["model"] == "jev-latest"
+        assert seen["compression"] is False
+
+    async def test_classifier_error_goes_to_qa_clarification(self, caplog) -> None:
         decision = await detect_intent(
             "随便看看",
             model=_FakeClassifier(error="boom"),
             mode="llm",
-            allowed_intents=("qa", "rework"),
+            allowed_intents=TASK_TYPES,
         )
 
-        assert decision.source == SOURCE_FALLBACK
+        assert decision.source == SOURCE_CLARIFY
         assert decision.intent == "qa"
+        assert decision.needs_clarification
+        assert "大模型意图判定失败" in caplog.text
+        assert "RuntimeError: boom" in caplog.text
 
-    async def test_jev_failure_falls_back_without_trying_the_llm(self) -> None:
+    async def test_jev_failure_goes_to_qa_without_trying_the_llm(self) -> None:
         model = _FakeClassifier(reply="qa")
         decision = await detect_intent(
             "随便看看",
             jev=_FakeJev(None),
             model=model,
             mode="jev",
-            allowed_intents=("qa", "rework"),
+            allowed_intents=TASK_TYPES,
         )
 
-        assert decision.source == SOURCE_FALLBACK
+        assert decision.source == SOURCE_CLARIFY
+        assert decision.intent == "qa"
+        assert decision.needs_clarification
         assert model.calls == 0

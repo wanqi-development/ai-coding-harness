@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from ai_coding_harness.agent import profiles as profiles_module
-from ai_coding_harness.agent.profiles import FORM_ALIASES
 from ai_coding_harness.agent.prompts import (
     CODER_PROMPT,
     ORCHESTRATE_FORM,
@@ -58,13 +57,6 @@ class TestIntentToProfile:
         assert profiles_module.profile_for("qa").form == QA_FORM
         assert profiles_module.profile_for("plan").form == PLAN_FORM
         assert profiles_module.profile_for("coding").form == ORCHESTRATE_FORM
-        assert profiles_module.profile_for("rework").form == ORCHESTRATE_FORM
-
-    def test_rework_is_the_only_alias(self) -> None:
-        assert FORM_ALIASES == {"rework": "coding"}
-        assert profiles_module.profile_for("rework") is profiles_module.profile_for(
-            "coding"
-        )
 
     def test_only_coding_mounts_subagents(self) -> None:
         assert profiles_module.profile_for("qa").subagents == ()
@@ -84,13 +76,15 @@ class TestIntentToProfile:
 
 
 class TestMainTools:
-    def test_qa_has_pr_reads_but_no_write_side(self) -> None:
+    def test_qa_can_write_analysis_memory_but_no_pr_or_plan_writes(self) -> None:
         names = _main_tools(QA_FORM)
 
         assert "get_pr_info" in names
         assert "list_pr_comments" in names
+        assert "read_repo_memory" in names
+        assert "save_repo_memory" in names
+        assert "sync_repo_code" in names
         for name in (
-            "save_repo_memory",
             "comment_pr",
             "close_pr",
             "create_pr",
@@ -121,8 +115,16 @@ class TestMainTools:
         assert "save_repo_memory" in names
         assert "comment_pr" in names
         assert "close_pr" in names
+        assert "create_pr" in names
         assert "get_unexecuted_plan" in names
         assert "planExists" in names
+        for name in (
+            "getActiveWorkTask",
+            "openWorkTask",
+            "recordTaskSubmission",
+            "updateWorkTask",
+        ):
+            assert name in names
 
     @pytest.mark.parametrize("form", [QA_FORM, PLAN_FORM, ORCHESTRATE_FORM])
     def test_every_form_can_hand_off(self, form: str) -> None:
@@ -135,13 +137,11 @@ class TestPrompts:
             "qa",
             "plan",
             "coding",
-            "rework",
         }
         assert set(profiles_module._PROFILES) == {
             "qa",
             "plan",
             "coding",
-            "rework",
         }
 
     def test_qa_merges_lookup_and_analysis(self) -> None:
@@ -164,23 +164,13 @@ class TestPrompts:
         assert "派 `coder`" in prompt
         assert "写代码/修复PR问题一律派 `coder`" in prompt
 
-    def test_coding_prompt_is_attached_per_turn(self) -> None:
-        from ai_coding_harness.agent.prompts import intent_directive
+    def test_coding_method_is_built_into_the_form_prompt(self) -> None:
+        prompt = build_main_prompt("https://gitee.com/o/r.git")
 
-        coding = intent_directive("coding")
-        rework = intent_directive("rework")
-
-        assert "本轮意图：coding" in coding
-        assert "再派 `reviewer`" in coding
-        assert "本轮意图：rework" in rework
-        assert "必须再派一次 `reviewer` 复查" in rework
-
-    def test_analysis_and_review_directives_are_gone(self) -> None:
-        from ai_coding_harness.agent.prompts import intent_directive
-
-        assert intent_directive("analysis") == ""
-        assert intent_directive("review") == ""
-        assert intent_directive("sync") == ""
+        assert "## 编码形态工作流程" in prompt
+        assert "openWorkTask" in prompt
+        assert "recordTaskSubmission" in prompt
+        assert "本轮意图：" not in prompt
 
     def test_subagent_prompts_remain_distinct(self) -> None:
         assert PLANNER_PROMPT != CODER_PROMPT

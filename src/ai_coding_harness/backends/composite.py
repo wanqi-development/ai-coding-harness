@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 from deepagents.backends import CompositeBackend, StoreBackend
 from deepagents.backends.utils import file_data_to_string
 from langgraph.store.base import BaseStore
@@ -33,7 +35,7 @@ MEMORIES_NAMESPACE: tuple[str, ...] = ("memories",)
 def memory_path(
     platform: str, owner: str, repo: str, prefix: str = "/memories/"
 ) -> str:
-    """仓库记忆文件的运行时路径 —— **记忆路径的唯一口径**，读写两侧都调它。
+    """仓库记忆主索引的运行时路径 —— 读写两侧的唯一口径。
 
     历史教训：server 层读记忆、工具层写记忆各自拼过一份路径，两处口径一旦不一致，
     写入成功但没人读得到（内容等于丢了）。所以格式只在这里定义一次。
@@ -41,13 +43,34 @@ def memory_path(
     前缀与后端路由（``CompositeBackend`` 的 ``memories_prefix``）同一口径，
     传别的值就等于写到没人读的 key 上。
     """
-    return f"{prefix.rstrip('/')}/{platform.strip().lower()}/{owner}/{repo}.md"
+    return f"{memory_root(platform, owner, repo, prefix)}/index.md"
+
+
+def memory_root(
+    platform: str, owner: str, repo: str, prefix: str = "/memories/"
+) -> str:
+    """仓库记忆详情目录；主索引仍是 ``memory_path`` 那份文件。"""
+    return f"{prefix.rstrip('/')}/{platform.strip().lower()}/{owner}/{repo}"
+
+
+def memory_document_path(
+    platform: str,
+    owner: str,
+    repo: str,
+    relative_path: str,
+    prefix: str = "/memories/",
+) -> str:
+    """仓库记忆子文档的逻辑路径；拒绝绝对路径与 ``..``。"""
+    part = PurePosixPath(str(relative_path).strip().replace("\\", "/"))
+    if not part.parts or part.is_absolute() or ".." in part.parts:
+        raise ValueError("仓库记忆子文档路径必须是安全的相对路径")
+    return f"{memory_root(platform, owner, repo, prefix)}/{part.as_posix()}"
 
 
 def memory_store_key(
     platform: str, owner: str, repo: str, prefix: str = "/memories/"
 ) -> str:
-    """仓库记忆在 store 里的实际 key：``/<platform>/<owner>/<repo>.md``。
+    """仓库记忆在 store 里的实际 key：``/<platform>/<owner>/<repo>/index.md``。
 
     ``CompositeBackend`` 命中路由前缀后是**先把前缀剥掉**再交给子后端（见上游
     ``_route_for_path`` 的说明），所以 ``StoreBackend`` 看到的 key 是去前缀的那半截。
@@ -58,6 +81,27 @@ def memory_store_key(
     实现上从 ``memory_path`` 剥前缀而不是再拼一遍字符串：路径形状只留 ``memory_path`` 一处定义。
     """
     return memory_path(platform, owner, repo, prefix).removeprefix(prefix.rstrip("/"))
+
+
+def memory_root_store_key(
+    platform: str, owner: str, repo: str, prefix: str = "/memories/"
+) -> str:
+    return memory_root(platform, owner, repo, prefix).removeprefix(
+        prefix.rstrip("/")
+    )
+
+
+def memory_document_store_key(
+    platform: str,
+    owner: str,
+    repo: str,
+    relative_path: str,
+    prefix: str = "/memories/",
+) -> str:
+    """子文档在 StoreBackend 里的实际 key（已剥掉路由前缀）。"""
+    return memory_document_path(
+        platform, owner, repo, relative_path, prefix
+    ).removeprefix(prefix.rstrip("/"))
 
 
 def build_composite_backend(
@@ -106,6 +150,33 @@ async def read_memory(
     """
     item = await store.aget(
         MEMORIES_NAMESPACE, memory_store_key(platform, owner, repo, prefix)
+    )
+    if item is None:
+        return None
+    value = getattr(item, "value", None)
+    if not isinstance(value, dict):
+        return None
+    return file_data_to_string(value)
+
+
+async def read_memory_document(
+    store: BaseStore,
+    platform: str,
+    owner: str,
+    repo: str,
+    relative_path: str,
+    prefix: str = "/memories/",
+) -> str | None:
+    """Read one indexed repository-memory detail document."""
+    item = await store.aget(
+        MEMORIES_NAMESPACE,
+        memory_document_store_key(
+            platform,
+            owner,
+            repo,
+            relative_path,
+            prefix,
+        ),
     )
     if item is None:
         return None

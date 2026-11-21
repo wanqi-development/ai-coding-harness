@@ -32,8 +32,9 @@ from __future__ import annotations
 
 from ai_coding_harness.agent.middleware.boundary import BoundaryMiddleware
 from ai_coding_harness.agent.middleware.context_inject import (
-    IntentMiddleware,
+    TurnContextMiddleware,
     now_stamp,
+    work_task_block,
 )
 from ai_coding_harness.agent.middleware.context_trim import (
     CONTEXT_TRIM_EVENT_VERSION,
@@ -63,6 +64,9 @@ from ai_coding_harness.agent.middleware.memory import (
 )
 from ai_coding_harness.agent.middleware.plan_recovery import PlanRecoveryMiddleware
 from ai_coding_harness.agent.middleware.read_guard import ReadGuardMiddleware
+from ai_coding_harness.agent.middleware.reasoning_hygiene import (
+    ReasoningHistoryMiddleware,
+)
 from ai_coding_harness.agent.middleware.redaction import (
     ModelRedactionMiddleware,
     RedactionMiddleware,
@@ -98,16 +102,17 @@ __all__ = [
     "DelegationGateMiddleware",
     "FallbackMiddleware",
     "HistoryRepairMiddleware",
-    "IntentMiddleware",
     "LoopGuardMiddleware",
     "MemoryMiddleware",
     "ModelRedactionMiddleware",
     "PlanRecoveryMiddleware",
     "ReadGuardMiddleware",
+    "ReasoningHistoryMiddleware",
     "RedactionMiddleware",
     "StreamUsageMiddleware",
     "ToolCallIdMiddleware",
     "ToolErrorGuardMiddleware",
+    "TurnContextMiddleware",
     "TurnState",
     "TurnStop",
     "apply_context_trim_event",
@@ -118,4 +123,5 @@ __all__ = [
     "plan_context_trim_event",
     "pretrim_tool_results",
     "prune_context_trim_event",
+    "work_task_block",
 ]

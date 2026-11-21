@@ -39,6 +39,8 @@ dependencies = [
     "beautifulsoup4",
     "zai-sdk",
     "python-dotenv",
+    "langchain-anthropic>=1.0,<2",
+    "typesafe-sdk>=0.7.5",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +49,10 @@ dev = [
     "pytest-asyncio",
     "ruff",
 ]
+
+[project.scripts]
+ai-coding-harness = "ai_coding_harness.main:main"
+ai-coding-worker = "ai_coding_harness.worker_main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_coding_harness"]

@@ -32,8 +32,21 @@ from langchain.agents.middleware import (
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from ai_coding_harness.agent.turn_state import TurnStop
+from ai_coding_harness.db import dao
+from ai_coding_harness.safety.git_approval import (
+    GitApprovalContext,
+    create_git_approval,
+    interrupt_payload,
+    wait_for_decision,
+)
+from ai_coding_harness.safety.git_policy import (
+    configured_protected_branches,
+    evaluate_git_command,
+)
 from ai_coding_harness.safety.permissions import CommandSafety
 from ai_coding_harness.safety.policy import AgentPolicy
+from ai_coding_harness.tools.context import get_configurable
 
 
 def _tool_name(tool: Any) -> str:
@@ -53,10 +66,14 @@ class BoundaryMiddleware(AgentMiddleware):
     """
 
     def __init__(
-        self, policy: AgentPolicy, safety: CommandSafety | None = None
+        self,
+        policy: AgentPolicy,
+        safety: CommandSafety | None = None,
+        approval: GitApprovalContext | None = None,
     ) -> None:
         self._policy = policy
         self._safety = safety
+        self._approval = approval
 
     async def awrap_model_call(
         self,
@@ -78,9 +95,34 @@ class BoundaryMiddleware(AgentMiddleware):
         call = request.tool_call
         name = str(call.get("name") or "")
         args = call.get("args")
-        reason = self._refusal(name, args if isinstance(args, Mapping) else {})
+        args = args if isinstance(args, Mapping) else {}
+        reason = self._policy.check_tool(name, args)
         if reason is None:
-            return await handler(request)
+            command = args.get("command") if name == "execute" else None
+            if isinstance(command, str):
+                if self._safety is not None:
+                    reason = self._safety.check(command)
+                if reason is None:
+                    git = evaluate_git_command(
+                        command,
+                        repo_root=(
+                            self._approval.repo_dir
+                            if self._approval is not None
+                            else self._policy.project_root
+                        ),
+                        protected_branches=configured_protected_branches(),
+                    )
+                    if git.level == "deny":
+                        reason = git.reason
+                    elif git.level == "approval":
+                        return await self._approval_result(
+                            request,
+                            handler,
+                            command=command,
+                            reason=git.reason,
+                        )
+            if reason is None:
+                return await handler(request)
         return ToolMessage(
             content=f"{reason}。本轮未执行，请换一种做法。",
             name=name or "unknown",
@@ -88,11 +130,85 @@ class BoundaryMiddleware(AgentMiddleware):
             status="error",
         )
 
-    def _refusal(self, name: str, args: Mapping[str, Any]) -> str | None:
-        if name == "execute" and self._safety is not None:
-            command = args.get("command")
-            if isinstance(command, str):
-                reason = self._safety.check(command)
-                if reason is not None:
-                    return reason
-        return self._policy.check_tool(name, args)
+    async def _approval_result(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+        *,
+        command: str,
+        reason: str,
+    ) -> ToolMessage | Command[Any]:
+        if self._approval is None:
+            return self._tool_error(
+                request,
+                "该命令需要人工审批，但当前运行没有审批上下文",
+            )
+        decision = evaluate_git_command(
+            command,
+            repo_root=self._approval.repo_dir,
+            protected_branches=configured_protected_branches(),
+        )
+        thread_id = str(get_configurable("thread_id") or "")
+        call_id = str(request.tool_call.get("id") or "")
+        try:
+            row = await create_git_approval(
+                self._approval,
+                command=command,
+                tool_call_id=call_id,
+                thread_id=thread_id,
+                decision=decision,
+            )
+        except Exception as exc:  # noqa: BLE001 - snapshot failure must fail closed
+            return self._tool_error(
+                request,
+                f"需要审批，但无法创建恢复快照，命令未执行：{exc}",
+            )
+        payload = interrupt_payload(row)
+        writer = getattr(getattr(request, "runtime", None), "stream_writer", None)
+        if not callable(writer):
+            async with self._approval.database.session() as db:
+                await dao.resolve_approval(
+                    db,
+                    session_id=self._approval.session_id,
+                    approval_id=row.id,
+                    choice="deny",
+                )
+            return self._tool_error(
+                request,
+                "该命令需要人工审批，但当前运行无法发送审批请求",
+            )
+        writer({"kind": "git_approval", "approval": payload})
+        response = await wait_for_decision(self._approval, row.id)
+        choice = str(response.get("choice") or "")
+        if choice == "terminate":
+            raise TurnStop(
+                "〔已由用户终止：拒绝了需要审批的 Git 命令〕",
+                {"aborted": "git_approval_terminated"},
+            )
+        if choice != "allow":
+            return self._tool_error(
+                request,
+                f"{reason}。用户拒绝执行，请换一种安全做法。",
+            )
+        async with self._approval.database.session() as db:
+            consumed = await dao.consume_approval(
+                db,
+                session_id=self._approval.session_id,
+                approval_id=row.id,
+            )
+        if not consumed:
+            return self._tool_error(
+                request,
+                "审批已失效或已被使用，命令没有执行；请重新发起审批。",
+            )
+        return await handler(request)
+
+    @staticmethod
+    def _tool_error(request: ToolCallRequest, text: str) -> ToolMessage:
+        call = request.tool_call
+        return ToolMessage(
+            content=text,
+            name=str(call.get("name") or "unknown"),
+            tool_call_id=call.get("id") or "",
+            status="error",
+        )

@@ -36,11 +36,6 @@ def get_thread_id() -> str | None:
     return get_configurable("thread_id")
 
 
-def get_intent() -> str | None:
-    """获取本次请求的意图（configurable.intent，由 server 层注入）。"""
-    return get_configurable("intent")
-
-
 def get_clarification() -> dict[str, Any] | None:
     """低置信度澄清信息（configurable.clarification）；不是澄清轮就是 ``None``。"""
     value = get_configurable("clarification")

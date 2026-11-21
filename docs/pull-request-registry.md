@@ -26,7 +26,7 @@ PR 创建者显示的是 token 所属账号；人工和 Agent 共用同一个 to
   - 查询失败或无提交：`unknown`。
 - 以后只读数据库中的 `source`，不反复查询 commits。
 - 外部或未知的 open PR 会在意图识别前硬停止，防止基于无法确认的仓库状态继续 coding /
-  plan / rework。
+  plan / coding。
 
 ## 3. 每轮 PR 查询
 
@@ -42,7 +42,7 @@ PR 创建者显示的是 token 所属账号；人工和 Agent 共用同一个 to
 
 ## 4. 用户向 PR 追加提交
 
-平台比较平台最新 `head_sha` 与数据库 `synced_head_sha`。rework 有唯一目标 PR，或用户明确
+平台比较平台最新 `head_sha` 与数据库 `synced_head_sha`。当前 coding work task 有关联 PR，或用户明确
 写出 `#N` 时，Agent 启动前执行：
 
 1. 检查工作区是否干净；

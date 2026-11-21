@@ -11,11 +11,16 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
+from ai_coding_harness.agent.middleware.repo_memory_pack import document_entries
 from ai_coding_harness.api.schemas import (
     ClarificationInfo,
     CreateSessionRequest,
+    GitApprovalInfo,
+    GitApprovalResolveRequest,
     LogLineItem,
     LogPage,
+    MemoryDocumentRef,
+    MemoryDocumentSnapshot,
     MemorySnapshot,
     PlanInfo,
     PullItem,
@@ -29,7 +34,11 @@ from ai_coding_harness.api.schemas import (
     UsageSnapshot,
 )
 from ai_coding_harness.api.session_lookup import current_user_id, resolve_session
-from ai_coding_harness.backends.composite import memory_path, read_memory
+from ai_coding_harness.backends.composite import (
+    memory_path,
+    read_memory,
+    read_memory_document,
+)
 from ai_coding_harness.db import dao
 from ai_coding_harness.observability.log_tail import read_session_logs
 from ai_coding_harness.observability.run_log import account_key
@@ -249,6 +258,41 @@ async def get_pending_clarification(
     session = await resolve_session(request, session_id)
     data = await request.app.state.runs.pending_clarification(session)
     return None if data is None else ClarificationInfo(**data)
+
+
+@router.get(
+    "/{session_id}/git-approval",
+    response_model=GitApprovalInfo | None,
+)
+async def get_pending_git_approval(
+    session_id: str, request: Request
+) -> GitApprovalInfo | None:
+    session = await resolve_session(request, session_id)
+    data = await request.app.state.runs.pending_git_approval(session)
+    return None if data is None else GitApprovalInfo(**data)
+
+
+@router.post(
+    "/{session_id}/git-approval",
+    response_model=GitApprovalInfo,
+)
+async def resolve_git_approval(
+    session_id: str,
+    req: GitApprovalResolveRequest,
+    request: Request,
+) -> GitApprovalInfo:
+    session = await resolve_session(request, session_id)
+    try:
+        data = await request.app.state.runs.resolve_git_approval(
+            session,
+            approval_id=req.approval_id,
+            choice=req.choice,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if data is None:
+        raise HTTPException(status_code=404, detail="审批不存在或已失效")
+    return GitApprovalInfo(**data)
 
 
 def _pull_number(text: str) -> int:
@@ -507,28 +551,70 @@ async def get_usage(session_id: str, request: Request) -> UsageSnapshot:
 
 @router.get("/{session_id}/memory", response_model=MemorySnapshot)
 async def get_memory(session_id: str, request: Request) -> MemorySnapshot:
-    """仓库记忆全文（**只读**）。
+    """仓库记忆主索引和按需文档目录（**只读**）。
 
     记忆原先只活在系统提示词里 —— 模型看得到、用户看不到。这里把它显示出来（右栏「记忆」
     标签）：读的是 StoreBackend 上那一份，与中间件读写的是**同一个 key**。
 
-    **不提供写入、也不提供手动刷新**：正文只在 coding / review 的收尾由主控写，文件头由平台
-    每轮开工前按 PR 实况重算（见 AGENTS.md 的写入口径）。在这里开一个「改一下」的口子，
-    就把那条约束破了；要更新记忆就走对话（刷新仓库记忆）或跑一轮编码/审查。
+    **不提供写入、也不提供手动刷新**：QA 可写经过代码验证的分析文档，coding 主控可写
+    缺口和长期约束；平台维护 PR 头。界面只读，要更新就走对话。
     """
     session = await resolve_session(request, session_id)
     repo = session.repo
     prefix = request.app.state.settings.memories_prefix
+    content = await read_memory(
+        request.app.state.store,
+        repo.platform.value,
+        repo.owner,
+        repo.repo,
+        prefix,
+    )
     return MemorySnapshot(
         path=memory_path(repo.platform.value, repo.owner, repo.repo, prefix),
-        content=await read_memory(
-                request.app.state.store,
-                repo.platform.value,
-                repo.owner,
-                repo.repo,
-                prefix,
-        ),
+        content=content,
+        documents=[
+            MemoryDocumentRef(
+                path=entry.path,
+                summary=entry.summary,
+                keywords=list(entry.keywords),
+            )
+            for entry in document_entries(content)
+        ],
     )
+
+
+@router.get(
+    "/{session_id}/memory/document",
+    response_model=MemoryDocumentSnapshot,
+)
+async def get_memory_document(
+    session_id: str, path: str, request: Request
+) -> MemoryDocumentSnapshot:
+    """读取主索引「记忆目录」中的一份详情文档。"""
+    session = await resolve_session(request, session_id)
+    repo = session.repo
+    prefix = request.app.state.settings.memories_prefix
+    index = await read_memory(
+        request.app.state.store,
+        repo.platform.value,
+        repo.owner,
+        repo.repo,
+        prefix,
+    )
+    allowed = {entry.path for entry in document_entries(index)}
+    if path not in allowed:
+        raise HTTPException(status_code=404, detail="记忆文档不在主索引目录中。")
+    content = await read_memory_document(
+        request.app.state.store,
+        repo.platform.value,
+        repo.owner,
+        repo.repo,
+        path,
+        prefix,
+    )
+    if content is None:
+        raise HTTPException(status_code=404, detail="记忆文档尚未生成。")
+    return MemoryDocumentSnapshot(path=path, content=content)
 
 
 @router.post("/{session_id}/cancel")

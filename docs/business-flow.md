@@ -35,19 +35,19 @@ flowchart TD
 
     C0["③ ensure_runtime：重连或新建沙箱 + 按需续期"] --> C1{"工作区可用？"}
     C1 -->|"不可用"| C2["error 帧：代码工作区不可用<br/>(前端可点重试)"]
-    C1 -->|"可用"| C3["本轮意图已判定并通过状态闸门"]
+    C1 -->|"可用"| C3["本轮意图已判定<br/>(PR 状态不改写意图)"]
     C2 --> Z2["结束：done"]
     C3 --> E0["⑤ profile_for(intent) → 形态<br/>加载仓库记忆并注入"]
     E0 --> E4
     E4["边界中间件按形态裁工具<br/>越界调用直接拒"]
     E4 --> E5["astream_events：模型 ↔ 工具 循环<br/>(循环守卫 / 错误兜底 / 脱敏)"]
-    E5 --> F1{"本轮形态挂子智能体？<br/>(coding / rework)"}
+    E5 --> F1{"本轮形态挂子智能体？<br/>(coding)"}
     F1 -->|"挂：派子智能体"| F2["planner → coder → reviewer（见 §四）"]
     F1 -->|"不挂"| F3["主控自己干：<br/>qa 问答 / 解释 / 排查，或 plan 出方案"]
 
     F2 --> G0
     F3 --> G0
-    G0["⑥ 把正文与待办落库（assistant 记录）"] --> G1{"本轮形态要沉淀记忆？<br/>(coding / rework)"}
+    G0["⑥ 把正文与待办落库（assistant 记录）"] --> G1{"本轮形态要沉淀记忆？<br/>(coding)"}
     G1 -->|"要"| G2["轮末打底：按 Gitee 实况刷新记忆<br/>(文件头 / PR 状态 / 摘老表)"]
     G1 -->|"不要"| G3["不动记忆"]
     G2 --> Z5["结束：done（前端渲染这一轮）"]
@@ -65,41 +65,59 @@ flowchart TD
 
 ## 二、分叉：意图怎么定
 
-先按仓库状态收口候选，再走四关（`server/intent.py`）：
+先识别真实意图；PR 状态只作为上下文，写操作冲突由 work task 判断（`server/intent.py`）：
 
 | 关 | 判据 | 说明 |
 | --- | --- | --- |
-| 0. 状态候选 | 查最近 10 条 PR + 完整 open PR；先同步 PR 表 / 记忆再分类 | 外部或归属未知的 open PR 直接停止；无 open PR：`qa / plan / coding`；有 Agent open PR：`qa / rework`；查询失败：`qa` |
-| 1. 口令直通 | 强关键字命中且属于候选集，**不调任何模型** | 「出方案」「实施」「按评审意见修改」等；候选外强口令交给函数闸门拦截 |
-| 2. JEV（SystemOne） | 口令没命中时问它，`Choice` 只列本轮候选 | 拿回选项 + 置信度 + 各候选概率，都进日志（`source=jev`） |
-| 3. 大模型判定 | JEV 没配 / 超时 / 报错 / 回了认不出的标签 | 退回原来那套「让对话模型回一个词 + 一句理由」的判定（`source=llm`） |
-| 4. 回落关键字 | 模型都判不出来 | 仍受候选集限制；无 PR 时优先 coding，有 PR 时默认 qa |
+| 1. 强口令 | 强关键字命中，**不调任何模型** | 「出方案」「实施」「按评审意见修改」等 |
+| 2. JEV 或大模型 | 强口令没命中时只走设置页选中的一侧 | 上下文包含最近三个未中断完整轮次、其中的中断消息和本轮消息 |
+| 失败 | 未配置 / 超时 / 报错 / 非法标签 / 低置信度 | 直接进入 `qa` 意图澄清，不使用弱关键字兜底，没有默认意图 |
+
+PR 快照只提供事实用于工具执行，不参与意图分类，也不再作为授权门禁。
+
+`qa` 对仓库工作区只读、不改变 PR，但可把经过代码验证的分析结论、缺口和风险写入仓库记忆，
+其中缺口与风险必须带代码路径或验证提交，因此在任何 PR 状态下都执行。非本 Harness 登记的 open PR
+只在快照中提示，不会自动阻断 coding。
 
 形状与工具子集（`agent/profiles.py` + `tools/register.py`）：
 
 | 意图 | 形态 | 子智能体 | 主控特有的工具 |
 | --- | --- | --- | --- |
-| `qa` | `qa` | —— | `get_pr_info`、`list_pr_comments`；可写 tmp 取证台账 |
-| `plan` | `plan` | —— | `get_pr_info`、`storePlan`、`getPlan`、`updatePlan`、`updatePlanSteps`、`deletePlan` |
-| `coding` | `orchestrate` | planner / coder / reviewer | `get_pr_info`、`list_pr_comments`、`comment_pr`、`close_pr`、`save_repo_memory` |
-| `rework`（PR 跟进） | `orchestrate`（与 `coding` 共用装配） | 同上 | 同上 |
+| `qa` | `qa` | —— | PR 只读、`read_repo_memory`、`save_repo_memory`、受控 `sync_repo_code`；可写 tmp 取证台账 |
+| `plan` | `plan` | —— | PR 只读、`read_repo_memory`、方案 CRUD；不写仓库记忆 |
+| `coding` | `orchestrate` | planner / coder / reviewer | PR 工具、work task 工具、仓库记忆索引/详情写入；`create_pr` 只在主控 |
 
 ---
 
-## 三、PR 同步与函数闸门
+## 三、PR 同步与任务冲突
 
 轮首查最近 10 条全部状态 PR 与完整 open PR：前者用于记忆，新于记忆水印的 PR 用一次模型调用
 批量摘要；后者用于 `pull_requests` 归属、方案关联、评论状态和工作区同步。已有 PR 按平台状态
-对账，有变化就真实写回 StoreBackend。coding / rework 轮末再走同一套同步。
+对账，有变化就真实写回 StoreBackend。coding 轮末再走同一套同步。
 
-外部 / 归属未知的 open PR 在意图分类前直接停下，并提示用户先处理。其余情况在意图判定后由
-`gate_intent_for_state` 放行或停下：待合并 PR 拦 `coding / plan`，放行 `qa / rework`。
-rework 有唯一目标或用户明确写 `#N` 时，平台先把工作区安全同步到 PR 最新 `head_sha`。
-`MemoryMiddleware` 只负责加载同步后的记忆并注入。
+外部 / 归属未知的 open PR 不再在分类前终止本轮。写代码前，主控调用 `openWorkTask`
+给出 `same / new / unclear`：已有 active task 时，`same` 绑定当前任务；`new` 会被拒绝并
+提示先完成当前任务、创建并合并 PR；`unclear` 只向用户确认一次。当前任务已有 PR，或用户
+明确写 `#N` 时，平台先把工作区安全同步到 PR 最新 `head_sha`。`MemoryMiddleware` 只负责
+加载同步后的记忆并注入。
+
+### Git 中断审批
+
+模型的 `execute` 命令在 BoundaryMiddleware 中先经过 Git 规范化策略：
+
+- `allow`：状态、diff、add/commit、普通 push 等正常开发命令直接执行；
+- `approval`：reset/clean/restore、历史改写、force-with-lease、非保护分支远端删除等，
+  先保存 `.git/harness-recovery/` 快照，再通过 SSE `approval` 帧暂停当前 run；
+- `deny`：filter-repo/filter-branch、reflog expire、gc --prune=now、mirror push、
+  受保护分支强推/删除等直接返回 ToolMessage，不进入审批。
+
+前端显示单选选择器：拒绝、允许本次执行、终止本轮。审批请求只更新 PG 中的
+`git_approvals`，不调用 `POST /chat`，不新建 user record；当前 run 的 middleware
+轮询到决定后继续同一 tool call。刷新页面会从 pending approval 恢复弹窗。
 
 ---
 
-## 四、分叉：coding / rework 的编排环路
+## 四、coding 的编排环路
 
 ```mermaid
 flowchart LR
@@ -110,22 +128,26 @@ flowchart LR
     V["用户：直接做<br/>(实施 / 直接做 / 确认实施)"] --> Q{"主控先查<br/>get_unexecuted_plan"}
     Q -->|"有未执行的方案"| C
     Q -->|"没有"| P2["planner 出方案并落库<br/>(不等确认)"] --> C
-    C["coder：按方案改 → 自测 → 提交 → create_pr"]
-    C --> R["reviewer：读 diff → 分级问题清单 → comment_pr 回评"]
-    R --> S["主控：把审查结论原样呈给用户"]
+    C["coder：按方案改 → 自测<br/>commit → push → 回报 submission"]
+    C --> M["主控：recordTaskSubmission<br/>合并累计摘要"]
+    M --> R["reviewer：读 diff → 分级 findings<br/>save_review(stage=local)"]
+    R --> S["主控：展示改动、验证与 findings"]
     S --> T{"用户决定"}
-    T -->|"点名要修的问题"| K["rework：派 coder 在同一分支改<br/>→ push 更新 PR"]
-    K --> K2["再派 reviewer 复查一次"]
-    K2 --> S
-    T -->|"不动了"| E["结束：等人工在 Gitee 合并"]
+    T -->|"继续改"| K["coder 修改 → reviewer 重新 save_review<br/>旧代码版本的审查自动失效"]
+    K --> S
+    T -->|"明确创建 PR"| D["主控：从 work task 读取 branch/base<br/>create_pr"]
+    D --> P["reviewer：审最终 PR Diff<br/>save_review(stage=pr) → comment_pr"]
+    P --> S2["主控：展示最终审查<br/>提醒用户合并"]
+    S2 --> E["用户手工合并 PR<br/>本阶段任务完成"]
 ```
 
 两条入口的差别只有一处：**用户明确说要动手时，planner 落库后不等确认** —— 一路 coder → reviewer 跑完；
 只是描述需求时，方案出来先停下等他点头。
 
-同一张图里两处**平台兜底**：`create_pr` 是幂等的（同分支已有未关闭 PR 就复用并回显编号与链接），
-所以「重新实施一轮」不会开出重复 PR；每轮收尾主控都要把本轮 PR 记进仓库记忆的「变更记录」，
-编号与链接取 `create_pr` 回执原文（§六）。
+Review 结论只供用户判断，不是 PR 门禁。主控结合当前 work task、最近三个完整轮次、中断消息
+和本轮目标决定是继续修改还是交付 PR。`create_pr` 只校验 `task_id`、最新 commit/head 与
+branch/base，本身幂等：同分支已有未关闭 PR 就复用。每轮真正建成 PR 后，主控才把编号与
+链接写进仓库记忆的「变更记录」（§六）。
 
 ---
 
@@ -174,28 +196,26 @@ sequenceDiagram
     end
 
     rect rgb(245, 245, 245)
-    Note over U,GIT: ③ 开工前（意图、记忆闸门、工具边界）
+    Note over U,GIT: ③ 开工前（意图、任务上下文、工具边界）
     SVC->>SVC: 意图分类（口令 → LLM → 回落）→ coding
     SVC->>DB: 写 user 记录（extra.intent=coding）
     SVC->>SBX: ensure_runtime
     SVC->>MW: 读记忆；有要核对的 PR 才查 Gitee
     MW->>GIT: all_pulls（仅当记忆里有待核对的 PR）
     MW->>DB: 按实况刷新记忆（文件头 / PR 状态）
-    alt 记忆里有待合并的 PR
-        MW-->>SVC: TurnStop（拦下本轮，提示等人工合并）
-    else 没有
-        MW-->>SVC: 放行
-        SVC->>MW: 按形态裁工具（越界调用当场拒）
-    end
+    SVC->>DB: 读取当前 active work task
+    SVC->>MW: 注入任务快照与 PR 状态；按形态裁工具（越界调用当场拒）
     end
 
     rect rgb(245, 245, 245)
     Note over U,GIT: ④ 跑这一轮（模型 ↔ 工具，直到收尾）
     loop 模型 ↔ 工具循环（受 recursion limit 与循环守卫约束）
-        SVC->>LLM: astream_events（系统提示 + 记忆 + 时间与意图）
+        SVC->>LLM: astream_events（系统提示 + 记忆 + 任务/PR 快照）
         LLM-->>SVC: 正文 / 工具调用
         SVC->>TOOL: 执行工具（脱敏、错误兜底）
     end
+    SVC->>TOOL: openWorkTask(relation=same/new/unclear)
+    TOOL->>DB: 新建或绑定 work task；新任务在当前任务未合并时拒绝
     SVC->>TOOL: get_unexecuted_plan（主控先查有没有可执行的方案）
     alt 有未执行的方案
         SVC->>SUB: task → coder
@@ -205,23 +225,30 @@ sequenceDiagram
         Note over SVC,SUB: 用户已说「直接做」→ 不等确认
         SVC->>SUB: task → coder
     end
-    SUB->>SBX: 改文件 / 跑测试 / git commit + push
-    SUB->>GIT: create_pr（同分支已有未关闭 PR 则复用）
-    GIT-->>SUB: PR 链接 + 编号
-    SUB-->>SVC: 回报（PR 编号与链接、验证结果）
+    SUB->>SBX: 改文件 / 跑测试 / commit / push
+    SUB-->>SVC: 回报 task_id、commit/head、changed_files、验证与本次摘要
+    SVC->>DB: recordTaskSubmission（合并累计摘要）
     SVC->>SUB: task → reviewer
-    SUB->>GIT: get_pr_info / list_pr_comments
-    SUB->>GIT: comment_pr（审查结论与问题清单）
-    SUB-->>SVC: 回报问题清单
+    SUB->>DB: save_review(stage=local，代码版本指纹 + findings)
+    SUB-->>SVC: 回报改动、验证、findings、review_id
+    SVC-->>U: 展示本地审查；提醒可继续修改或创建 PR
+    U->>SVC: 明确点击 / 说「创建 PR」
+    SVC->>TOOL: create_pr(task_id)（同分支已有未关闭 PR 则复用）
+    TOOL->>DB: 读取 branch/base/latest pushed head
+    TOOL->>GIT: 创建或复用 PR
+    GIT-->>TOOL: PR 链接 + 编号
+    SVC->>SUB: task → reviewer（最终 PR Diff）
+    SUB->>DB: save_review(stage=pr)
+    SUB->>GIT: comment_pr（同一份审查结论）
+    SUB-->>SVC: 回报最终审查
+    SVC-->>U: 展示审查结论并提醒合并；合并后本阶段完成
     end
 
     rect rgb(245, 245, 245)
     Note over U,GIT: ⑤ 收尾（先呈结论，再写记忆，最后平台打底与落库）
     SVC-->>FE: ai 帧（审查结论原样呈给用户）
-    SVC->>TOOL: save_repo_memory（本轮 PR 记进「变更记录」，本轮的最后一件事）
-    Note over TOOL,GIT: 编号与链接取 create_pr 回执原文
-    TOOL->>GIT: all_pulls（写盘前核对状态）
-    TOOL->>DB: 覆盖写记忆（文件头由平台盖章）
+    SVC->>DB: 平台按 PR 实况增量写 history/changes.md
+    Note over SVC,DB: 主索引只更新平台维护的 PR 头行
     SVC->>MW: 轮末打底（按 Gitee 实况再刷一遍）
     SVC->>DB: 写 assistant 记录（正文 + 待办）
     SVC-->>HUB: done
@@ -235,7 +262,7 @@ sequenceDiagram
     FE->>API: POST /cancel · GET /stream?after=N · DELETE
     U->>GIT: 人工在 Gitee 上合并 PR
     Note over DB,GIT: 下一轮刷新时状态改成「已合并」
-    U->>FE: 按评审意见改（rework）
+    U->>FE: 按评审意见继续改（coding）
     FE->>API: 新的一轮（同一套时序，形态同为 orchestrate）
     end
 ```
@@ -246,8 +273,9 @@ sequenceDiagram
    不是这一轮的一部分。
 2. **SSE 与运行是两条线**：`POST /chat` 返回的是订阅流，运行在 `RunHub` 自己的 task 里 —— 所以浏览器刷新
    只断订阅（② 里那条虚线），运行照跑到 ⑤ 收尾。
-3. **平台与模型各写哪部分**：③ 与 ⑤ 的「轮末打底」是平台在写（文件头 / PR 状态），④ 里 coder 的
-   `create_pr` 与 ⑤ 里 `save_repo_memory` 是模型在写 —— 分工见 §六。
+3. **平台与模型各写哪部分**：③ 与 ⑤ 的「轮末打底」是平台在写（文件头 / PR 状态），④ 里主控的
+   `create_pr` 与 ⑤ 里 `save_repo_memory` 是模型在写；coder 只负责 commit + push 与 submission
+   数据 —— 分工见 §六。
 
 > 同一张图另有一份 **draw.io 原生文件**：`docs/coding-sequence.drawio`（用 draw.io 直接打开即可编辑，
 > 也可以另存为 `.drawio.svg` 嵌进文档）。它由 `scripts/make_drawio.py` 从同一份数据生成 —— 改图时
@@ -260,11 +288,14 @@ sequenceDiagram
 | 时机 | 谁做 | 动什么 |
 | --- | --- | --- |
 | 每轮**开工前** | 平台（`repo_state` / `repo_memory_sync`） | 查最近 10 条全部 PR 与完整 open PR；同步 PR 归属 / head 水位，新增 PR 批量摘要，已有 PR 修正状态 |
-| coding / rework **收尾** | 模型（`save_repo_memory`） | 「仓库基本信息」（变了才改）、「变更记录」（本轮 PR）、「当前缺口」（按模块） |
-| coding / rework **轮末** | 平台（`_refresh_repo_memory`） | 再走同一套最近 10 条 + open 全量同步，并更新 PR 表与记忆 |
+| coding **收尾** | 模型（文档级 `save_repo_memory`） | 主索引的基本信息/目录/架构摘要；缺口、约束、功能流程和时序 |
+| coding **轮末** | 平台（`_refresh_repo_memory`） | 再走同一套最近 10 条 + open 全量同步，并更新 PR 表与记忆 |
 
-「当前缺口」是下一轮「该做什么」的唯一出处；「变更记录」以 PR 为角度（一次改动一定带着一个 PR，
-PR 没建成就不写这条）。
+`plan` 回合不触发记忆迁移、PR 记忆同步或详情写入；读取旧格式时只在内存中转换视图。
+
+主索引只保留基本信息、语义目录、压缩架构和记忆目录；功能流程图、时序图、接口与历史在
+子文档中按需加载。「当前缺口」用于判断下一轮该做什么；「变更记录」以 PR 为角度，
+PR 没建成就不写这条。
 
 ---
 
@@ -275,7 +306,7 @@ PR 没建成就不写这条）。
 | 消息里含凭据 | 整条拒收：不进库（存脱敏版）、不发模型、不建沙箱 | `service.chat` 入口 |
 | 同一会话已有在跑的一轮 | 409；配了 Redis 时**跨 worker 也拦得住** | `RunHub.start` + `RedisRunLock` |
 | 工作区建不出来 / 重连失败 | error 帧「代码工作区不可用」+ done（可点重试） | `ensure_runtime` |
-| Gitee 查询失败（闸门那条路） | 拦下本轮、不写记忆；提示先解决凭据/网络 | `refresh_memory`（中间件） |
+| Gitee 查询失败 | 分类与问答继续；记录失败状态，不能声称 PR 现状已知 | `repo_state` / 轮首同步 |
 | 主导模型挂了 | 切兜底模型（`FALLBACK_PROVIDER`）；连续失败到阈值**熔断**，冷却期内不再撞主导 | `FallbackMiddleware` |
 | 模型全败 | error 帧；原始异常只进日志（脱敏） | `_run_agent` |
 | 同一工具同参数反复调用 | 先警告一次；再重复即本轮收尾 | `LoopGuardMiddleware` |

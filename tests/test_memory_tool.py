@@ -1,14 +1,4 @@
-"""``save_repo_memory`` 的行为守卫（2026-10-20 起是**按节增量写**）。
-
-三条最容易出错的线：
-
-1. **入参**：模型只能提交「哪一节 + 那一节的内容」，不能整篇重写；写错节（比如把本次改动
-   塞进「仓库基本信息」）要被当场拒掉。
-2. **落盘**：``StoreBackend.awrite`` 只新建，已存在的文件必须走 ``aedit`` 全文替换；
-   内容没变就不写。
-3. **职责边界**：PR 查询和新 PR / 状态同步在轮首拦截点与 coding/rework 轮末完成；
-   `save_repo_memory` 只负责合并正文并落盘。
-"""
+"""仓库记忆最终工具：读取一份文档、写入一份语义文档。"""
 
 from __future__ import annotations
 
@@ -16,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ai_coding_harness.agent.profiles import ORCHESTRATE_FORM, PLAN_FORM, QA_FORM
 from ai_coding_harness.backends.composite import memory_path
 from ai_coding_harness.config import Settings
 from ai_coding_harness.tools import memory as memory_mod
@@ -23,78 +14,60 @@ from ai_coding_harness.tools.git import GiteeRepo
 from ai_coding_harness.tools.register import build_main_tools
 
 REPO = GiteeRepo(owner="acme", repo="demo", token="test-token")
-PATH = "/memories/gitee/acme/demo.md"
+INDEX = "/memories/gitee/acme/demo/index.md"
+ROOT = "/memories/gitee/acme/demo"
+DIRECTORY = f"{ROOT}/architecture/directory.md"
+OVERVIEW = f"{ROOT}/architecture/overview.md"
+FEATURE = f"{ROOT}/features/payment-refund.md"
+DOMAIN = f"{ROOT}/domains/payment.md"
+RELATED = f"{ROOT}/domains/notification.md"
+GAPS = f"{ROOT}/working/gaps.md"
+RISKS = f"{ROOT}/working/risks.md"
+STAMP = "2026-11-19 10:30"
 
-#: 钉住的写盘时刻：落盘时的时间戳由平台现取，不钉住就断言不了。
-STAMP = "2026-10-20 09:41"
 
-#: 一份正常的记忆（旧口径的「关键决策」也会被认成「长期约束」）。
-BASE = """# 仓库记忆：acme/demo
-
-> 最后更新：2026-10-19 08:00　｜　最近 PR：—
-
-## 一、仓库基本信息
-- **技术栈**：Java 21
-
-## 二、变更记录（最新在上）
-### 2026-10-19 · 新增 · 商品列表分页
-- **PR**：#12　｜　**状态**：待合并
-
-## 三、当前缺口（按模块）
-- **订单**：退款未实现
-
-## 四、长期约束
-- **约束**：不引入新依赖　｜　**原因**：沙箱离线　｜　**影响**：新增依赖要先问
-"""
+def test_default_index_path_is_nested_under_the_repository() -> None:
+    assert memory_path("gitee", "acme", "demo") == (
+        "/memories/gitee/acme/demo/index.md"
+    )
 
 
 class _FakeBackend:
-    """内存后端，语义对齐 ``StoreBackend``：``awrite`` 只新建、``aedit`` 才替换。"""
+    """StoreBackend 语义替身：awrite 只新建，aedit 才更新。"""
 
-    def __init__(
-        self,
-        *,
-        write_error: str | None = None,
-        edit_error: str | None = None,
-        read_error: str = "",
-    ) -> None:
+    def __init__(self, *, write_error: str | None = None):
         self.files: dict[str, str] = {}
-        self.areads: list[str] = []
-        self.awrites: list[tuple[str, str]] = []
-        self.aedits: list[tuple[str, str, str]] = []
-        self._write_error = write_error
-        self._edit_error = edit_error
-        self._read_error = read_error
+        self.writes: list[str] = []
+        self.edits: list[str] = []
+        self.write_error = write_error
 
-    async def aread(self, file_path: str) -> SimpleNamespace:
-        self.areads.append(file_path)
-        if self._read_error:
-            return SimpleNamespace(error=self._read_error, file_data=None)
-        if file_path not in self.files:
-            return SimpleNamespace(error=f"File '{file_path}' not found", file_data=None)
-        return SimpleNamespace(error=None, file_data={"content": self.files[file_path]})
+    async def aread(self, path: str) -> SimpleNamespace:
+        if path not in self.files:
+            return SimpleNamespace(error="not found", file_data=None)
+        return SimpleNamespace(error=None, file_data={"content": self.files[path]})
 
-    async def awrite(self, file_path: str, content: str) -> SimpleNamespace:
-        self.awrites.append((file_path, content))
-        if self._write_error:
-            return SimpleNamespace(error=self._write_error, path=None)
-        if file_path in self.files:
-            return SimpleNamespace(
-                error=f"Cannot write to {file_path} because it already exists.", path=None
-            )
-        self.files[file_path] = content
-        return SimpleNamespace(error=None, path=file_path)
+    async def awrite(self, path: str, content: str) -> SimpleNamespace:
+        self.writes.append(path)
+        if self.write_error:
+            return SimpleNamespace(error=self.write_error, path=None)
+        if path in self.files:
+            return SimpleNamespace(error="already exists", path=None)
+        self.files[path] = content
+        return SimpleNamespace(error=None, path=path)
 
     async def aedit(
-        self, file_path: str, old_string: str, new_string: str, replace_all: bool = False
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
     ) -> SimpleNamespace:
-        self.aedits.append((file_path, old_string, new_string))
-        if self._edit_error:
-            return SimpleNamespace(error=self._edit_error, path=None)
-        if self.files.get(file_path) != old_string:
-            return SimpleNamespace(error=f"old_string not found in {file_path}", path=None)
-        self.files[file_path] = new_string
-        return SimpleNamespace(error=None, path=file_path)
+        del replace_all
+        self.edits.append(path)
+        if self.files.get(path) != old_string:
+            return SimpleNamespace(error="old_string not found", path=None)
+        self.files[path] = new_string
+        return SimpleNamespace(error=None, path=path)
 
 
 @pytest.fixture(autouse=True)
@@ -103,245 +76,320 @@ def clock(monkeypatch) -> str:
     return STAMP
 
 
-def _tool(backend: _FakeBackend, settings: Settings | None = None):
-    tools = build_main_tools(
-        settings or Settings(),
+def _tools(backend: _FakeBackend, form: str = ORCHESTRATE_FORM):
+    return build_main_tools(
+        Settings(_env_file=None),
         SimpleNamespace(name="web_search_tool"),  # type: ignore[arg-type]
         SimpleNamespace(name="fetch_url_tool"),  # type: ignore[arg-type]
         REPO,
         backend,  # type: ignore[arg-type]
-    )
-    return next(t for t in tools if t.name == "save_repo_memory")
-
-
-async def _call(tool, section: str, payload: dict) -> str:
-    return await tool.ainvoke({"section": section, "payload": payload})
-
-
-# -- 落盘 ---------------------------------------------------------------------
-
-
-async def test_first_write_creates_the_file(clock):
-    backend = _FakeBackend()
-
-    out = await _call(
-        _tool(backend), "change", {"kind": "新增", "summary": "商品列表分页", "pr": 12}
+        form=form,
     )
 
-    assert "已创建" in out
-    assert PATH in backend.files
-    text = backend.files[PATH]
-    assert f"> 最后更新：{STAMP}" in text, "文件头由平台盖章"
-    assert "### 2026-10-20 · 新增 · 商品列表分页" in text
-    assert "#12" in text and "待合并" in text
-    assert backend.aedits == [], "首次建档走 awrite"
+
+def _tool(backend: _FakeBackend, name: str, form: str = ORCHESTRATE_FORM):
+    return next(tool for tool in _tools(backend, form) if tool.name == name)
 
 
-async def test_existing_memory_is_updated_through_edit():
+async def _save(backend: _FakeBackend, form: str = ORCHESTRATE_FORM, **payload) -> str:
+    return await _tool(backend, "save_repo_memory", form).ainvoke(payload)
+
+
+async def test_profile_updates_the_small_main_index(clock):
     backend = _FakeBackend()
-    backend.files[PATH] = BASE
 
-    out = await _call(
-        _tool(backend), "change", {"kind": "修改", "summary": "补分页参数", "pr": 13}
+    out = await _save(
+        backend,
+        kind="profile",
+        content=(
+            "- **项目地址**：https://gitee.com/acme/demo.git\n"
+            "- **技术栈**：FastAPI + Vue 3\n"
+            "- **启动方式**：docker compose up"
+        ),
     )
 
-    assert "已更新" in out
-    assert backend.awrites == []
-    assert backend.aedits, "已存在的文件必须走 aedit"
-    text = backend.files[PATH]
-    assert "#13" in text and "#12" in text
+    assert "仓库基本信息已更新" in out
+    assert f"> 最后更新：{STAMP}" in backend.files[INDEX]
+    assert "**技术栈**：FastAPI + Vue 3" in backend.files[INDEX]
+    assert "## 二、目录与模块" in backend.files[INDEX]
+    assert "## 三、架构概览" in backend.files[INDEX]
+    assert "## 四、记忆目录" in backend.files[INDEX]
 
 
-async def test_the_same_pr_is_not_recorded_twice():
+async def test_directory_is_a_document_and_is_mirrored_into_the_index():
     backend = _FakeBackend()
-    backend.files[PATH] = BASE
-
-    await _call(_tool(backend), "change", {"kind": "修改", "summary": "换个说法", "pr": 12})
-
-    text = backend.files[PATH]
-    assert text.count("#12") == 1, "同一个 PR 只该有一条"
-    assert "换个说法" in text
-
-
-async def test_the_change_window_keeps_only_eight():
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE
-    tool = _tool(backend)
-
-    for number in range(20, 29):  # 9 条新的
-        await _call(tool, "change", {"kind": "修改", "summary": f"第 {number} 个", "pr": number})
-
-    text = backend.files[PATH]
-    assert text.count("### ") == 8
-    assert "#20" not in text, "最旧的滚出窗口"
-    assert "#28" in text
-
-
-async def test_identical_content_is_not_written_again():
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE
-    tool = _tool(backend)
-    payload = {"kind": "修改", "summary": "补分页参数", "pr": 13}
-
-    await _call(tool, "change", payload)
-    before = len(backend.aedits)
-    out = await _call(tool, "change", payload)
-
-    assert "一致" in out
-    assert len(backend.aedits) == before, "内容没变就不该再写一次"
-
-
-async def test_create_failure_is_reported_not_swallowed():
-    backend = _FakeBackend(write_error="存储挂了")
-
-    out = await _call(_tool(backend), "gaps", {"items": [{"module": "订单", "text": "退款"}]})
-
-    assert "写入仓库记忆失败" in out and "存储挂了" in out
-
-
-async def test_edit_failure_is_reported_not_swallowed():
-    backend = _FakeBackend(edit_error="改不动")
-    backend.files[PATH] = BASE
-
-    out = await _call(_tool(backend), "gaps", {"items": [{"module": "订单", "text": "退款"}]})
-
-    assert "写入仓库记忆失败" in out and "改不动" in out
-
-
-# -- 分节写入的限制 -------------------------------------------------------------
-
-
-async def test_basic_only_accepts_the_whitelisted_fields():
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE
-
-    out = await _call(
-        _tool(backend), "basic", {"fields": {"本次改动": "新增了分页"}}
+    content = (
+        "## 目录导航\n"
+        "- **入口**：`src/main.py` — 应用启动\n"
+        "- **支付模块**：`src/payment` — 支付与退款\n"
     )
 
-    assert "不是仓库基本信息的字段" in out
-    assert backend.aedits == [] and backend.awrites == []
-
-
-async def test_basic_updates_a_whitelisted_field():
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE
-
-    await _call(_tool(backend), "basic", {"fields": {"技术栈": "Java 17"}})
-
-    text = backend.files[PATH]
-    assert "**技术栈**：Java 17" in text
-    assert "Java 21" not in text
-
-
-async def test_basic_write_drops_fields_outside_the_whitelist():
-    """存量里躺着的非白名单字段（「认证体系」这类）要在下一次 basic 写入时清掉。"""
-    backend = _FakeBackend()
-    backend.files[PATH] = BASE.replace(
-        "- **技术栈**：Java 21",
-        "- **技术栈**：Java 21\n- **认证体系**：网关集中验签\n- **服务间鉴权**：HMAC 签名",
+    out = await _save(
+        backend,
+        kind="directory",
+        title="目录与模块",
+        content=content,
+        summary="应用入口、支付模块与测试目录",
     )
 
-    out = await _call(_tool(backend), "basic", {"fields": {"技术栈": "Java 17"}})
-
-    text = backend.files[PATH]
-    assert "认证体系" not in text
-    assert "服务间鉴权" not in text
-    assert "清掉 2 条非白名单字段" in out
+    assert "`architecture/directory.md`" in out
+    assert content.strip() in backend.files[DIRECTORY]
+    assert "`src/payment`" in backend.files[INDEX]
+    assert "`architecture/directory.md`" in backend.files[INDEX]
 
 
-async def test_gaps_replace_the_whole_section():
+async def test_architecture_overview_updates_its_own_document_and_index():
     backend = _FakeBackend()
-    backend.files[PATH] = BASE
+    graph = "```mermaid\nflowchart LR\n  UI --> API --> DB\n```"
 
-    await _call(
-        _tool(backend),
-        "gaps",
-        {"items": [{"module": "支付", "text": "对账未实现"}]},
+    await _save(
+        backend,
+        kind="architecture",
+        slug="overview",
+        title="整体架构",
+        content=graph,
+        summary="前端、API 与数据库",
+        keywords=["architecture", "架构"],
     )
 
-    text = backend.files[PATH]
-    assert "**支付**：对账未实现" in text
-    assert "退款未实现" not in text, "整节替换：过时的缺口要消失"
+    assert "flowchart LR" in backend.files[OVERVIEW]
+    assert "flowchart LR" in backend.files[INDEX]
+    assert "`architecture/overview.md`" in backend.files[INDEX]
 
 
-async def test_decisions_need_all_three_columns():
+async def test_feature_requires_domain_and_updates_domain_index():
     backend = _FakeBackend()
-    backend.files[PATH] = BASE
-
-    out = await _call(
-        _tool(backend),
-        "decisions",
-        {"items": [{"decision": "不引入新依赖", "reason": "离线"}]},
+    content = (
+        "## 功能职责\n处理支付退款。\n\n"
+        "## 主流程图\n```mermaid\nflowchart LR\n  Refund --> Provider\n```"
     )
 
-    assert "impact" in out
-    assert backend.aedits == []
+    missing = await _save(
+        backend,
+        kind="feature",
+        slug="payment-refund",
+        title="支付退款",
+        content=content,
+    )
+    assert "必须提供主要 domain" in missing
+
+    out = await _save(
+        backend,
+        kind="feature",
+        slug="payment-refund",
+        title="支付退款",
+        content=content,
+        summary="退款申请、渠道调用与补偿",
+        domain="payment",
+        related_domains=["notification"],
+        keywords=["refund", "退款"],
+        source_paths=["src/payment/refund.py", "tests/test_refund.py"],
+        verified_commit="abc123",
+    )
+
+    assert "`features/payment-refund.md`" in out
+    feature = backend.files[FEATURE]
+    assert "flowchart LR" in feature
+    assert "abc123" in feature
+    assert "主要领域：payment" in feature
+    assert "`features/payment-refund.md`" in backend.files[DOMAIN]
+    assert "## 功能索引" in backend.files[DOMAIN]
+    assert "`features/payment-refund.md`" in backend.files[RELATED]
+    assert "## 关联功能" in backend.files[RELATED]
+    assert "`domains/payment.md`" in backend.files[INDEX]
+    assert "`features/payment-refund.md`" in backend.files[INDEX]
 
 
-async def test_too_many_decisions_is_rejected():
+async def test_read_tool_loads_one_document_from_the_index():
     backend = _FakeBackend()
-    backend.files[PATH] = BASE
-    items = [
-        {"decision": f"约束{i}", "reason": "原因", "impact": "影响"} for i in range(9)
-    ]
+    await _save(
+        backend,
+        kind="feature",
+        slug="payment-refund",
+        title="支付退款",
+        content="## 时序图\n```mermaid\nsequenceDiagram\n  User->>API: refund\n```",
+        summary="退款",
+        domain="payment",
+    )
 
-    out = await _call(_tool(backend), "decisions", {"items": items})
+    text = await _tool(backend, "read_repo_memory").ainvoke({"path": "features/payment-refund.md"})
+    missing = await _tool(backend, "read_repo_memory").ainvoke({"path": "features/not-found.md"})
 
-    assert "最多 8 条" in out
-    assert backend.aedits == []
+    assert "sequenceDiagram" in text
+    assert "文档不存在" in missing
 
 
-async def test_an_unknown_section_is_rejected():
+async def test_new_memory_pack_creates_gaps_and_risks_skeletons(clock):
     backend = _FakeBackend()
 
-    out = await _call(_tool(backend), "full_text", {"content": "整篇"})
+    index = await _tool(backend, "read_repo_memory").ainvoke({"path": "index"})
 
-    assert "section 只能是" in out
-    assert backend.awrites == []
+    assert "`working/gaps.md`" in index
+    assert "`working/risks.md`" in index
+    assert GAPS in backend.files
+    assert RISKS in backend.files
+    assert "## 风险登记" in backend.files[RISKS]
 
 
-async def test_an_overlong_field_is_rejected_instead_of_truncated():
+async def test_qa_can_write_verified_gaps_and_risks_but_not_decisions():
     backend = _FakeBackend()
-    backend.files[PATH] = BASE
 
-    out = await _call(_tool(backend), "basic", {"fields": {"技术栈": "字" * 301}})
+    feature = await _save(
+        backend,
+        form=QA_FORM,
+        kind="feature",
+        slug="payment-refund",
+        title="支付退款",
+        content="## 功能职责\n退款分析。",
+        domain="payment",
+    )
+    gaps = await _save(
+        backend,
+        form=QA_FORM,
+        kind="gaps",
+        content=(
+            "## 缺口登记\n"
+            "- **支付**：退款回调尚未实现。\n"
+            "  - **状态**：未开始\n"
+        ),
+        source_paths=["src/payment/refund.py"],
+    )
+    risks = await _save(
+        backend,
+        form=QA_FORM,
+        kind="risks",
+        content=(
+            "## 风险登记\n"
+            "- **重复退款**：回调重试可能重复入账。\n"
+            "  - **严重度**：高\n"
+        ),
+        verified_commit="abc123",
+    )
+    decision = await _save(
+        backend,
+        form=QA_FORM,
+        kind="decision",
+        slug="no-refund-retry",
+        content="## 约束\n禁止无幂等键重试。",
+    )
 
-    assert "超过 300 字" in out
-    assert backend.aedits == [], "超长就整次不写，不做静默截断"
+    assert "features/payment-refund.md" in feature
+    assert "`working/gaps.md`" in gaps
+    assert "`working/risks.md`" in risks
+    assert "退款回调尚未实现" in backend.files[GAPS]
+    assert "重复退款" in backend.files[RISKS]
+    assert "当前角色不能写 kind=decision" in decision
 
 
-async def test_an_oversized_section_is_rejected_with_its_size():
+async def test_plan_has_only_the_read_tool_and_does_not_migrate(clock):
     backend = _FakeBackend()
-    backend.files[PATH] = BASE
-    items = [{"module": f"模块{i}", "text": "字" * 200} for i in range(10)]
+    legacy = """# 仓库记忆：acme/demo
 
-    out = await _call(_tool(backend), "gaps", {"items": items})
+> 最后更新：2026-11-18 08:00　｜　最近 PR：—
 
-    assert "超出上限" in out and "当前缺口" in out
-    assert backend.aedits == []
+## 一、仓库基本信息
+- **技术栈**：Python
+
+## 二、变更记录（最新在上）
+### 2026-11-18 · 修改 · 旧改动
+- **PR**：#1　｜　**状态**：已合并
+
+## 三、当前缺口（按模块）
+
+## 四、长期约束
+"""
+    backend.files[INDEX] = legacy
+    names = [tool.name for tool in _tools(backend, PLAN_FORM)]
+    assert "read_repo_memory" in names
+    assert "save_repo_memory" not in names
+
+    text = await _tool(backend, "read_repo_memory", PLAN_FORM).ainvoke({"path": "index"})
+
+    assert "## 二、目录与模块" in text
+    assert backend.files[INDEX] == legacy
+    assert backend.writes == []
+    assert backend.edits == []
 
 
-async def test_legacy_tables_are_dropped_on_write():
+async def test_gaps_and_risks_use_separate_documents_and_enter_the_catalog():
     backend = _FakeBackend()
-    backend.files[PATH] = BASE + "\n## 五、功能列表\n| 功能 | 状态 |\n"
+    gap_out = await _save(
+        backend,
+        kind="gaps",
+        content="- **退款**：渠道补偿尚未实现\n- **对账**：缺少定时任务",
+        summary="退款补偿与对账缺口",
+        source_paths=["src/payment/refund.py"],
+    )
+    risk_out = await _save(
+        backend,
+        kind="risks",
+        content=(
+            "## 风险登记\n"
+            "- **并发覆盖**：同一退款单可能被两个 worker 同时处理。\n"
+            "  - **严重度**：高\n"
+            "  - **触发条件**：重复消费消息\n"
+            "  - **影响**：重复打款\n"
+            "  - **状态**：待处理\n"
+            "  - **证据**：`src/payment/refund.py`"
+        ),
+        summary="退款并发风险",
+        keywords=["refund", "concurrency"],
+        source_paths=["src/payment/refund.py"],
+        verified_commit="abc123",
+    )
 
-    await _call(_tool(backend), "gaps", {"items": [{"module": "订单", "text": "退款"}]})
+    assert "`working/gaps.md`" in gap_out
+    assert "`working/risks.md`" in risk_out
+    assert "退款" in backend.files[GAPS]
+    assert "对账" in backend.files[GAPS]
+    assert "并发覆盖" in backend.files[RISKS]
+    assert "严重度**：高" in backend.files[RISKS]
+    assert "触发条件**：重复消费消息" in backend.files[RISKS]
+    assert "abc123" in backend.files[RISKS]
+    assert "`working/gaps.md`" in backend.files[INDEX]
+    assert "`working/risks.md`" in backend.files[INDEX]
+    assert "退款并发风险" in backend.files[INDEX]
 
-    assert "功能列表" not in backend.files[PATH]
+
+async def test_gaps_and_risks_require_code_evidence():
+    backend = _FakeBackend()
+
+    gap = await _save(
+        backend,
+        kind="gaps",
+        content="- **退款**：补偿缺失",
+    )
+    risk = await _save(
+        backend,
+        kind="risks",
+        content="- **并发**：可能重复退款",
+    )
+
+    assert "gaps 至少需要一项代码证据" in gap
+    assert "risks 至少需要一项代码证据" in risk
 
 
-# -- 描述与路径 ----------------------------------------------------------------
+async def test_invalid_profile_field_and_storage_error_are_returned_as_text():
+    backend = _FakeBackend()
+    invalid = await _save(
+        backend,
+        kind="profile",
+        content="- **模块列表**：不允许",
+    )
+    assert "profile 不支持的字段" in invalid
+
+    failing = _FakeBackend(write_error="存储挂了")
+    error = await _save(
+        failing,
+        kind="gaps",
+        content="- 退款未完成",
+        source_paths=["src/payment/refund.py"],
+    )
+    assert "写入仓库记忆失败" in error
+    assert "存储挂了" in error
 
 
-def test_path_comes_from_the_shared_helper():
-    assert memory_path("gitee", "acme", "demo") == PATH
-
-
-def test_the_tool_description_documents_the_sections():
-    """schema 只有 section + payload，写法必须写在描述里，否则模型只能猜。"""
-    tool = _tool(_FakeBackend())
-    assert "按节" in tool.description
-    for section in ("change", "gaps", "decisions", "basic"):
-        assert f'section="{section}"' in tool.description
-    assert "整篇" in tool.description
+async def test_no_search_tool_is_exposed():
+    names = [tool.name for tool in _tools(_FakeBackend())]
+    assert "search_repo_memory" not in names
+    assert "save_repo_memory_document" not in names

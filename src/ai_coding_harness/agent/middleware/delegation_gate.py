@@ -41,8 +41,10 @@ from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
-from ai_coding_harness.core.stream import TASK_TOOL, TODO_TOOL
+from ai_coding_harness.agent.turn_state import TurnState
+from ai_coding_harness.core.stream import TASK_TOOL, TODO_TOOL, subagent_name
 from ai_coding_harness.observability.logging import MAIN_AGENT
+from ai_coding_harness.tools.context import get_configurable
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,24 @@ class DelegationGateMiddleware(AgentMiddleware):
                 tool_call_id=call.get("id") or "",
                 status="error",
             )
+
+        if subagent_name(call.get("args")) == "coder":
+            state = get_configurable("turn_state")
+            if not isinstance(state, TurnState) or state.work_task_id is None:
+                logger.warning(
+                    "委派闸门拦下 coder：本轮尚未绑定代码任务",
+                    extra={"agent": MAIN_AGENT},
+                )
+                return ToolMessage(
+                    content=(
+                        "派 coder 前必须先调用 `openWorkTask` 绑定当前代码任务。"
+                        "如果已有未完成任务，本次需求属于新任务时不要继续写代码；"
+                        "先向用户说明需要完成当前任务并合并 PR。"
+                    ),
+                    name=name,
+                    tool_call_id=call.get("id") or "",
+                    status="error",
+                )
 
         return await handler(request)
 

@@ -308,6 +308,7 @@ async def test_shutdown_cancels_the_in_flight_runs() -> None:
     await asyncio.wait_for(hub.shutdown(), timeout=5)
     assert not await hub.is_running("s")
     assert await _drain(hub, "s") == []
+    assert len(svc.recovery_calls) == 1, "优雅重启前必须保存工作区"
 
 
 # -- 路由：POST /sessions/{id}/cancel ---------------------------------------

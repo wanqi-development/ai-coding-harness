@@ -498,19 +498,19 @@ def test_the_two_template_copies_are_identical():
     assert sandbox == docs
 
 
-def test_the_template_asks_for_the_unfinished_features():
-    """「当前缺口」里按模块列未完成的功能 —— 模版与提示词都得这么说，否则模型不会写。
-
-    这一节 2026-09-26 从「当前进度」改名成「当前缺口」：它是**分析结论**的一半（这个仓库现在
-    缺什么），与「仓库基本信息」一起来自按 skill 做的分析，所以留在记忆里而不是另存文件。
-    """
+def test_the_template_separates_confirmed_gaps_from_potential_risks():
+    """缺口是已确认缺失的能力；风险是可能造成不利后果的问题，不能混成一个文档。"""
     text = (REPO / "sandbox" / "policies" / "repo-memory-template.md").read_text(
         encoding="utf-8"
     )
 
-    assert "## 三、当前缺口（按模块）" in text
-    assert "未完成的功能" in text
-    assert 'section="gaps"' in text, "按节增量写的口径要写在模版里"
+    assert "### 当前缺口" in text
+    assert "已确认缺失或尚未完成" in text
+    assert "### 当前风险" in text
+    assert "潜在不利后果" in text
+    assert 'save_repo_memory(kind="gaps", ...)' in text
+    assert 'save_repo_memory(kind="risks", ...)' in text
+    assert "必须提供 `source_paths` 或 `verified_commit`" in text
 
 
 def test_the_template_records_the_pr_status_but_never_a_pr_less_entry():

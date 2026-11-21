@@ -1,11 +1,11 @@
-"""思考正文的补丁层：ChatOpenAI 丢掉 ``reasoning_content``，这里完成完整往返。
+"""思考正文的补丁层：保留当轮展示，但禁止历史 reasoning 回传。
 
 三层都要钉：
 
 ① ``_convert_chunk_to_generation_chunk`` 从**原始 chunk** 里取 ``reasoning_content``；
 ② ``ReasoningAIMessageChunk.content_blocks`` 把它还原成 reasoning 块 —— OpenAI 的
    provider translator 不读 ``additional_kwargs``，只补 ① 到不了 v3 事件桥；
-③ ``_get_request_payload`` 把历史里的思考写回 assistant 消息，工具续轮不会丢上下文。
+③ ``_get_request_payload`` 从 outbound 副本中移除历史思考，正文与工具配对保持原样。
 
 不联网：chunk 是手造的 dict，和 ``chunk.model_dump()`` 的形状一致。
 """
@@ -14,14 +14,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk
 
 from ai_coding_harness.agent.chat_model import (
     ReasoningAIMessage,
     ReasoningAIMessageChunk,
-    ReasoningChatOpenAI,
+    ReasoningContentChatOpenAI,
 )
 from ai_coding_harness.agent.llm import build_model
 from ai_coding_harness.config import ModelConfig, Settings
@@ -29,8 +28,8 @@ from ai_coding_harness.config import ModelConfig, Settings
 _BASE = "http://127.0.0.1:1/v1"
 
 
-def _model() -> ReasoningChatOpenAI:
-    return ReasoningChatOpenAI(
+def _model() -> ReasoningContentChatOpenAI:
+    return ReasoningContentChatOpenAI(
         model="m", api_key="k", base_url=_BASE, stream_usage=True
     )
 
@@ -86,8 +85,8 @@ def test_stream_chunks_merge_reasoning_and_text() -> None:
     assert {"type": "text", "text": "425"} in merged.content_blocks
 
 
-def test_reasoning_content_is_replayed_in_the_next_chat_request() -> None:
-    """思考不能只在界面上出现；tool call 后的下一次请求必须把这段历史发回模型。"""
+def test_reasoning_content_is_not_replayed_in_the_next_chat_request() -> None:
+    """Real-time reasoning is display-only; tool history must survive without it."""
     assistant = AIMessage(
         content="",
         additional_kwargs={"reasoning_content": "先检查目录，再执行命令"},
@@ -105,19 +104,20 @@ def test_reasoning_content_is_replayed_in_the_next_chat_request() -> None:
         [assistant, ToolMessage(content="README.md", tool_call_id="call_1")]
     )
 
-    assert payload["messages"][0]["reasoning_content"] == "先检查目录，再执行命令"
+    assert "reasoning_content" not in payload["messages"][0]
+    assert payload["messages"][0]["tool_calls"][0]["id"] == "call_1"
     assert payload["messages"][1]["role"] == "tool"
 
 
-def test_reasoning_block_is_also_replayed_in_the_next_chat_request() -> None:
-    """历史消息来自内容块形态时也不能丢；兼容旧 checkpoint 与新的 v3 消息。"""
+def test_reasoning_block_is_not_replayed_in_the_next_chat_request() -> None:
+    """Reasoning blocks from old checkpoints are stripped from the request copy."""
     assistant = AIMessage(
         content=[{"type": "reasoning", "reasoning": "先算乘法"}],
     )
 
     payload = _model()._get_request_payload([assistant])
 
-    assert payload["messages"][0]["reasoning_content"] == "先算乘法"
+    assert "reasoning_content" not in payload["messages"][0]
 
 
 def test_a_chunk_without_reasoning_gains_no_empty_block() -> None:
@@ -242,6 +242,38 @@ def test_responses_reasoning_summary_block_is_already_protocol_ready() -> None:
     ]
 
 
+def test_responses_payload_drops_all_historical_reasoning() -> None:
+    model = ReasoningContentChatOpenAI(
+        model="gpt-6.1-sol",
+        api_key="k",
+        base_url=_BASE,
+        use_responses_api=True,
+        output_version="responses/v1",
+    )
+    messages = [
+        AIMessage(
+            content=[
+                {
+                    "type": "reasoning",
+                    "id": "rs_previous",
+                    "reasoning": "来自上一条 Responses 调用的思考",
+                },
+                {"type": "text", "text": "旧回答"},
+            ]
+        ),
+        HumanMessage(content="继续"),
+    ]
+
+    payload = model._get_request_payload(messages)
+
+    assert payload["input"]
+    assert not any(item.get("type") == "reasoning" for item in payload["input"])
+    assert any(
+        item.get("type") == "message" and item.get("role") == "user"
+        for item in payload["input"]
+    )
+
+
 def test_build_model_uses_the_reasoning_client() -> None:
     settings = Settings(
         _env_file=None,
@@ -250,17 +282,14 @@ def test_build_model_uses_the_reasoning_client() -> None:
         },
     )
 
-    assert isinstance(build_model(settings, role="qa"), ReasoningChatOpenAI)
+    assert isinstance(build_model(settings, role="qa"), ReasoningContentChatOpenAI)
 
 
 async def test_v3_events_carry_reasoning_deltas() -> None:
     """端到端到事件层：`content-block-delta` 里必须是 ``reasoning-delta``，
     否则 ``stream.py`` 的翻译层拿不到思考文本。"""
 
-    class Fake(GenericFakeChatModel):
-        def _get_ls_params(self, **kwargs: object) -> dict[str, str]:
-            return {"ls_provider": "openai"}
-
+    class Fake(ReasoningContentChatOpenAI):
         async def _astream(
             self,
             messages: Any,
@@ -277,7 +306,7 @@ async def test_v3_events_carry_reasoning_deltas() -> None:
                     )
                 )
 
-    model = Fake(messages=iter([AIMessage(content="ok")]))
+    model = Fake(model="m", api_key="k", base_url=_BASE)
     stream = await model.astream_events("hi", version="v3")
     deltas = [
         event["delta"]
@@ -287,3 +316,33 @@ async def test_v3_events_carry_reasoning_deltas() -> None:
 
     assert {"type": "reasoning-delta", "reasoning": "先算"} in deltas
     assert {"type": "reasoning-delta", "reasoning": "乘法"} in deltas
+
+
+def test_sync_v3_stream_events_carry_reasoning_deltas() -> None:
+    """同步 ``stream_events(version="v3")`` 走同一个 content-block 出口。"""
+
+    class Fake(ReasoningContentChatOpenAI):
+        def _stream(
+            self,
+            messages: Any,
+            stop: Any = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+        ):
+            yield ChatGenerationChunk(
+                message=ReasoningAIMessageChunk(
+                    content="",
+                    additional_kwargs={"reasoning_content": "同步思考"},
+                    response_metadata={"model_provider": "openai"},
+                )
+            )
+
+    model = Fake(model="m", api_key="k", base_url=_BASE)
+    stream = model.stream_events("hi", version="v3")
+    deltas = [
+        event["delta"]
+        for event in stream
+        if event["event"] == "content-block-delta"
+    ]
+
+    assert {"type": "reasoning-delta", "reasoning": "同步思考"} in deltas

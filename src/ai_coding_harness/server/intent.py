@@ -1,21 +1,16 @@
-"""用户意图分析 —— 状态候选 + 四关判定（口令 → JEV → 大模型 → 关键字口径）。
+"""用户意图分析 —— 强口令与 JEV / 大模型。
 
-四关顺序不可颠倒（见 ``detect_intent``）：
+只有两关；任一关没有识别出可靠意图就转 qa 意图澄清：
 
-1. **按仓库状态限制候选**：没有 open PR 时是 qa / plan / coding；有 open PR 时是
-   qa / rework。候选集同时喂给关键字、JEV、大模型与兜底，模型不会选一个当前场景
-   根本不可执行的意图。
-2. **强关键字（口令级）直通**：命中即定，不调任何模型。这类词是明确指令（「出方案」
+1. **强关键字（口令级）直通**：命中即定，不调任何模型。这类词是明确指令（「出方案」
    「实施」），没有歧义。
-3. **JEV（SystemOne，决策型模型）判定**：口令没命中时问它。``Choice`` 的 criteria
-   只放当前候选，拿回选项、置信度与各候选概率 —— 见 ``JevDecider``。
-4. **大模型判定 / 回落 ``classify()``**：模型不可用时退回纯关键字口径；关键字也没命中
-   就取候选里的默认项。没有 open PR 时优先沿用历史上的 coding 兜底；有 open PR 时
-   默认 qa，避免把一句模糊话直接变成 rework。
+2. **JEV / 大模型**：按所选模式二选一。未配置、超时、报错、非法标签或低置信度都
+   返回 ``qa + needs_clarification``，不再用弱关键字或默认值猜意图。
 
-**弱关键字**（只作第 2/3 关的「线索」）不单独定案：命中它们的消息恰恰是歧义最大的那批
-（现在靠排除词「怎么实现」「设计模式」打补丁就是证据）。它们的作用有二：作为线索写进
-判定输入，以及在第 4 关充当兜底依据。
+分类阶段只区分 qa / plan / coding。PR 跟进、审查、修复已有代码都归 coding，
+由主控再决定派 coder 还是 reviewer，以及是否需要创建 PR。
+
+**弱关键字**只作为判定器提示词里的线索，不单独定案。
 
 另有 ``force_llm=True`` 的变体：跳过第 1 关直接问判定器，供「智能体自述做不了、
 要纠正口令误判」那条路使用（见 ``detect_intent`` 与 ``tools/handoff.py``）。
@@ -35,33 +30,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
 
-# 任务类型：`review` 主控形态已删除，PR 审查并入 rework 的子智能体流程；
-# `analysis` 与 qa 合并；`sync` 删除，本地仓库由用户手动刷新。
+# 任务类型：PR 审查、回评、修复和交付都属于 coding；主控按当前 work task
+# 决定派 reviewer 还是 coder。`analysis` 与 qa 合并，`sync` 删除。
 TASK_TYPES: tuple[str, ...] = (
     "coding",  # 编码：写/改/重构/修复
-    "rework",  # PR 跟进：审查 open PR，或按意见 / 用户新要求继续修改
     "plan",  # 计划 / 方案 / 设计
     "qa",  # 提问（默认兜底）
 )
-
-#: 「PR 跟进」。它要处理的就是那份**还开着**的 PR；装配上与 coding 共用 profile。
-REWORK_INTENT = "rework"
-
-#: 明确的“未完成轮次”标记：出现这些词时沿用上一轮/未完成任务。
-CONTINUE_MARKERS: tuple[str, ...] = (
-    "继续", "接着", "修正", "纠正", "重来", "再试一次",
-    "为什么不", "为什么没", "不是", "不对",
-)
-
-#: 短追问里的动作词：上一轮是 plan 时，这些通常表示实施/修复代码，而不是改方案文本。
-SHORT_IMPERATIVES: tuple[str, ...] = (
-    "修复", "实施", "执行", "开始", "做", "改", "落地", "上", "来",
-)
-
-#: 无状态限制时的历史默认。动态候选会把不可用的项过滤掉：没有 open PR 时它仍是
-#: coding，有 open PR 时实际落到 qa。
-DEFAULT_INTENT = "coding"
-
 
 @dataclass(frozen=True)
 class IntentRule:
@@ -78,28 +53,6 @@ class IntentRule:
 
 # 规则顺序敏感：越具体越靠前，先成立的胜出。
 _RULES: tuple[IntentRule, ...] = (
-    # PR 跟进：既能按评审意见改，也可以在 open PR 上按用户的新想法继续改。
-    IntentRule(
-        "rework",
-        # 强口令一律**带动词**（怎么改、改哪里），因为「评审 / 审查」本身不是改码的意思
-        strong=(
-            "按评审意见", "根据评审意见", "按评审结论", "根据评审结论",
-            "按审查意见", "根据审查意见", "按审查结论", "根据审查结论",
-            "评审意见修改", "评审意见修复", "评审意见改", "评审意见修",
-            "审查意见修改", "审查意见修复", "审查意见改", "审查意见修",
-            "评审结论修改", "评审结论改", "审查结论修改", "审查结论改",
-            "按 review 意见", "按review意见", "review 意见修改", "review意见修改",
-            "修复评审意见", "修复审查意见", "修复P1", "修复P2", "修复P3",
-            "修复p1", "修复p2", "修复p3",
-            "修复全部", "修改所有PR问题", "修改所有问题",
-            "代码审查", "代码评审", "审查一下", "评审一下",
-            "审查 pr", "审查pr", "评审 pr", "评审pr",
-            "返工",
-        ),
-        # 弱线索只作提示与兜底。**不放光秃秃的「评审意见」**：「看看有哪些评审意见」
-        # 是查现状，该留在 qa；只有带修改动作时才由模型判 rework。
-        weak=("评审提", "审查提", "代码审查", "代码评审", "审查", "评审"),
-    ),
     IntentRule(
         "plan",
         strong=(
@@ -115,6 +68,10 @@ _RULES: tuple[IntentRule, ...] = (
         strong=(
             "实施", "动手改", "开始改", "按这个方案做", "按方案做", "写代码", "修改代码",
             "改代码", "提 pr", "提个 pr", "提个pr", "开 pr", "开pr", "提交 pr", "创建 pr",
+            "按评审意见", "根据评审意见", "按审查意见", "根据审查意见",
+            "修复评审意见", "修复审查意见", "修复P1", "修复P2", "修复P3",
+            "修复p1", "修复p2", "修复p3", "修复全部", "修改所有PR问题",
+            "代码审查", "代码评审", "审查 pr", "审查pr", "评审 pr", "评审pr", "返工",
             "写文档", "补文档", "更新文档", "修改文档", "改文档", "写技术文档",
             "补技术文档", "修改技术文档", "更新 readme", "更新readme", "写 readme",
             "写readme", "修改 readme", "修改readme", "更新 agent.md", "更新agent.md",
@@ -124,6 +81,7 @@ _RULES: tuple[IntentRule, ...] = (
         weak=(
             "实现", "开发", "重构", "修复", "新增",
             "功能", "bug", "feature", "改一下", "加上", "去掉", "加一个",
+            "评审提", "审查提", "代码审查", "代码评审", "审查", "评审",
         ),
         # 这些是「问怎么实现」，属于问答而非让你动手写
         excludes=(
@@ -165,18 +123,11 @@ _INTENT_SPECS: tuple[IntentSpec, ...] = (
     # 行不行」，都不是 coding —— coding 的判据是有没有让动手。
     IntentSpec(
         "coding",
-        "要写、改、修、重构代码，或按已定方案实施；也包括直接新增 / 修改仓库里的文档文件"
+        "要写、改、修、重构代码，按已定方案实施，或对已有 PR 做审查、回评、"
+        "修复和交付；也包括直接新增 / 修改仓库里的文档文件"
         "（README、AGENTS.md、docs 等纯文档改动）。"
         "**讨论需求本身不是 coding**（要不要做、做成什么样、补什么条件、换个说法）——"
         "那是 qa。",
-    ),
-    # open PR 的后续都在这一档：审查、回评、按评审意见修、按用户新想法继续改。
-    # 真正的执行动作由 rework 指令与 reviewer 子智能体分流。
-    IntentSpec(
-        "rework",
-        "跟进一个还开着的 PR：审查 / 评审 / 回评，按评审意见修复，"
-        "或按用户在这份 PR 上提出的新设计问题继续修改。只处理 open PR 的既有分支，"
-        "不新建分支、不新建 PR。",
     ),
     # qa 合并原 analysis：所有只读问答、解释、排查、仓库现状查询都归这里。
     IntentSpec(
@@ -191,15 +142,12 @@ _INTENT_SPECS: tuple[IntentSpec, ...] = (
 _LLM_INTENTS: frozenset[str] = frozenset(spec.intent for spec in _INTENT_SPECS)
 
 # 判定来源，写进日志与业务记录，用于事后核对准确率：
-# keyword = 口令直通或（未启用判定器时的）关键字口径；jev = JEV 判定；llm = 大模型判定；
-# fallback = 两个模型都判不出来，回落到关键字口径
+# keyword = 强口令直通；jev = JEV 判定；llm = 大模型判定；clarify = 转 qa 意图澄清
 SOURCE_KEYWORD = "keyword"
 SOURCE_JEV = "jev"
 SOURCE_LLM = "llm"
-SOURCE_FALLBACK = "fallback"
 SOURCE_CLARIFY = "clarify"
 SOURCE_CLARIFY_CHOICE = "clarification_choice"
-SOURCE_PR_OWNERSHIP = "pr_ownership"
 SOURCE_STATE = "state"
 
 
@@ -210,57 +158,13 @@ class IntentDecision:
     intent: str
     source: str
     reason: str = ""
-    #: 判定器给的置信度（JEV 的 ``ChoiceAnswer.confidence``，0~1）；口令直通与关键字口径
+    #: 判定器给的置信度（JEV 的 ``ChoiceAnswer.confidence``，0~1）；强口令
     #: 没有这个概念，留 ``None``。
     confidence: float | None = None
     #: 低置信度时的候选（意图, 概率），按可能性从高到低；只用于 qa 的澄清追问。
     candidates: tuple[tuple[str, float], ...] = ()
     #: 本轮是否转成 qa、先向用户确认意图。
     needs_clarification: bool = False
-
-
-@dataclass(frozen=True)
-class StateGateResult:
-    """函数式 PR 状态闸门的结果：放行时给最终意图，否则给阻塞原因。"""
-
-    intent: str | None
-    reason: str = ""
-
-
-def gate_intent_for_state(
-        intent: str, allowed_intents: Sequence[str]
-) -> StateGateResult:
-    """判定后的最后一道状态闸门。
-
-    分类器已经只看到候选，但强关键字、上一轮判定与 handoff 重判仍可能给出过时意图。
-    这里统一收口，不把“能不能执行”留给提示词。
-    """
-    allowed = set(allowed_intents)
-    if intent in allowed:
-        return StateGateResult(intent)
-    if intent == "coding" and "coding" not in allowed:
-        return StateGateResult(
-            None,
-            "当前仓库还有未合并的 PR。coding 已暂停；如果要继续处理这份 PR，"
-            "请明确说审查或修改当前 PR。",
-        )
-    if intent == "rework" and "coding" in allowed:
-        return StateGateResult(
-            None,
-            "当前没有可返工的 PR：可能没有 open PR，或 open PR 还没有评论、reviewer "
-            "尚未产出问题。请继续 coding 收尾，或明确说明要开始新的改动。",
-        )
-    if intent == "plan" and "plan" not in allowed:
-        return StateGateResult(
-            None,
-            "当前仓库还有未合并的 PR。按本项目的状态约束，先审查或修改这份 PR，"
-            "合并 / 关闭后再出新的实施方案。",
-        )
-    return StateGateResult(
-        None,
-        "当前无法确认仓库的 PR 状态,"
-        "这次先只做只读问答；需要改代码时请稍后重试。",
-    )
 
 
 def should_clarify(decision: IntentDecision, threshold: float) -> bool:
@@ -274,6 +178,8 @@ def clarification_decision(
         decision: IntentDecision, threshold: float
 ) -> IntentDecision | None:
     """低置信度 → qa 澄清决策；不需要澄清返回 ``None``。"""
+    if decision.needs_clarification:
+        return decision
     if not should_clarify(decision, threshold):
         return None
     confidence = float(decision.confidence or 0.0)
@@ -287,11 +193,13 @@ def clarification_decision(
     )
 
 
-def has_continue_marker(message: str) -> bool:
-    """「不是」不能命中「是不是」——后者是疑问句，不是纠正。"""
-    return any(
-        marker in message and not (marker == "不是" and "是不是" in message)
-        for marker in CONTINUE_MARKERS
+def clarification_from_failure(reason: str) -> IntentDecision:
+    """分类器无法给出可靠意图时，交给 qa 做意图澄清。"""
+    return IntentDecision(
+        "qa",
+        SOURCE_CLARIFY,
+        reason,
+        needs_clarification=True,
     )
 
 
@@ -347,26 +255,6 @@ def weak_hints(message: str) -> list[str]:
     return hints
 
 
-def classify(
-        message: str, *, allowed_intents: Sequence[str] | None = None
-) -> str:
-    """纯关键字判定（强 + 弱 + 排除词）→ 任务类型。
-
-    这是 LLM 不可用时的回落口径，也是升级前的老行为。
-    """
-    allowed = tuple(allowed_intents or TASK_TYPES)
-    allowed_set = set(allowed)
-    text = message.lower()
-    for rule in _RULES:
-        if rule.intent not in allowed_set:
-            continue
-        if any(e.lower() in text for e in rule.excludes):
-            continue
-        if any(_hit(text, word) for word in (*rule.strong, *rule.weak)):
-            return rule.intent
-    return DEFAULT_INTENT if DEFAULT_INTENT in allowed_set else (allowed[0] if allowed else "qa")
-
-
 # -- LLM 判定 ---------------------------------------------------------------
 
 # 判定要点。分类模型栽得最多的就是「句子里出现功能名词就判 coding」——「请给这个仓库
@@ -407,25 +295,20 @@ _BOUNDARY: tuple[str, ...] = (
         "文档要写什么、怎么组织、先列提纲，仍分别归 qa / plan。"
     ),
     (
-        "- rework 与 coding 的分界：**指着一份已经审过的 PR（或它上面的评审清单 / 评审原文）**"
-        "要求审查、回评或继续修改，是 rework；按新需求从零写、或按方案实施，是 coding。"
-    ),
-    (
         "- qa 已合并原来的 analysis：解释功能、解释用户疑问、排查为什么、查已有数据，"
         "全部归 qa。"
         "**计划、方案、任务完成度一律归 plan**，哪怕是“完成了多少”这种问法。"
     ),
     (
-        "- PR 生命周期：没有 open PR 时写代码 / 创建 PR 是 coding；存在 open PR 时，"
-        "对它的审查、回评、修复或继续修改都归 rework。PR 已合并 / 已关闭后先刷新缓存，"
-        "没有 open PR 再回到 coding。"
+        "- PR 生命周期：写代码、创建 PR，以及对已有 PR 的审查、回评、修复和继续修改，"
+        "统一归 coding。主控会根据当前代码任务决定派 coder 还是 reviewer。"
     ),
     (
         "- 用户说「继续 / 接着 / 修正 / 纠正 / 重来 / 再试一次」时，按**未完成轮次**处理："
         "沿用上一轮的可执行意图，不要新开一个无关形态。"
     ),
     (
-        "- 对上一轮动作的追问（「你为什么不派 coder」「上一轮不是 rework 吗」"
+        "- 对上一轮动作的追问（「你为什么不派 coder」「上一轮不是 coding 吗」"
         "「为什么没改代码」）不是新的分析任务：先看上一轮判定与回复，判断用户是要继续 /"
         "纠正上一轮动作，还是只要解释；**不要仅因为出现「为什么」就判 analysis**。"
     ),
@@ -538,11 +421,17 @@ def _user_prompt(
             "不要仅因为出现「为什么」就判 analysis。"
         )
     if dialogue:
-        lines = ["最近三个用户轮次内的完整会话记录（由远及近，以下正文未截断）："]
+        lines = [
+            (
+                "最近三个未中断完整用户轮次，以及窗口内的中断消息"
+                "（由远及近，以下正文未截断）："
+            )
+        ]
         for turn in dialogue:
             role = {
                 "user": "用户",
                 "assistant": "助手",
+                "assistant_interrupted": "助手（本轮中断，以下为已产生内容）",
                 "plan": "方案",
             }.get(str(turn.get("role") or ""), "记录")
             lines.append(f"[{role}] {turn.get('content', '')}")
@@ -679,7 +568,7 @@ class IntentDecider(Protocol):
 
 
 class JevDecider:
-    """用 JEV（SystemOne）判意图；``Choice`` 的候选每轮按仓库状态裁。
+    """用 JEV（SystemOne）判意图；``Choice`` 的候选覆盖全部真实意图。
 
     ``Choice(instructions=…, criteria={标签: 描述})`` 拿回 ``.choice`` / ``.confidence`` /
     ``.probabilities`` —— 置信度与各候选概率都进日志，比大模型自述的一句理由更硬。
@@ -688,7 +577,7 @@ class JevDecider:
     口径一漂就会出现「换个模型结论就变」，事后从日志里也看不出是哪一层判的。
 
     **任何失败都只是「这一关判不出来」**：没配、超时、报错、回了认不出的标签，一律返回
-    ``None`` 交给下一关（大模型 → 关键字口径），绝不打断这一轮对话。
+    ``None`` 交给 qa 意图澄清，绝不打断这一轮对话。
 
     SDK（``typesafe-sdk``）**在构造时才 import**：没装这个包的部署不该因此起不来 ——
     与 ``tools/web_search.py`` 里那几处懒加载同一个理由。
@@ -711,6 +600,11 @@ class JevDecider:
             base_url=base_url or None,
             model=model or None,
             timeout=timeout,
+            # ztoken's SystemOne gateway does not decode SDK zstd bodies. The
+            # real classifier prompt is >1 KiB, so leaving SDK default enabled
+            # turns valid JSON into an opaque request and the gateway reports
+            # "missing model / invalid JSON".
+            compression=False,
             # 偶发 5xx/429 让 SDK 自己重试一次；整体超时仍由 timeout 兜住
             retry=RetryPolicy(max_retries=1),
         )
@@ -802,7 +696,7 @@ def build_jev_decider(settings: Any, *, user_id: int | None = None) -> JevDecide
     作废）：**地址与 key 两样都要**才认为这一侧可用 —— 只填了 key 会打到 SDK 的默认地址上，
     那多半不是用户想连的那家（踩过一次：默认地址与自建网关不是一回事）。
 
-    构造失败**不让服务起不来**：JEV 只是二选一里的一侧，缺了它还有关键字口径兜底。
+    构造失败**不让服务起不来**：JEV 只是二选一里的一侧，缺了它转 qa 意图澄清。
     """
     if not getattr(settings, "intent_jev_enabled", False):
         return None
@@ -876,23 +770,22 @@ async def detect_intent(
         allowed_intents: Sequence[str] | None = None,
         repo_state: str | None = None,
 ) -> IntentDecision:
-    """判定本轮意图。**两道瀑布按 ``mode`` 二选一**（2026-10-13 用户口径，2026-10-15 收紧为
-    **严格二选一**）：
+    """判定本轮意图。只认两关，失败就转 qa 意图澄清：
 
-    * ``mode="jev"``（**三关**）：口令 → **JEV** → 关键字口径。**选了 JEV 就只有 JEV**：
-      JEV 没配齐（``jev is None``）或判不出来（超时 / 认不出标签）都直接落关键字口径 ——
-      不借另一侧的模型（要借就是没做选择，用户口径 2026-10-15）。
-    * ``mode="llm"``（**三关**）：口令 → **大模型** → 关键字口径（不碰 JEV）。
+    * ``mode="jev"``：强口令 → JEV。
+    * ``mode="llm"``：强口令 → 大模型。
+
+    强口令未命中且选定判定器没配、超时、报错、返回非法标签时，不再用弱关键字
+    猜一个意图，也不存在默认 ``coding``；统一返回 ``qa + needs_clarification``。
 
     ``force_llm=True``（``handoffTask`` 的重判）不看 ``mode``：重判要纠正的正是口令层，
-    只能问大模型。判定是增强而不是新的故障点：每一关的结论都如实标在 ``source`` 上
-    （keyword / jev / llm / fallback），事后能按来源核对准确率。
+    只能问大模型；模型不可用时同样转 qa 澄清，不猜意图。
 
     ``force_llm`` 跳过**口令直通**那一层，直接问模型（``interrupt`` 路径用）。
     智能体自述「这活我做不了」时，要纠正的往往正是口令层 —— 撞上口令就算定了案，
     而消息里的真实诉求是另一件事（2026-09-21 那次：一轮 ``execute git status`` 打转，
-    口令层早早就把它钉成了 coding）。判定器不可用仍是回落，且来源照样标 ``fallback``：
-    这时候的判定**不是**重判，调用方得看得出来（见 ``tools/handoff.py`` 的拒绝分支）。
+    口令层早早就把它钉成了 coding）。判定器不可用则来源标 ``clarify``，调用方能据此
+    拒绝把一次失败的“重判”当成成功交接（见 ``tools/handoff.py``）。
 
     ``usage`` 是调用方给的累加器（``{"input":…, "output":…}``）：判定本身也要花 token，
     而且花的是**另一个模型**，所以由调用方决定要不要单独归一类（见 ``_record_usage``）。
@@ -902,10 +795,11 @@ async def detect_intent(
     「修复吧」时，指代对象只在上一轮那句反问里 —— 两条判定路径（JEV / 大模型）共用同一个
     提示词，所以两处一起看到它。不传就是不带（老行为）。
 
-    ``previous_intent`` 是上一轮的判定结果：对「你为什么不派 coder」「上一轮不是 rework
+    ``previous_intent`` 是上一轮的判定结果：对「你为什么不派 coder」「上一轮不是 coding
     吗」这类**追问**，它比字面里的「为什么」可靠得多。两条判定路径同样共用。
 
-    ``dialogue`` 是最近三个用户轮次的完整对话：用户消息、助手消息和方案记录均保留全文。
+    ``dialogue`` 是最近三个未中断完整用户轮次，外加窗口内的中断消息；用户、助手和
+    方案正文均保留，主动中断的助手记录会明确标记。
     """
     candidates_allowed = _normalise_allowed(allowed_intents)
     if not force_llm:
@@ -918,8 +812,8 @@ async def detect_intent(
 
     hints = weak_hints(message)
 
-    # JEV 那一关：只在「配置选了它」且不是重判时才走（三关里的第二关）。
-    # 严格二选一：选了 JEV 但没配齐 / 判不出来，直接落关键字口径，**不借大模型**。
+    # JEV 那一关：只在「配置选了它」且不是重判时才走。
+    # 严格二选一：选了 JEV 但没配齐 / 判不出来，直接转 qa 澄清，**不借大模型**。
     if mode == "jev" and not force_llm:
         if jev is not None:
             try:
@@ -937,13 +831,15 @@ async def detect_intent(
                     allowed_intents=candidates_allowed,
                     repo_state=repo_state,
                 )
-            except Exception as exc:  # noqa: BLE001 —— JEV 是外部服务，失败只降级
+            except Exception as exc:  # noqa: BLE001 —— JEV 是外部服务
                 logger.warning(
-                    "JEV 判定失败（三关：落关键字口径）：%s: %s",
+                    "JEV 判定失败（转 qa 意图澄清）：%s: %s",
                     type(exc).__name__,
                     exc,
                 )
-                decided = None
+                return clarification_from_failure(
+                    f"JEV 判定失败：{type(exc).__name__}: {exc}"
+                )
             if decided is not None:
                 intent, reason, confidence = decided[:3]
                 candidates = decided[3] if len(decided) > 3 else ()
@@ -954,12 +850,8 @@ async def detect_intent(
                     confidence=confidence,
                     candidates=candidates,
                 )
-        # 三关就是三关：JEV 判不出来（超时 / 认不出标签 / 没配齐）**不再回退大模型** ——
-        # 用户口径是「二选一」，而「判不出来」不等于「没有 JEV」。
-        return IntentDecision(
-            classify(message, allowed_intents=candidates_allowed),
-            SOURCE_FALLBACK,
-            "JEV 不可用或判不出来（三关：落关键字口径）",
+        return clarification_from_failure(
+            "JEV 不可用或判不出可靠意图"
         )
 
     if model is not None:
@@ -988,20 +880,23 @@ async def detect_intent(
                 timeout=timeout,
             )
         except Exception as exc:  # noqa: BLE001  # 分类失败绝不能打断本轮
-            return IntentDecision(
-                classify(message, allowed_intents=candidates_allowed),
-                SOURCE_FALLBACK,
-                str(exc) or type(exc).__name__,
+            logger.warning(
+                "大模型意图判定失败（转 qa 意图澄清）：model=%s timeout=%.2fs %s: %s",
+                getattr(model, "model_name", "-"),
+                timeout,
+                type(exc).__name__,
+                str(exc)[:500],
+            )
+            return clarification_from_failure(
+                f"大模型意图判定失败：{type(exc).__name__}: {exc}"
             )
         _record_usage(usage, getattr(reply, "usage_metadata", None))
         parsed = parse_reply(
             _reply_text(reply), allowed_intents=candidates_allowed
         )
         if parsed is None:
-            return IntentDecision(
-                classify(message, allowed_intents=candidates_allowed),
-                SOURCE_FALLBACK,
-                "大模型返回了无法识别的结果",
+            return clarification_from_failure(
+                "大模型返回了无法识别的意图"
             )
         return IntentDecision(
             parsed.intent,
@@ -1011,10 +906,7 @@ async def detect_intent(
             candidates=parsed.candidates,
         )
 
-    # 走到这里只有两种情况：没配大模型；或 ``force_llm`` 重判但没有可用模型。
-    # 后者必须标 ``fallback`` —— ``handoffTask`` 靠来源判断「这次不是重判，别交接」。
-    return IntentDecision(
-        classify(message, allowed_intents=candidates_allowed),
-        SOURCE_FALLBACK if force_llm else SOURCE_KEYWORD,
-        "重判没有可用模型" if force_llm else "无可用判定器",
+    # 没配大模型；或 ``force_llm`` 重判但没有可用模型。
+    return clarification_from_failure(
+        "重判没有可用模型" if force_llm else "没有可用的意图判定器"
     )

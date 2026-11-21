@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_coding_harness.db.models import (
@@ -116,42 +116,106 @@ async def recent_user_summaries(
 async def recent_dialogue(
     db: AsyncSession, *, session_id: int, rounds: int = 3
 ) -> list[tuple[str, str]]:
-    """最近 ``rounds`` 个用户轮次内的完整会话记录（按时间正序）。
+    """最近 ``rounds`` 个未中断完整轮次，外加窗口内的中断消息。
 
-    轮次以 ``user`` 记录为边界；返回期间的全部 user / assistant / **plan** 记录。
-    plan 是会话时间线里的独立记录，不是 assistant 详情附件，必须一起带上。
-    正文不在这里截断，调用方按自己的预算处理。
+    中断轮不占三个完整轮次的名额：从中断标记的 assistant 记录（``extra.partial``）
+    继续向前找，直到找到三个正常收尾的完整轮次。返回该窗口内全部 user / assistant /
+    plan 正文；中断的 assistant 以 ``assistant_interrupted`` 角色返回。
     """
-    user_ids = list(
-        (
-            await db.scalars(
-                select(SessionRecord.id)
+    rounds = max(1, rounds)
+    limit = max(12, rounds * 4)
+    selected_user_ids: list[int] = []
+
+    while True:
+        user_ids = list(
+            (
+                await db.scalars(
+                    select(SessionRecord.id)
+                    .where(
+                        SessionRecord.session_id == session_id,
+                        SessionRecord.type == "user",
+                    )
+                    .order_by(SessionRecord.id.desc())
+                    .limit(limit)
+                )
+            ).all()
+        )
+        if not user_ids:
+            return []
+
+        assistant_rows = (
+            await db.execute(
+                select(
+                    SessionRecord.id,
+                    SessionRecordDetail.extra,
+                    (func.length(SessionRecordDetail.content) > 0).label("has_content"),
+                )
+                .outerjoin(
+                    SessionRecordDetail,
+                    SessionRecordDetail.record_id == SessionRecord.id,
+                )
                 .where(
                     SessionRecord.session_id == session_id,
-                    SessionRecord.type == "user",
+                    SessionRecord.type == "assistant",
+                    SessionRecord.id >= min(user_ids),
                 )
-                .order_by(SessionRecord.id.desc())
-                .limit(max(1, rounds))
+                .order_by(SessionRecord.id.asc())
             )
         ).all()
-    )
-    if not user_ids:
+
+        selected_user_ids = []
+        complete = 0
+        for index, user_id in enumerate(user_ids):
+            newer_user_id = user_ids[index - 1] if index > 0 else None
+            answers = [
+                (extra, bool(has_content))
+                for record_id, extra, has_content in assistant_rows
+                if record_id > user_id
+                and (newer_user_id is None or record_id < newer_user_id)
+            ]
+            is_complete = any(
+                has_content and not (isinstance(extra, dict) and extra.get("partial") is True)
+                for extra, has_content in answers
+            )
+            selected_user_ids.append(user_id)
+            if is_complete:
+                complete += 1
+                if complete >= rounds:
+                    break
+
+        if complete >= rounds or len(user_ids) < limit:
+            break
+        limit *= 2
+
+    if not selected_user_ids:
         return []
-    rows = await db.execute(
-        select(SessionRecord.type, SessionRecordDetail.content)
-        .join(SessionRecordDetail, SessionRecordDetail.record_id == SessionRecord.id)
-        .where(
-            SessionRecord.session_id == session_id,
-            SessionRecord.id >= min(user_ids),
-            SessionRecord.type.in_(("user", "assistant", "plan")),
+    cutoff = min(selected_user_ids)
+    rows = (
+        await db.execute(
+            select(
+                SessionRecord.type,
+                SessionRecordDetail.content,
+                SessionRecordDetail.extra,
+            )
+            .join(SessionRecordDetail, SessionRecordDetail.record_id == SessionRecord.id)
+            .where(
+                SessionRecord.session_id == session_id,
+                SessionRecord.id >= cutoff,
+                SessionRecord.type.in_(("user", "assistant", "plan")),
+            )
+            .order_by(SessionRecord.id.asc())
         )
-        .order_by(SessionRecord.id.asc())
-    )
-    return [
-        (str(kind), str(content))
-        for kind, content in rows.all()
-        if isinstance(content, str) and content.strip()
-    ]
+    ).all()
+
+    out: list[tuple[str, str]] = []
+    for kind, content, extra in rows:
+        if not isinstance(content, str) or not content.strip():
+            continue
+        role = str(kind)
+        if role == "assistant" and isinstance(extra, dict) and extra.get("partial") is True:
+            role = "assistant_interrupted"
+        out.append((role, content))
+    return out
 
 
 async def latest_assistant_tail(
@@ -204,7 +268,7 @@ async def recent_assistant_intents(
 ) -> list[str]:
     """最近几条助手记录的意图（新 → 旧），供“未完成任务”回溯。
 
-    最近一轮可能是 analysis/qa，但它不覆盖更早的 coding/rework；调用方按
+    最近一轮可能是 qa，但它不覆盖更早的 coding；调用方按
     “最近的可执行意图”挑一个。
     """
     rows = await db.scalars(

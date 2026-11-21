@@ -4,13 +4,19 @@ param(
     [string]$HarnessUser = $(if ($env:WSL_USER) { $env:WSL_USER } else { "harness" }),
     [int]$BackendPort = 8000,
     [int]$FrontendPort = 5173,
+    [string]$HarnessHostHome = $env:HARNESS_HOST_HOME,
     [switch]$NoFrontend
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_host-runtime.ps1")
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $repoRootForWsl = $repoRoot.Replace("\", "/")
 $launcher = Join-Path $PSScriptRoot "start-wsl-standalone.ps1"
+if ($HarnessHostHome) {
+    $env:HARNESS_HOST_HOME = $HarnessHostHome
+}
+$runtime = Get-HarnessHostRuntime
 
 function Invoke-WslChecked {
     param(
@@ -134,13 +140,33 @@ if (-not $needsBootstrap) {
 }
 
 if (-not $needsBootstrap) {
-    $dbPath = "/home/$HarnessUser/.ai-coding-harness/harness.sqlite3"
+    $dbPathResult = Invoke-WslChecked -CaptureOutput -Arguments @(
+        "-d", $Distro, "-u", $HarnessUser, "--",
+        "wslpath", "-a", "-u", (Join-Path $runtime.Data "harness.sqlite3").Replace("\", "/")
+    )
+    $dbPath = ($dbPathResult.Output -join "`n").Trim()
+    if (-not $dbPath) {
+        throw "Cannot resolve standalone SQLite path inside WSL."
+    }
     $dbResult = Invoke-WslChecked -CaptureOutput -AllowFailure -Quiet -Arguments @(
         "-d", $Distro, "-u", $HarnessUser, "--",
         "sqlite3", $dbPath, "SELECT COUNT(*) FROM users;"
     )
     $userCount = ($dbResult.Output -join "`n").Trim()
-    if ($dbResult.ExitCode -ne 0 -or -not $userCount -or [int]$userCount -lt 1) {
+    $needsAdmin = $dbResult.ExitCode -ne 0 -or -not $userCount -or [int]$userCount -lt 1
+    if ($needsAdmin) {
+        $legacyDb = "/home/$HarnessUser/.ai-coding-harness/harness.sqlite3"
+        $legacyResult = Invoke-WslChecked -CaptureOutput -AllowFailure -Quiet -Arguments @(
+            "-d", $Distro, "-u", $HarnessUser, "--",
+            "sqlite3", $legacyDb, "SELECT COUNT(*) FROM users;"
+        )
+        $legacyUsers = ($legacyResult.Output -join "`n").Trim()
+        if ($legacyResult.ExitCode -eq 0 -and $legacyUsers -and [int]$legacyUsers -ge 1) {
+            Write-Host "Found legacy WSL standalone data; it will be migrated by the launcher."
+            $needsAdmin = $false
+        }
+    }
+    if ($needsAdmin) {
         Write-Host "No administrator exists yet; running interactive bootstrap."
         $needsBootstrap = $true
     }
@@ -170,6 +196,7 @@ $arguments = @{
     HarnessUser = $HarnessUser
     BackendPort = $BackendPort
     FrontendPort = $FrontendPort
+    HarnessHostHome = $runtime.Root
 }
 if ($needsBootstrap) {
     $arguments.Bootstrap = $true

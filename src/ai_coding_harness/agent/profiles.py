@@ -2,8 +2,7 @@
 
 意图是**逐轮**判定的（``server/intent.py``），智能体则按 ``(会话, 形态)`` 缓存
 （见 ``session/manager.py``）—— 所以这里管的是**构建期**差异。像「本轮先派 planner」
-「等用户决定修哪些问题」那类**当轮**要求不在这里，仍由 ``prompts.intent_directive``
-逐次注入。两者互补，别把一边的东西搬到另一边。
+「等用户决定修哪些问题」那类**当轮**要求不在这里；动态任务状态由服务端注入。
 
 **只有一个轴：形态（form）**。形态同时定下三件事 —— 挂哪些子智能体、主控拿哪些主工具
 （``tools/register.py`` 按它选）、主控用哪套角色提示词（``prompts._MAIN_PROMPTS``）。
@@ -49,26 +48,12 @@ _PROFILES: dict[str, AgentProfile] = {
     "coding": AgentProfile(ORCHESTRATE_FORM, subagents=_SUBAGENT_ORDER),
 }
 
-#: 与某个已有意图**共用同一份装配**的意图。唯一一例：``rework``（PR 跟进）复用
-#: ``coding`` 的全流程 —— 要改的代码一样、要走的环路一样（coder 改 → reviewer 审），差别
-#: 只在逐轮意图指令。开 / 关 PR 的状态候选已经在分类前收口，记忆中间件只负责注入。
-#:
-#: 共用是**有意**的，所以写成显式登记，而不是再抄一份同形 profile：抄一份就会漂，而形态一
-#: 漂，工具子集与角色提示词跟着一起漂（缓存键正是形态名）。反过来，真要给 rework 不同的
-#: 工具或提示词，就得把它从这张表里摘出去、单开一种形态。
-#:
-FORM_ALIASES: dict[str, str] = {"rework": "coding"}
-
-# 别名在 ``_PROFILES`` 建好之后再挂上 —— 共用必须是**同一个对象**，不能是两条内容相同的
-# 记录（``TestProfiles`` 钉着「rework 与 coding 拿到的是同一份装配」）。
-_PROFILES.update({alias: _PROFILES[target] for alias, target in FORM_ALIASES.items()})
-
 # 不知道用户要干什么时的兜底：少给能力的代价（这轮做不了）比多给更难挽回。
 _FULL = _PROFILES["coding"]
 
-# 有专属装配的意图（含 `FORM_ALIASES` 里的别名）。与 ``server/intent.py`` 的 ``TASK_TYPES``
-# 对表：新增意图若忘了在这里登记，它会**静默**落到全量装配（挂着 create_pr 与三个子智能体）
-# —— 正是本次要去掉的那种误选。
+# 有专属装配的意图。与 ``server/intent.py`` 的 ``TASK_TYPES`` 对表：新增意图若忘了
+# 在这里登记，它会**静默**落到全量装配（挂着 create_pr 与三个子智能体）—— 正是本次
+# 要去掉的那种误选。
 PROFILED_INTENTS: frozenset[str] = frozenset(_PROFILES)
 
 
@@ -78,8 +63,7 @@ def profile_for(intent: str | None) -> AgentProfile:
     未知意图按**全量**装配：不知道用户要干什么时，少给能力的代价（这轮做不了）比
     多给能力的代价（可能误用）更难挽回。
 
-    别名意图（``FORM_ALIASES``）拿到的是被复用那一份**同一个对象** —— 形态相同即装配相同，
-    而形态正是 ``SessionManager`` 的缓存键，所以同一会话里 coding 与 rework 共用同一个
-    主智能体实例（提示词、工具、子智能体都对得上）。
+    所有写代码、审查 PR 和修复 PR 的工作都进入 coding 形态；主控根据 work task
+    决定派 reviewer 还是 coder。
     """
     return _PROFILES.get(intent or "", _FULL)

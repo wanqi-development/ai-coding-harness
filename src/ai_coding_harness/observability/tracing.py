@@ -10,4 +10,4 @@ from ai_coding_harness.config import Settings
 
 def setup_tracing(settings: Settings) -> None:
     """预留：接入 LangSmith / OpenTelemetry 的入口点。"""
-    return None
+    return

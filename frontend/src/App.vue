@@ -8,6 +8,8 @@ import {
   ensureWorkspace,
   getRecords,
   getClarification,
+  getGitApproval,
+  resolveGitApproval,
   getSession,
   getAuthConfig,
   getAuthMe,
@@ -20,7 +22,9 @@ import {
   type ChatEvent,
   type ClarificationAnswer,
   type ClarificationInfo,
+  type GitApprovalInfo,
   type PlanInfo,
+  type ReviewInfo,
   type PlanStep,
   type RecordItem,
   type SessionItem,
@@ -40,20 +44,22 @@ import PrPanel from './components/panels/PrPanel.vue'
 import UsagePanel from './components/panels/UsagePanel.vue'
 import RepoPanel from './components/panels/RepoPanel.vue'
 import ChangesPanel from './components/panels/ChangesPanel.vue'
+import ReviewCard from './components/ReviewCard.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
 import ClarificationDialog from './components/ClarificationDialog.vue'
+import GitApprovalDialog from './components/GitApprovalDialog.vue'
 import HandoffRun from './components/HandoffRun.vue'
 import LoginPage from './components/LoginPage.vue'
 import PasswordChangeGate from './components/PasswordChangeGate.vue'
-import { defaultPanelTab } from './lib/prefs'
 import { usePanelWidth } from './lib/splitter'
 import { splitLongText } from './lib/streamblocks'
 import { clarificationAnswerLabels, clarificationSteps } from './lib/clarification'
 import { applyRunTrace, createRunTree, type RunTree } from './lib/runs'
 import { shouldShowTodos } from './lib/todos'
 import { readView, watchView, writeView, type AppView, type SettingsPanel } from './lib/viewState'
+import { draftFor, withDraft, type SessionDrafts } from './lib/sessionDrafts'
 
-/** AI 消息里的三种块；用户消息恒为单个 text 块。待办树固定渲染在回复最下边。 */
+/** AI 消息里的结构化块；用户消息恒为单个 text 块。待办树固定渲染在回复最下边。 */
 type Part =
   /** `sealed` = 这块已经写完，不会再变（流式分块用，见 streamblocks.ts）。 */
   | { kind: 'text'; content: string; sealed?: boolean }
@@ -67,6 +73,7 @@ type Part =
    * SSE 的 `plan` 事件，刷新后那条来自落库的 `type='plan'` 记录，两边形状一样。
    */
   | { kind: 'plan'; plan: PlanInfo }
+  | { kind: 'review'; review: ReviewInfo }
   | { kind: 'handoff'; tree: RunTree }
 
 interface Message {
@@ -309,11 +316,11 @@ function pushText(parts: Part[], text: string) {
  * 后端也是这么攒的（树排在正文之后），所以这里没有块号、也不需要块号。
  */
 function pushTodos(parts: Part[], items: TodoItem[]) {
-  for (const p of parts) {
-    if (p.kind === 'todos') {
-      p.items = items
-      return
-    }
+  const index = parts.findIndex((part) => part.kind === 'todos')
+  if (index >= 0) {
+    // 替换整个 part，避免只改嵌套数组后订阅回调停留在旧渲染结果。
+    parts[index] = { kind: 'todos', items }
+    return
   }
   parts.push({ kind: 'todos', items })
 }
@@ -339,6 +346,14 @@ function pushPlan(parts: Part[], info: PlanInfo | null) {
   }
   if (at >= 0) (parts[at] as { kind: 'plan'; plan: PlanInfo }).plan = info
   else parts.push({ kind: 'plan', plan: info })
+}
+
+function pushReview(parts: Part[], review: ReviewInfo) {
+  const index = parts.findIndex(
+    (part) => part.kind === 'review' && part.review.review_id === review.review_id,
+  )
+  if (index >= 0) parts[index] = { kind: 'review', review }
+  else parts.push({ kind: 'review', review })
 }
 
 function pushRun(parts: Part[], trace: import('./lib/api').RunTrace) {
@@ -413,6 +428,20 @@ function planProgress(m: Message): string {
   const info = planPart(m)
   if (!info || !info.steps.length) return ''
   return `已完成 ${planDone(info)}/${info.steps.length}`
+}
+
+function reviewParts(m: Message): ReviewInfo[] {
+  return m.parts.filter((part): part is Extract<Part, { kind: 'review' }> =>
+    part.kind === 'review',
+  ).map((part) => part.review)
+}
+
+function requestCreatePr(review: ReviewInfo): void {
+  if (loading.value || !workspaceReady.value || !currentId.value) return
+  input.value =
+    `请基于当前代码任务创建 PR（最近一次 review_id=${review.review_id}）；` +
+    '随后对最终 PR Diff 做正式审查，并明确提醒我合并以完成本阶段任务。'
+  void send()
 }
 
 /** 取一条消息的待办树（没有就是空数组）。 */
@@ -573,6 +602,22 @@ const sessions = ref<SessionItem[]>([])
 const currentId = ref<string>('')
 const messages = ref<Message[]>([])
 /**
+ * 输入草稿按会话隔离。
+ *
+ * 这里不能用一个全局字符串：切换会话时它会把 A 会话写到一半的内容带到 B。草稿只活在
+ * 当前页面内存里，不写 localStorage，避免共享浏览器或多标签页时把内容串到别的账号/会话。
+ */
+const composerDrafts = ref<SessionDrafts>({})
+
+function setComposerDraft(sessionId: string, value: string) {
+  composerDrafts.value = withDraft(composerDrafts.value, sessionId, value)
+}
+
+function clearComposerDraft(sessionId: string) {
+  setComposerDraft(sessionId, '')
+}
+
+/**
  * 首屏只渲染最近这么多条，更早的点「显示更早」再往前放。
  *
  * 一条回复动辄几 KB，180 条的会话就是 270 KB 级的 DOM；它同时抬着两笔成本 —— 打开会话时
@@ -628,10 +673,38 @@ async function loadOlder() {
     loadingOlder.value = false
   }
 }
-const input = ref('')
+const input = computed({
+  get: () => {
+    const id = currentId.value
+    return draftFor(composerDrafts.value, id)
+  },
+  set: (value: string) => setComposerDraft(currentId.value, value),
+})
 /** 输入框高度随内容长（1→6 行）；超过 6 行框内滚动。 */
 const composerInput = ref<HTMLTextAreaElement | null>(null)
+const composerComposing = ref(false)
 const COMPOSER_MAX_LINES = 6
+
+/** Clear the active session draft and the textarea DOM in the same turn. */
+function clearComposer(sessionId: string) {
+  clearComposerDraft(sessionId)
+  if (currentId.value === sessionId && composerInput.value) {
+    composerInput.value.value = ''
+  }
+}
+
+/**
+ * Enter sends; IME confirm Enter stays inside the textarea.
+ *
+ * `isComposing` and the explicit composition flag cover both Chromium's
+ * pre-`compositionend` keydown and browsers that keep the flag stale.
+ */
+function onComposerEnter(event: KeyboardEvent) {
+  if (event.isComposing || composerComposing.value) return
+  event.preventDefault()
+  void send()
+}
+
 function fitComposer() {
   const el = composerInput.value
   if (!el) return
@@ -659,12 +732,31 @@ const nextBeforeId = ref<number | null>(null)
 /** 当前要展示的澄清弹窗；null = 没有（或用户已经关掉）。 */
 const clarification = ref<ClarificationInfo | null>(null)
 const clarificationBusy = ref(false)
+const gitApproval = ref<GitApprovalInfo | null>(null)
+const gitApprovalBusy = ref(false)
+const gitApprovalOpen = ref(false)
 // 输入框上方那条快捷动作：默认收起（见模板处的说明）
 const quickOpen = ref(false)
 // 这一轮流是「用户自己喊停」的吗：本地据此补终止标记，并抑制 abort 带出来的那行「错误」
 const stopping = ref(false)
 // 当前流的本地中断句柄：点终止时 abort 它，本地立刻松手，不等后端收尾
 let streamAbort: AbortController | null = null
+let streamSessionId = ''
+let streamGeneration = 0
+
+/**
+ * 主动放弃当前订阅。
+ *
+ * 浏览器对同一 HTTP/1.1 源只有约 6 条连接；重复 attach 同一轮会占满长连接，
+ * 右侧面板的普通接口就只能在浏览器里 pending。切会话、回首页和卸载时必须先断。
+ */
+function abortCurrentStream(): void {
+  const controller = streamAbort
+  streamAbort = null
+  streamSessionId = ''
+  streamGeneration += 1
+  controller?.abort()
+}
 
 /** 与后端 `service.CANCELLED_BY_USER` 同一句 —— 本地补的标记要和落库的正文一致 */
 const TERMINATED = '〔已由用户终止〕'
@@ -726,9 +818,8 @@ const {
   invert: true,
 })
 
-// 右侧栏：代码 / 记忆 / PR / 日志 / Token。初始标签来自设置页的「基本设置」
-// （本机偏好，见 prefs.ts）；之后点标签照旧自由切，不再回写那个偏好。
-const rightTab = ref<'code' | 'memory' | 'pulls' | 'logs' | 'usage'>(defaultPanelTab.value)
+// 右侧栏：代码 / 记忆 / PR / 日志 / Token。初始固定为代码，之后可自由切换。
+const rightTab = ref<'code' | 'memory' | 'pulls' | 'logs' | 'usage'>('code')
 // 方案链接里展开的步骤（按 index 记）：随会话切换重置
 const expandedSteps = ref<number[]>([])
 // 右侧栏「全屏」（面板盖满整个窗口）：临时状态，不持久化
@@ -867,6 +958,7 @@ async function leaveWorkspace() {
     messages.value = []
     sessions.value = []
     currentId.value = ''
+    composerDrafts.value = {}
   }
 }
 
@@ -1016,6 +1108,8 @@ function retryWorkspace() {
 }
 
 function startNewChat() {
+  abortCurrentStream()
+  stopping.value = false
   // 记住「停在新建对话页」；同时清掉上次会话，免得下次加载又把它打开
   writePref(NEW_CHAT_KEY, '1')
   writePref(LAST_SESSION_KEY, '')
@@ -1079,6 +1173,17 @@ function recordToMessage(r: RecordItem): Message | null {
       recordId: r.id,
     }
   }
+  if (r.type === 'review') {
+    const review = r.extra?.review as ReviewInfo | undefined
+    return review
+      ? {
+          role: 'assistant',
+          parts: [{ kind: 'review', review }],
+          at: r.created_at,
+          recordId: r.id,
+        }
+      : null
+  }
   if (r.type !== 'user' && r.type !== 'assistant') return null
   return {
     role: r.type === 'user' ? 'user' : 'assistant',
@@ -1118,6 +1223,8 @@ function fillElapsedFromUser(items: Message[]): void {
 }
 
 async function openSession(id: string) {
+  abortCurrentStream()
+  stopping.value = false
   // 记住这次打开的会话（初次加载就用它恢复）
   writePref(LAST_SESSION_KEY, id)
   writePref(NEW_CHAT_KEY, '')
@@ -1128,6 +1235,8 @@ async function openSession(id: string) {
   // 换会话就把「显示更早」的展开量收回默认值
   visibleTail.value = VISIBLE_TAIL
   clarification.value = null
+  gitApproval.value = null
+  gitApprovalOpen.value = false
   resetPanels()
   resetWorkspace()
   // 上一个会话的流若还在收尾，它的 finally 不会再碰 loading（会话号对不上了）；这里复位，
@@ -1141,15 +1250,29 @@ async function openSession(id: string) {
   const records = page.items
   hasMoreHistory.value = page.has_more
   nextBeforeId.value = page.next_before_id
-  // 三类记录进聊天流：用户 / 助手 / **方案**（方案以链接形式出现，见 planFromRecord）
+  // 用户 / 助手 / 方案 / 审查都进聊天流；方案与审查以链接卡片出现。
   messages.value = records
-    .filter((r) => r.type === 'user' || r.type === 'assistant' || r.type === 'plan')
+    .filter(
+      (r) =>
+        r.type === 'user' ||
+        r.type === 'assistant' ||
+        r.type === 'plan' ||
+        r.type === 'review',
+    )
     .map((r) => {
       if (r.type === 'plan') {
         const plan = planFromRecord(r)
         return {
           role: 'assistant' as const,
           parts: plan ? [{ kind: 'plan' as const, plan }] : [],
+          at: r.created_at,
+        }
+      }
+      if (r.type === 'review') {
+        const review = r.extra?.review as ReviewInfo | undefined
+        return {
+          role: 'assistant' as const,
+          parts: review ? [{ kind: 'review' as const, review }] : [],
           at: r.created_at,
         }
       }
@@ -1163,7 +1286,7 @@ async function openSession(id: string) {
         changes: (r.extra?.changes as ChangesInfo | undefined) ?? undefined,
       }
     })
-    // 方案记录万一缺 plan_id（老数据）会映射成空块：丢掉它，别留一条空消息
+    // 方案 / 审查记录缺结构化载荷时映射成空块：丢掉它，别留空消息。
     .filter((m) => m.parts.length)
   fillElapsedFromUser(messages.value)
   visibleTail.value = VISIBLE_TAIL
@@ -1172,6 +1295,13 @@ async function openSession(id: string) {
     clarification.value = await getClarification(id)
   } catch {
     clarification.value = null
+  }
+  try {
+    gitApproval.value = await getGitApproval(id)
+    gitApprovalOpen.value = gitApproval.value !== null
+  } catch {
+    gitApproval.value = null
+    gitApprovalOpen.value = false
   }
   // 刷新时这一轮还在跑：库里的记录还没有它（收尾才落库），得接回直播流
   if (detail?.running) void attachRunning(id)
@@ -1185,6 +1315,7 @@ async function openSession(id: string) {
 
 async function removeSession(id: string) {
   await destroySession(id)
+  clearComposer(id)
   if (currentId.value === id) {
     writePref(LAST_SESSION_KEY, '')
     currentId.value = ''
@@ -1498,6 +1629,8 @@ function attachStream(msg: Message) {
     } else if (ev.type === 'todos') {
       // 待办树永远画在正文下面，这里不用抢在正文前头落地
       pushTodos(msg.parts, ev.items ?? [])
+      // todo 帧可能前后没有 text/reasoning 分片；必须主动进入同一渲染调度。
+      schedule()
     } else if (ev.type === 'tool') {
       // 委派帧带了角色就先按角色说（「正在编码」），其余照工具名说，不认识再退回泛化文案
       activity.value =
@@ -1505,6 +1638,9 @@ function attachStream(msg: Message) {
     } else if (ev.type === 'plan') {
       // 后端每次推的都是全量快照：同一份方案只占一块，就地替换（`plan: null` = 方案被删）
       pushPlan(msg.parts, ev.plan ?? null)
+    } else if (ev.type === 'review' && ev.review) {
+      pushReview(msg.parts, ev.review)
+      schedule()
     } else if (ev.type === 'run' && ev.run) {
       pushRun(msg.parts, ev.run)
     } else if (ev.type === 'usage') {
@@ -1517,6 +1653,10 @@ function attachStream(msg: Message) {
     } else if (ev.type === 'clarification') {
       clarification.value = ev.clarification ?? null
       activity.value = '等待确认'
+    } else if (ev.type === 'approval' && ev.approval) {
+      gitApproval.value = ev.approval
+      gitApprovalOpen.value = true
+      activity.value = '等待 Git 操作确认'
     } else if (ev.type === 'error') {
       append(`\n[错误] ${ev.error}`)
     }
@@ -1530,8 +1670,16 @@ function attachStream(msg: Message) {
  * 帧的落点按会话号守着：中途切走会话就不再往这条消息里塞（它已经不在屏幕上了），
  * 也别去碰新会话的 loading —— 那是新会话自己的事。
  */
-async function runStream(id: string, resp: Response, msg: Message, signal?: AbortSignal) {
+async function runStream(
+  id: string,
+  resp: Response,
+  msg: Message,
+  generation: number,
+  signal?: AbortSignal,
+) {
   const { onEvent, flush, append } = attachStream(msg)
+  const isCurrent = () =>
+    generation === streamGeneration && currentId.value === id
   const previousAssistantId =
     [...messages.value]
       .reverse()
@@ -1552,7 +1700,7 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
     if (!stopping.value) append(`\n[错误] ${e.message ?? e}`)
   } finally {
     // 后台真被终止了，正文尾巴上补一句 —— 与落库的那条记录同一句，刷新前后看到的一样
-    if (stopping.value && currentId.value === id) append(`\n\n${TERMINATED}`)
+    if (stopping.value && isCurrent()) append(`\n\n${TERMINATED}`)
     // 收尾必须刷一次，否则最后一批会卡在定时器里
     flush()
     // 数据库是这一轮的最终事实来源：正常拿完 done 后回填持久化记录；没拿到 done
@@ -1577,7 +1725,7 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
       }
       const at = messages.value.indexOf(msg)
       if (at >= 0) messages.value[at] = persisted
-    } else if (!completed && !stopping.value && currentId.value === id) {
+    } else if (!completed && !stopping.value && isCurrent()) {
       append('\n\n[连接在完成帧前中断，本轮可能仍在后台运行。请刷新页面接回。]')
     }
     // AI 那条的时间＝流结束时刻（失败/中断也补上，否则这条会一直没有时间）
@@ -1586,7 +1734,7 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
       // 计时收尾：从开跑那一刻算起，冻结下来（之后刷新回放也照实显示这个数）
       if (msg.startedAt) msg.elapsedMs = Date.now() - msg.startedAt
     }
-    if (currentId.value === id) {
+    if (isCurrent()) {
       loading.value = false
       scrollToBottom()
     }
@@ -1595,6 +1743,7 @@ async function runStream(id: string, resp: Response, msg: Message, signal?: Abor
     if (streamAbort?.signal === signal) {
       stopping.value = false
       streamAbort = null
+      streamSessionId = ''
     }
   }
 }
@@ -1645,7 +1794,7 @@ async function sendTurn(choice?: { info: ClarificationInfo; answers: Clarificati
   // 先渲染、再去拿流：POST 的 await 要一直挂到后端把响应头发回来，等它回来才 push 的话，
   // 用户会以为没发出去而重发；而 loading 也还没置上、按钮尚未禁用，第二次点击真能发出去 ——
   // 后端那一轮已经在跑，于是收到 409。渲染与置 loading 都提前，这两个毛病一起消掉。
-  input.value = ''
+  clearComposerDraft(id)
   // 用户那条的时间＝发送时刻；AI 那条等流结束再补，与后端「回合收尾才写记录」对齐
   messages.value.push({ role: 'user', parts: [{ kind: 'text', content: displayText }], at: new Date().toISOString() })
   // 计时从这一下开始（用户口径：自己发的那轮就直接计时）
@@ -1660,6 +1809,8 @@ async function sendTurn(choice?: { info: ClarificationInfo; answers: Clarificati
   // 本轮的本地中断句柄：终止按钮拿它 abort（后端那一份由 cancelChat 负责）
   const controller = new AbortController()
   streamAbort = controller
+  streamSessionId = id
+  const generation = ++streamGeneration
   try {
     resp = await postChat(
       id,
@@ -1673,7 +1824,16 @@ async function sendTurn(choice?: { info: ClarificationInfo; answers: Clarificati
         : undefined,
     )
   } catch (e: any) {
-    if (streamAbort === controller) streamAbort = null
+    if (streamAbort === controller) {
+      streamAbort = null
+      streamSessionId = ''
+    }
+    // 用户可能在 POST 返回前就切到了另一个会话。此时不能动当前页面的消息和输入框；
+    // 只把失败内容还原到发起请求的那个会话草稿里。
+    if (currentId.value !== id) {
+      setComposerDraft(id, text)
+      return
+    }
     // 用户点的是终止（响应头还没回来就点了）：这不是发送失败 —— 别摘掉刚放上去的两条消息、
     // 也别弹窗。那一条用户消息后端大概率已经收下（刷新后历史上看得到），本地这轮就停在
     // 这里：AI 那条只留终止标记，跟库里那条记录对得上。
@@ -1689,7 +1849,7 @@ async function sendTurn(choice?: { info: ClarificationInfo; answers: Clarificati
     // loading 期间输入框与按钮都是禁用的，末尾这两条不会被别人动过，按下标摘是安全的。
     messages.value.splice(messages.value.length - 2, 2)
     if (choice) clarification.value = choice.info
-    else input.value = text
+    else setComposerDraft(id, text)
     loading.value = false
     // 409 的两种成因状态码相同，靠 running 区分（见 isRunInProgress）：本轮真在跑就接回它，
     // 用户那条后端没收到，所以内容留在输入框里，等这一轮完了他自己再发一次；
@@ -1701,11 +1861,26 @@ async function sendTurn(choice?: { info: ClarificationInfo; answers: Clarificati
     alert(e.message ?? '发送失败')
     return
   }
-  await runStream(id, resp, msg, controller.signal)
+  await runStream(id, resp, msg, generation, controller.signal)
 }
 
 async function send() {
   await sendTurn()
+}
+
+async function submitGitApproval(choice: string) {
+  const info = gitApproval.value
+  if (!info || gitApprovalBusy.value || !currentId.value) return
+  gitApprovalBusy.value = true
+  try {
+    await resolveGitApproval(currentId.value, info.approval_id, choice)
+    gitApproval.value = null
+    gitApprovalOpen.value = false
+  } catch (e: any) {
+    setNotice(`Git 操作审批失败：${e?.message ?? e}`)
+  } finally {
+    gitApprovalBusy.value = false
+  }
 }
 
 function submitClarification(answers: ClarificationAnswer[]) {
@@ -1756,17 +1931,28 @@ async function stopRun() {
  * 用户那条已经在 `/records` 里了，只补一条 assistant 消息接住重放的帧。
  */
 async function attachRunning(id: string) {
+  if (streamAbort && streamSessionId === id && !streamAbort.signal.aborted) return
+  if (streamAbort) abortCurrentStream()
   // 接回来的流同样可终止：刷新断的只是订阅，后端那一轮还在跑
   const controller = new AbortController()
+  streamAbort = controller
+  streamSessionId = id
+  const generation = ++streamGeneration
   let resp: Response
   try {
     resp = await resumeChat(id, 0, controller.signal)
   } catch {
+    if (streamAbort === controller) {
+      streamAbort = null
+      streamSessionId = ''
+    }
     // 接不上就当没有直播，读库那条路照样把历史显示出来，不打断「打开会话」
     return
   }
-  if (currentId.value !== id) return
-  streamAbort = controller
+  if (currentId.value !== id) {
+    controller.abort()
+    return
+  }
   // 重新打开时这一轮**已经在跑**：起点取**用户那条消息的时间** —— 于是计时器显示的是
   // 「这一轮已经跑了多久」，而不是「我看了多久」（用户口径：不需要很精确）
   const lastUser = [...messages.value].reverse().find((item) => item.role === 'user')
@@ -1781,16 +1967,18 @@ async function attachRunning(id: string) {
   loading.value = true
   activity.value = '正在接续本轮'
   scrollToBottom()
-  await runStream(id, resp, msg, controller.signal)
+  await runStream(id, resp, msg, generation, controller.signal)
 }
 
 // 初次加载：先拉会话列表，再恢复上次的页面（见 restoreLastView）
 setUnauthorizedHandler(() => {
+  abortCurrentStream()
   authUser.value = null
   authReady.value = true
   messages.value = []
   sessions.value = []
   currentId.value = ''
+  composerDrafts.value = {}
 })
 
 onMounted(() => {
@@ -1820,6 +2008,7 @@ watch(loading, (on) => {
 
 onUnmounted(() => {
   // 卸载时停掉轮询：定时器持有组件闭包，不停会在切页后继续打接口
+  abortCurrentStream()
   stopWorkspacePoll()
   if (tickTimer) clearInterval(tickTimer)
   unwatchView()
@@ -2047,6 +2236,12 @@ onUnmounted(() => {
                 <div v-else class="streaming-plain">{{ groupText(entry.parts) }}</div>
               </div>
             </template>
+            <ReviewCard
+              v-for="(review, ri) in reviewParts(m)"
+              :key="`review:${review.review_id}:${ri}`"
+              :review="review"
+              @create-pr="requestCreatePr"
+            />
             <!-- 待办树固定画在正文下面：它表示「现在什么状态」，不是「说到哪儿了」。
                  整棵全完成、且这一轮已收尾就不画（见 showsTodos）—— 那份全绿清单只是噪音，
                  没做完才要留着；空列表是「参数还没流完」的中间态，也不占位 -->
@@ -2270,6 +2465,14 @@ onUnmounted(() => {
       </div>
       <!-- 输入区 -->
       <div v-if="!pendingRepo" class="composer">
+        <button
+          v-if="gitApproval && !gitApprovalOpen"
+          class="git-approval-reopen"
+          type="button"
+          @click="gitApprovalOpen = true"
+        >
+          有待确认的 Git 操作 · 打开审批
+        </button>
         <textarea
           v-model="input"
           ref="composerInput"
@@ -2277,7 +2480,9 @@ onUnmounted(() => {
           rows="1"
           placeholder="给 ai-coding-harness 发送消息…"
           :disabled="!currentId || loading || !workspaceReady"
-          @keydown.enter.exact.prevent="send"
+          @compositionstart="composerComposing = true"
+          @compositionend="composerComposing = false"
+          @keydown.enter.exact="onComposerEnter"
         />
         <!-- 正在跑时这一格换成「终止」：停的是本轮，会话与已产出的内容都留着 -->
         <button
@@ -2449,6 +2654,14 @@ onUnmounted(() => {
       @submit="submitClarification"
       @other="otherClarification"
       @close="clarification = null"
+    />
+
+    <GitApprovalDialog
+      v-if="gitApproval && gitApprovalOpen"
+      :info="gitApproval"
+      :busy="gitApprovalBusy"
+      @resolve="submitGitApproval"
+      @close="gitApprovalOpen = false"
     />
 
     <div v-if="createError" class="modal-mask" @click.self="createError = ''">

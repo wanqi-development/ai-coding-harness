@@ -39,14 +39,13 @@ def _merged_value(
 def _same_key_scope(
     left_base_url: str,
     right_base_url: str,
-    metas: tuple[ProviderMeta, ...],
+    left_provider: str,
+    right_provider: str,
 ) -> bool:
     """Whether two rows point at the same provider endpoint."""
     left = left_base_url.strip().rstrip("/")
     right = right_base_url.strip().rstrip("/")
-    if not left or left != right:
-        return False
-    return provider_key_for(left, metas) == provider_key_for(right, metas)
+    return bool(left and left == right and left_provider == right_provider)
 
 
 def _reusable_key_source(
@@ -54,6 +53,7 @@ def _reusable_key_source(
     *,
     target_key: str,
     base_url: str,
+    provider: str,
     metas: tuple[ProviderMeta, ...],
 ) -> object | None:
     for agent, source in existing.items():
@@ -63,7 +63,9 @@ def _reusable_key_source(
             and _same_key_scope(
                 getattr(source, "base_url", "") or "",
                 base_url,
-                metas,
+                str(getattr(source, "provider", "") or "")
+                or provider_key_for(getattr(source, "base_url", "") or "", metas),
+                provider,
             )
         ):
             return source
@@ -124,6 +126,13 @@ async def put_model_config(
                 "model": _merged_value(fields, current, "model", "model_name"),
                 "base_url": _merged_value(fields, current, "base_url", "base_url"),
                 "api_key": _merged_value(fields, current, "api_key", "api_key"),
+                "provider": (
+                    _merged_value(fields, current, "provider", "provider")
+                    or provider_key_for(
+                        _merged_value(fields, current, "base_url", "base_url"),
+                        metas,
+                    )
+                ),
             }
             api_key_write = fields.get("api_key")
             api_key_from = str(fields.get("api_key_from") or "").strip()
@@ -140,7 +149,9 @@ async def put_model_config(
                 if not _same_key_scope(
                     getattr(source, "base_url", "") or "",
                     values["base_url"],
-                    metas,
+                    str(getattr(source, "provider", "") or "")
+                    or provider_key_for(getattr(source, "base_url", "") or "", metas),
+                    values["provider"],
                 ):
                     raise HTTPException(
                         status_code=400,
@@ -151,6 +162,7 @@ async def put_model_config(
                     existing,
                     target_key=key,
                     base_url=values["base_url"],
+                    provider=values["provider"],
                     metas=metas,
                 )
             if source is not None:
@@ -178,6 +190,7 @@ async def put_model_config(
                 user_id=user_id,
                 agent=key,
                 base_url=fields.get("base_url"),
+                provider=fields.get("provider"),
                 model_name=fields.get("model"),
                 api_key=api_key_write,
                 context_window=fields.get("context_window"),

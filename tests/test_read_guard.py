@@ -83,7 +83,7 @@ class TestReadFile:
         assert isinstance(out, ToolMessage) and out.status == "error"
 
     async def test_tmp_and_memory_are_not_restricted(self):
-        for path in ("/ai_coding/tmp/evidence.md", "/memories/o/r.md"):
+        for path in ("/ai_coding/tmp/evidence.md", "/memories/o/r/index.md"):
             _out, handler = await _run("read_file", {"file_path": path})
             assert handler.calls == 1
 

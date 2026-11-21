@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import shlex
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -42,6 +44,7 @@ from ai_coding_harness.core.codeplatform import Platform, RepoSpec, parse_repo_u
 from ai_coding_harness.db import Database, dao
 from ai_coding_harness.infra.circuit import CircuitStore
 from ai_coding_harness.observability.logging import MAIN_AGENT
+from ai_coding_harness.safety.git_approval import GitApprovalContext
 from ai_coding_harness.safety.permissions import CommandSafety
 from ai_coding_harness.safety.policy import policy_for
 from ai_coding_harness.sandbox.factory import build_sandbox_provider
@@ -432,6 +435,61 @@ class SessionManager:
             self._abandon(pending)
         raise error or WorkspaceError("代码工作区创建失败")
 
+    async def capture_restart_recovery(self, session: Session) -> str | None:
+        """Persist uncommitted workspace work before a graceful process restart.
+
+        The volume remains the source of truth. This snapshot lives inside ``.git`` so
+        it neither dirties the worktree nor changes branch history; it gives operators
+        an auditable patch/status copy if a later sandbox rebuild loses the volume.
+        """
+        runtime = self._runtimes.get(session.public_id)
+        if runtime is None:
+            return None
+        repo_dir = (
+            f"{self._settings.sandbox_project_dir.rstrip('/')}/{session.repo.repo}"
+        )
+        command = f"""set -eu
+repo_dir={shlex.quote(repo_dir)}
+cd "$repo_dir"
+if [ -z "$(git status --porcelain)" ]; then
+  echo "__HARNESS_RECOVERY_CLEAN__"
+  exit 0
+fi
+recovery_dir=.git/harness-recovery
+mkdir -p "$recovery_dir"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
+git status --porcelain=v1 > "$recovery_dir/$stamp.status"
+git diff --binary > "$recovery_dir/$stamp.unstaged.patch"
+git diff --cached --binary > "$recovery_dir/$stamp.staged.patch"
+git rev-parse HEAD > "$recovery_dir/$stamp.head"
+echo "__HARNESS_RECOVERY_SAVED__ $recovery_dir/$stamp"
+"""
+        try:
+            result = await runtime.sandbox.run(
+                command,
+                timeout=timedelta(seconds=30),
+            )
+        except Exception:
+            logger.exception(
+                "重启前保存工作区快照失败：public_id=%s", session.public_id
+            )
+            return None
+        if not result.ok:
+            logger.warning(
+                "重启前保存工作区快照失败：public_id=%s %s",
+                session.public_id,
+                result.stderr or result.text,
+            )
+            return None
+        if "__HARNESS_RECOVERY_SAVED__" in result.text:
+            logger.info(
+                "重启前已保存工作区快照：public_id=%s %s",
+                session.public_id,
+                result.text.strip(),
+            )
+            return result.text.strip()
+        return None
+
     def _fallback_middleware(
         self, role: str, agent: str, user_id: int | None = None
     ) -> FallbackMiddleware | None:
@@ -468,6 +526,15 @@ class SessionManager:
         """
         settings = self.settings_for(session)
         user_id = getattr(session, "user_id", None)
+        repo_dir = (
+            f"{settings.sandbox_project_dir.rstrip('/')}/{session.repo.repo}"
+        )
+        git_approval = GitApprovalContext(
+            database=self._db,
+            session_id=session.db_id,
+            repo_dir=repo_dir,
+            backend=runtime.backend,
+        )
         plan_ctx = PlanContext(
             session_db_id=session.db_id,
             owner=session.repo.owner,
@@ -498,7 +565,7 @@ class SessionManager:
             tools_by_role={
                 role: build_subagent_tools(
                     role, settings, self._web_search, self._fetch_url,
-                    session.repo, self._db, plan_ctx,
+                    session.repo, self._db, plan_ctx, runtime.backend,
                 )
                 for role in profile.subagents
             },
@@ -507,6 +574,7 @@ class SessionManager:
                 role: policy_for(role, settings) for role in profile.subagents
             },
             safety=self._safety,
+            git_approval=git_approval,
             fallbacks={
                 role: fb
                 for role in profile.subagents
@@ -543,6 +611,7 @@ class SessionManager:
             # 边界按**形态**取（与模型、主工具同一根轴），子智能体按角色各取一份
             policy=policy_for(profile.form, settings),
             safety=self._safety,
+            git_approval=git_approval,
             fallback=self._fallback_middleware(profile.form, MAIN_AGENT, user_id),
             # 记忆：所有形态都挂 —— 每轮开始把记忆全文注入系统提示，模型不必再读一遍。
             # ``build_memory_middleware`` 按形态判要不要带闸门：plan / coding 两个主控
