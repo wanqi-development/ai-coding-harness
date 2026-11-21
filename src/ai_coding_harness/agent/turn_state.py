@@ -59,6 +59,7 @@ class TurnState:
         allowed_intents: Sequence[str] = (),
         plan_id: int | None = None,
         pr: int | None = None,
+        work_task_payload: Mapping[str, Any] | None = None,
     ) -> None:
         self.message = message
         self.history: tuple[str, ...] = tuple(history)
@@ -72,6 +73,16 @@ class TurnState:
         self.pr: int | None = pr
         #: 本轮正在处理的方案编号；由 plan 工具写入。
         self.plan_id: int | None = plan_id
+        #: 最近一次持久化审查；由 ``save_review`` 写入。
+        self.review_id: int | None = None
+        self.review_payload: dict[str, Any] | None = None
+        #: 本轮绑定 / 新建的代码任务；coder 派发与创建 PR 都以它为准。
+        self.work_task_id: int | None = None
+        self.work_task_payload: dict[str, Any] | None = (
+            dict(work_task_payload) if work_task_payload is not None else None
+        )
+        if self.work_task_payload is not None:
+            self.work_task_id = int(self.work_task_payload["task_id"])
         #: 重判意图的回调（``handoffTask`` 使用）。
         self.rejudge = rejudge
         self._counts: dict[str, int] = {}

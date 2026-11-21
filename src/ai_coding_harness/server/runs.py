@@ -32,6 +32,7 @@ from ai_coding_harness.server.run_store import (
     RunBuffer,
     RunLock,
 )
+from ai_coding_harness.server.text_batch import TextFrameBatcher
 
 if TYPE_CHECKING:
     from ai_coding_harness.server.service import HarnessService
@@ -56,6 +57,7 @@ class _Local:
     event: asyncio.Event = field(default_factory=asyncio.Event)
     done: bool = False
     watcher: asyncio.Task | None = None
+    session: Any = None
 
 
 class RunHub:
@@ -74,12 +76,18 @@ class RunHub:
         lock: RunLock | None = None,
         poll_interval: float = 0.2,
         renew_interval: float = 30.0,
+        wait_for_worker: bool = False,
+        text_batch_chars: int = 1,
+        text_batch_flush_seconds: float = 0.0,
     ) -> None:
         self._service = service
         self._buffer: RunBuffer = buffer or MemoryRunBuffer()
         self._lock: RunLock = lock or MemoryRunLock()
         self._poll = poll_interval
         self._renew_interval = renew_interval
+        self._wait_for_worker = wait_for_worker
+        self._text_batch_chars = max(1, int(text_batch_chars))
+        self._text_batch_flush_seconds = max(0.0, float(text_batch_flush_seconds))
         self._runs: dict[str, _Local] = {}
 
     # -- 启动 ---------------------------------------------------------------
@@ -92,6 +100,7 @@ class RunHub:
         clarification_id: str | None = None,
         choice: int | str | None = None,
         answers: list[dict[str, Any]] | None = None,
+        open_buffer: bool = True,
     ) -> None:
         """起一轮；同一会话已有在跑的轮次时抛 ``RunInProgress``。
 
@@ -104,8 +113,10 @@ class RunHub:
             raise RunInProgress(session_id)
         if not await self._lock.acquire(session_id):
             raise RunInProgress(session_id)
-        await self._buffer.open(session_id)
+        if open_buffer:
+            await self._buffer.open(session_id)
         run = _Local()
+        run.session = session
         self._runs[session_id] = run
         run.task = asyncio.create_task(
             self._pump(
@@ -142,6 +153,36 @@ class RunHub:
         ``session.public_id`` 现取 —— 两个来源在测试里就不相等，帧会写到没人读的键上
         （现象是订阅者永远等下去）。
         """
+        batcher = TextFrameBatcher(
+            max_chars=self._text_batch_chars,
+            flush_seconds=self._text_batch_flush_seconds,
+        )
+        batch_lock = asyncio.Lock()
+        flush_task: asyncio.Task[None] | None = None
+
+        async def append_frames(frames: list[dict[str, Any]]) -> None:
+            for frame in frames:
+                await self._buffer.append(session_id, frame)
+                run.event.set()
+
+        async def flush_after(delay: float) -> None:
+            await asyncio.sleep(delay)
+            async with batch_lock:
+                await append_frames(batcher.flush())
+
+        def schedule_flush() -> None:
+            nonlocal flush_task
+            delay = batcher.flush_delay()
+            if delay is None:
+                if flush_task is not None and not flush_task.done():
+                    flush_task.cancel()
+                return
+            if flush_task is None or flush_task.done():
+                flush_task = asyncio.create_task(
+                    flush_after(delay),
+                    name=f"flush-text:{session_id}",
+                )
+
         try:
             extra = {
                 key: value
@@ -153,18 +194,31 @@ class RunHub:
                 if value is not None
             }
             async for frame in self._service.chat(session, message, **extra):
-                await self._buffer.append(session_id, frame)
-                run.event.set()
+                async with batch_lock:
+                    await append_frames(batcher.push(frame))
+                    schedule_flush()
+            async with batch_lock:
+                if flush_task is not None and not flush_task.done():
+                    flush_task.cancel()
+                await append_frames(batcher.flush())
         except asyncio.CancelledError:
             raise  # 用户终止：不是故障，别吞（收尾在 finally）
         except Exception:
             # service.chat 自己接得住的地方（含 _run_agent）都会发 error 帧；走到这里说明
             # 它在更早处就炸了（意图分类、写用户记录）。原始文本不出口。
+            async with batch_lock:
+                if flush_task is not None and not flush_task.done():
+                    flush_task.cancel()
+                await append_frames(batcher.flush())
             logger.exception("本轮运行异常：public_id=%s", session_id)
             await self._buffer.append(
                 session_id, {"type": "error", "error": RUN_ERROR_MESSAGE}
             )
         finally:
+            if flush_task is not None:
+                if not flush_task.done():
+                    flush_task.cancel()
+                await asyncio.gather(flush_task, return_exceptions=True)
             # 收尾不能再抛：这里已经是无主的异步任务，抛出去只会变成一条
             # 「Task exception was never retrieved」的噪音（缓冲/锁自己会降级，不会上抛）
             try:
@@ -260,6 +314,9 @@ class RunHub:
                 # 重启）＝ 不会再有帧进来：直接收尾，别让**已经接上**的订阅者也跟着空转
                 # （理由同 ``is_running``）
                 if not await self._lock.held(session_id):
+                    if self._wait_for_worker:
+                        await asyncio.sleep(self._poll)
+                        continue
                     logger.warning("本轮已无持有者，订阅收尾：%s", session_id)
                     return
                 await asyncio.sleep(self._poll)
@@ -268,6 +325,35 @@ class RunHub:
     async def pending_clarification(self, session: Session) -> dict[str, Any] | None:
         """当前会话的待澄清项（刷新页面时前端恢复弹窗用）。"""
         return await self._service.pending_clarification(session)
+
+    async def pending_git_approval(
+        self, session: Session
+    ) -> dict[str, Any] | None:
+        data = await self._service.pending_git_approval(session)
+        if data is None:
+            return None
+        if not await self.is_running(session.public_id):
+            await self._service.expire_git_approval(
+                session, str(data["approval_id"])
+            )
+            return None
+        return data
+
+    async def resolve_git_approval(
+        self,
+        session: Session,
+        *,
+        approval_id: str,
+        choice: str,
+    ) -> dict[str, Any] | None:
+        if not await self.is_running(session.public_id):
+            await self._service.expire_git_approval(session, approval_id)
+            return None
+        return await self._service.resolve_git_approval(
+            session,
+            approval_id=approval_id,
+            choice=choice,
+        )
 
     async def is_running(self, session_id: str) -> bool:
         """这个会话现在有没有一轮在跑（本进程的、或别的 worker 的）。"""
@@ -286,6 +372,19 @@ class RunHub:
             logger.warning("本轮已无持有者（进程重启或被杀），按未在跑处理：%s", session_id)
             return False
         return True
+
+    async def wait(self, session_id: str) -> None:
+        """Wait for a locally started worker run to finish."""
+        local = self._runs.get(session_id)
+        if local is None or local.task is None:
+            return
+        await asyncio.shield(local.task)
+
+    async def fail_external_run(self, session_id: str, error: str) -> None:
+        """Terminate a gateway-created run that failed before a local task started."""
+        await self._buffer.append(session_id, {"type": "error", "error": error})
+        await self._buffer.append(session_id, {"type": "done"})
+        await self._buffer.finish(session_id)
 
     async def cancel(self, session_id: str) -> bool:
         """终止并丢弃某会话的运行（会话被删时、用户点「终止」时调用）。
@@ -313,7 +412,10 @@ class RunHub:
     async def shutdown(self) -> None:
         """进程退出前收掉所有在跑的轮次，别让它们在后端已经拆池子时还去写库。"""
         tasks: list[asyncio.Task] = []
+        sessions: list[Any] = []
         for session_id, run in list(self._runs.items()):
+            if run.session is not None:
+                sessions.append(run.session)
             if run.watcher is not None and not run.watcher.done():
                 run.watcher.cancel()
             if run.task is not None and not run.task.done():
@@ -324,3 +426,7 @@ class RunHub:
         self._runs.clear()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        capture = getattr(self._service, "capture_restart_recovery", None)
+        if capture is not None:
+            for session in sessions:
+                await capture(session)

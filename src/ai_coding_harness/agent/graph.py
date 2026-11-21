@@ -24,18 +24,20 @@ from ai_coding_harness.agent.middleware import (
     DelegationGateMiddleware,
     FallbackMiddleware,
     HistoryRepairMiddleware,
-    IntentMiddleware,
     LoopGuardMiddleware,
     MemoryMiddleware,
     ModelRedactionMiddleware,
     PlanRecoveryMiddleware,
     ReadGuardMiddleware,
+    ReasoningHistoryMiddleware,
     RedactionMiddleware,
     StreamUsageMiddleware,
     ToolCallIdMiddleware,
     ToolErrorGuardMiddleware,
+    TurnContextMiddleware,
 )
 from ai_coding_harness.observability.logging import MAIN_AGENT, MAIN_AGENT_NAME
+from ai_coding_harness.safety.git_approval import GitApprovalContext
 from ai_coding_harness.safety.permissions import CommandSafety
 from ai_coding_harness.safety.policy import AgentPolicy
 
@@ -71,6 +73,7 @@ def build_agent(
     system_prompt: str,
     policy: AgentPolicy,
     safety: CommandSafety | None = None,
+    git_approval: GitApprovalContext | None = None,
     fallback: FallbackMiddleware | None = None,
     memory: MemoryMiddleware | None = None,
     plan_recovery: PlanRecoveryMiddleware | None = None,
@@ -90,9 +93,9 @@ def build_agent(
     用的是同一份规则。
 
     ``fallback`` 是兜底中间件（``None`` ＝ 本形态没有兜底，见 ``llm.build_fallback``）。
-    它挂在这批的**最内侧**：降级重试跑的是它自己的内层 handler，不该把我们的边界与脱敏
-    前处理再跑一遍；反过来，外层的 ``ModelRedactionMiddleware`` 因此永远看到「最终赢的
-    那个回答」，一次脱敏即覆盖所有模型来源。
+    它挂在这批主要中间件的内侧，与模型调用之间只保留 reasoning 清理和流式用量降级：
+    降级重试不该把边界与脱敏前处理再跑一遍；外层的 ``ModelRedactionMiddleware`` 因此
+    永远看到「最终赢的那个回答」，一次脱敏即覆盖所有模型来源。
 
     ``memory`` 是仓库记忆中间件（``None`` ＝ 这个智能体不看记忆，单测里会这么用）。
     所有智能体都该挂一份：它把记忆全文注入系统消息。主控形态那份还会在开工前按 Gitee
@@ -110,7 +113,7 @@ def build_agent(
         system_prompt=system_prompt,
         middleware=[
             # 放在我们这批的最外侧：越界的调用要在别的中间件动手之前就被拒掉
-            BoundaryMiddleware(policy, safety),
+            BoundaryMiddleware(policy, safety, git_approval),
             # 进入编码主控时先回收上一轮遗留的 executing 方案；正常退出时再兜底收口。
             *([plan_recovery] if plan_recovery is not None else []),
             # 紧接着的这块答的是「本轮看不看得到仓库记忆」：闸门那条路在 before_agent
@@ -126,16 +129,19 @@ def build_agent(
             # 那本身就是新信息），数的是「真的执行了、结果还一样」的那种原地打转
             LoopGuardMiddleware(agent=MAIN_AGENT),
             ToolCallIdMiddleware(),
-            IntentMiddleware(),
+            TurnContextMiddleware(),
             RedactionMiddleware(),
             ModelRedactionMiddleware(),
             ToolErrorGuardMiddleware(agent=MAIN_AGENT),
             HistoryRepairMiddleware(),
-            # 压缩（摘要）挂在最内侧、兜底的外面：兜底重试不该把压缩再跑一遍。
+            # 压缩（摘要）靠近模型调用、位于兜底外面：兜底重试不该把压缩再跑一遍。
             # 到压缩线时它先做一次应急工具裁剪（只保当前步骤），剪完低于线就不压。
             *([summarization] if summarization is not None else []),
-            # 兜底放在倒数第二层：它重试时不再重跑上面这几层
+            # 兜底位于主要中间件内侧：它重试时不再重跑上面这几层
             *([fallback] if fallback is not None else []),
+            # Reasoning 只用于当轮流式展示。跨模型、跨协议没有统一历史语
+            # 义，因此最靠近模型调用处统一剥离，兜底重试也走同一份请求。
+            ReasoningHistoryMiddleware(),
             # 比兜底还内一层：网关不认 stream_options 的 400 在这里就地重试，
             # 不让兜底把它误判成「主导模型挂了」而切模型。
             StreamUsageMiddleware(agent=MAIN_AGENT),
