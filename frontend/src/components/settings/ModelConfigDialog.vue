@@ -188,18 +188,18 @@ onMounted(() => firstField.value?.focus())
           >
             <optgroup v-for="group in grouped" :key="group.name" :label="group.name">
               <option v-for="item in group.items" :key="item.key" :value="item.key">
-                {{ item.label }}
+                {{ item.label }} · {{ item.protocol === 'anthropic_messages' ? 'Anthropic Messages' : 'OpenAI Compatible' }}
               </option>
             </optgroup>
             <option v-for="item in ungrouped" :key="item.key" :value="item.key">
-              {{ item.label }}
+              {{ item.label }} · {{ item.protocol === 'anthropic_messages' ? 'Anthropic Messages' : 'OpenAI Compatible' }}
             </option>
           </select>
           <span v-if="lockNote" class="field-note">{{ lockNote }}</span>
         </div>
 
         <div class="group">
-          <h3>base_url / api_key</h3>
+          <h3>API 连接</h3>
           <label class="field">
             <span class="field-label">
               base_url <span class="req">*</span>

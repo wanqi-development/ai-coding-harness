@@ -1,5 +1,5 @@
 /**
- * 本机界面偏好：外观（主题 / 代码字号 / 对话列宽）与基本设置（默认打开的右栏标签）。
+ * 本机界面偏好：外观（主题 / 代码字号 / 对话列宽）。
  *
  * **为什么存 localStorage**：这是本机、单人的显示偏好，后端没有「用户设置」表 ——
  * 为它加表 + 迁移 + 接口不划算，和栏宽同一口径（见 `splitter.ts`）。读写都容错：
@@ -12,7 +12,6 @@ import { ref } from 'vue'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 export type ChatWidth = 'compact' | 'standard' | 'wide'
-export type PanelTab = 'code' | 'memory' | 'pulls' | 'logs' | 'usage'
 
 /** 代码字号的可调范围（`--code-size` 的取值，单位 px）。 */
 export const CODE_SIZE = { min: 12, max: 16, default: 14 } as const
@@ -37,7 +36,6 @@ const KEY = {
   theme: 'ui.theme',
   codeSize: 'ui.codeSize',
   chatWidth: 'ui.chatWidth',
-  tab: 'ui.panelTab',
 } as const
 
 function read(key: string): string | null {
@@ -64,12 +62,6 @@ function asChatWidth(value: string | null): ChatWidth {
   return value === 'compact' || value === 'standard' || value === 'wide' ? value : 'standard'
 }
 
-function asTab(value: string | null): PanelTab {
-  return value === 'memory' || value === 'pulls' || value === 'logs' || value === 'usage'
-    ? value
-    : 'code'
-}
-
 function asCodeSize(value: string | null): number {
   const size = Number(value)
   if (!Number.isFinite(size)) return CODE_SIZE.default
@@ -79,8 +71,6 @@ function asCodeSize(value: string | null): number {
 export const themeMode = ref<ThemeMode>(asTheme(read(KEY.theme)))
 export const codeSize = ref<number>(asCodeSize(read(KEY.codeSize)))
 export const chatWidth = ref<ChatWidth>(asChatWidth(read(KEY.chatWidth)))
-/** 新建/刷新后默认打开哪个右栏标签（只影响进入界面的初始值，之后点标签照旧自由切）。 */
-export const defaultPanelTab = ref<PanelTab>(asTab(read(KEY.tab)))
 
 const darkQuery = window.matchMedia('(prefers-color-scheme: dark)')
 
@@ -114,11 +104,6 @@ export function setChatWidth(width: ChatWidth): void {
   chatWidth.value = width
   write(KEY.chatWidth, width)
   applyChatWidth()
-}
-
-export function setDefaultPanelTab(tab: PanelTab): void {
-  defaultPanelTab.value = tab
-  write(KEY.tab, tab)
 }
 
 /**

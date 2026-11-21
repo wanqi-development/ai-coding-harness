@@ -377,6 +377,40 @@ export interface PlanInfo {
   updated_at: string
 }
 
+export interface ReviewFinding {
+  finding_id: number
+  severity: 'P0' | 'P1' | 'P2' | 'P3'
+  file: string
+  line: number | null
+  title: string
+  description: string
+  status: 'open' | 'accepted' | 'fixed' | 'wont_fix' | 'stale'
+}
+
+/** 本地 / PR 审查快照；绑定一个确定的代码版本。 */
+export interface ReviewInfo {
+  review_id: number
+  session_id: number
+  plan_id: number | null
+  pull_request_id: number | null
+  stage: 'local' | 'pr'
+  status: 'running' | 'completed' | 'failed' | 'stale' | 'cancelled'
+  base_ref: string
+  base_sha: string
+  head_ref: string
+  head_sha: string
+  code_revision: string
+  summary: string
+  report_markdown: string
+  reviewer_agent: string
+  provider: string
+  model: string
+  rules_version: string
+  created_at: string
+  updated_at: string
+  findings: ReviewFinding[]
+}
+
 /**
  * 仓库记忆（StoreBackend 上那份 Markdown）。
  *
@@ -386,6 +420,18 @@ export interface PlanInfo {
 export interface MemorySnapshot {
   path: string
   content: string | null
+  documents: MemoryDocumentRef[]
+}
+
+export interface MemoryDocumentRef {
+  path: string
+  summary: string
+  keywords: string[]
+}
+
+export interface MemoryDocumentSnapshot {
+  path: string
+  content: string
 }
 
 /** 一条 PR（平台差异后端已归一）。`state` 是状态码，中文标签由前端映射。 */
@@ -478,6 +524,40 @@ export interface ClarificationInfo {
   allow_other?: boolean
 }
 
+export interface GitApprovalOption {
+  id: 'allow' | 'deny' | 'terminate' | string
+  label: string
+  description?: string
+  tone?: 'safe' | 'danger' | 'neutral' | string
+}
+
+export interface GitApprovalInfo {
+  approval_id: string
+  request_hash: string
+  tool_call_id: string
+  command: string
+  action: string
+  risk: string
+  status: string
+  choice?: string | null
+  options: GitApprovalOption[]
+  details: {
+    branch?: string
+    head_sha?: string
+    reason?: string
+    targets?: string[]
+    status?: string[]
+    status_truncated?: number
+    recovery_path?: string
+    clean_preview?: string[]
+    clean_preview_truncated?: number
+    preview_commands?: string[]
+  }
+  created_at: string
+  expires_at: string
+  resolved_at?: string | null
+}
+
 export interface ChatEvent {
   type:
     | 'ai'
@@ -485,9 +565,11 @@ export interface ChatEvent {
     | 'tool'
     | 'todos'
     | 'plan'
+    | 'review'
     | 'usage'
     | 'changes'
     | 'clarification'
+    | 'approval'
     | 'run'
     | 'done'
     | 'error'
@@ -502,7 +584,9 @@ export interface ChatEvent {
   items?: TodoItem[]
   error?: string
   plan?: PlanInfo
+  review?: ReviewInfo
   clarification?: ClarificationInfo
+  approval?: GitApprovalInfo
   /**
    * `usage` 帧：本轮收尾时下发的那份账。
    *
@@ -583,6 +667,28 @@ export async function getClarification(id: string): Promise<ClarificationInfo | 
   return r.json()
 }
 
+/** Current Git approval needed by the running turn; null means none. */
+export async function getGitApproval(id: string): Promise<GitApprovalInfo | null> {
+  const r = await fetch(`/sessions/${id}/git-approval`)
+  if (!r.ok) throw new Error(`审批状态加载失败：${r.status}`)
+  return r.json()
+}
+
+/** Resolve the current approval. The existing SSE run resumes in place. */
+export async function resolveGitApproval(
+  id: string,
+  approvalId: string,
+  choice: string,
+): Promise<GitApprovalInfo> {
+  const r = await fetch(`/sessions/${id}/git-approval`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approval_id: approvalId, choice }),
+  })
+  if (!r.ok) throw new Error(await errorDetail(r, `审批提交失败：${r.status}`))
+  return r.json()
+}
+
 /**
  * 该会话的仓库记忆全文（**只读**）。
  *
@@ -592,6 +698,17 @@ export async function getClarification(id: string): Promise<ClarificationInfo | 
 export async function getMemory(id: string): Promise<MemorySnapshot> {
   const r = await fetch(`/sessions/${id}/memory`)
   if (!r.ok) throw new Error(await errorDetail(r, `记忆加载失败：${r.status}`))
+  return r.json()
+}
+
+/** 按索引路径读取一份仓库记忆详情（只读）。 */
+export async function getMemoryDocument(
+  id: string,
+  path: string,
+): Promise<MemoryDocumentSnapshot> {
+  const query = new URLSearchParams({ path })
+  const r = await fetch(`/sessions/${id}/memory/document?${query}`)
+  if (!r.ok) throw new Error(await errorDetail(r, `记忆文档加载失败：${r.status}`))
   return r.json()
 }
 
@@ -659,7 +776,7 @@ export interface UsageSnapshot {
   totals: UsageActor
   actors: UsageActor[]
   /**
-   * **主控按形态**拆出来的用量（qa / analysis / plan / review / coding / rework）。
+   * **主控按形态**拆出来的用量（qa / plan / coding）。历史记录里的旧形态值仍可能返回。
    * 子智能体不在这里 —— 它们本来就是独立的执行主角（见 `actors`）。
    */
   by_form: Record<string, UsageActor>
@@ -701,7 +818,7 @@ export interface ModelConfigRow {
   section: string
   /** 这一行服务哪些角色（`plan` 行 = `plan` + `planner`）—— 「编码」那一组靠它按角色画 */
   roles: string[]
-  /** 界面「提供商」那一栏选中的是谁（后端按 base_url 反推；不存库，纯界面提示） */
+  /** 界面「提供商」那一栏选中的是谁；新数据显式存库，旧数据按 base_url 兼容反推 */
   provider: string
   /** 供应商被锁死（界面上不让改）：JEV 那一行锁 `typesafe` */
   provider_locked: boolean
@@ -758,6 +875,8 @@ export interface ProviderOption {
   key: string
   label: string
   base_url: string
+  /** 运行时协议：openai_compatible / anthropic_messages */
+  protocol: string
   ui_group: string
   sort_order: number
   /** 拉清单的路径：相对路径拼在 base_url 后面，**也可以写绝对 URL**（qwen 的清单在另一个根下） */
@@ -765,6 +884,8 @@ export interface ProviderOption {
   /** 鉴权头怎么写（多数是 `Authorization` + `Bearer `；有的网关是 `x-api-key`） */
   auth_header: string
   auth_prefix: string
+  /** 平台侧模型清单请求的额外请求头 */
+  extra_headers: Record<string, string>
   /** 1 启用 / 0 停用（停用的不进下拉，但在「提供商」栏里看得到、能改回来） */
   status: number
   /** 这家官方有没有 `/models`（只是标注；「测试连接」不看它） */
@@ -775,11 +896,13 @@ export interface ProviderOption {
 export interface ProviderUpsert {
   label: string
   base_url: string
+  protocol: string
   ui_group: string
   sort_order: number
   models_path: string
   auth_header: string
   auth_prefix: string
+  extra_headers: Record<string, string>
   status: number
   is_dynamic_model_list: boolean
 }
@@ -793,7 +916,7 @@ export interface ModelConfigSnapshot {
   coding_group: CodingGroupRole[]
   /** 意图识别走哪一关：`jev` / `llm`（**严格二选一**，不互相兜底） */
   intent_mode: string
-  /** JEV 这一侧配齐了没有（地址 + key）：false 时选了 JEV 会落关键字口径 */
+  /** JEV 这一侧配齐了没有（地址 + key）：false 时选了 JEV 会进入 qa 意图澄清 */
   jev_configured: boolean
 }
 
@@ -819,6 +942,7 @@ export async function putModelConfig(
     string,
     {
       base_url?: string
+      provider?: string
       model?: string
       api_key?: string
       api_key_from?: string

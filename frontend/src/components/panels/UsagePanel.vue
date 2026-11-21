@@ -46,13 +46,13 @@ const hasUsage = computed(() => (data.value?.rounds_with_usage ?? 0) > 0)
  *
  * - 主控**按形态**拆开：qa / plan 各一行；
  * - `coding` 是一组，子项是 coder / reviewer / planner；
- * - **rework 不单列**：它与 coding 共用 `orchestrate` 形态，主控开销并进 coding 那一组；
+ * - coding 是一组；历史记录里旧的 `rework` 值也并入 coding，避免旧会话出现第二套编码行；
  * - `intent`（判定）与 `internal`（摘要）是别处的开销，各自平铺。
  */
 const SUB_AGENT_KEYS = ['coder', 'reviewer', 'planner'] as const
 /** 独立成行的形态（主控按 ``extra.intent`` 聚合出来的） */
 const STANDALONE_FORMS = ['qa', 'plan'] as const
-/** 并进 coding 组的两个形态：rework 与 coding 共用同一套「主控 + 三个子智能体」 */
+/** 当前编码形态，并兼容历史记录里已废弃的 `rework` 值。 */
 const CODING_FORMS = ['coding', 'rework'] as const
 
 /** 形态的两个名字：拉丁名（与后端 key 对齐）+ 中文。 */
@@ -60,7 +60,6 @@ const FORM_LABELS: Record<string, [string, string]> = {
   qa: ['qa', '问答'],
   plan: ['plan', '方案'],
   coding: ['coding', '编码'],
-  rework: ['rework', 'PR 跟进'],
 }
 
 /** 子智能体的两个名字（与 /ai_coding/skills 里的角色名一致）。 */
@@ -108,7 +107,7 @@ const groupedRows = computed<UsageRow[]>(() => {
     rows.push({ key: form.key, actor: form, depth: 0, children: [], formKey: form.key })
   }
 
-  // ② coding 组：主控（coding + rework）+ 三个子智能体
+  // ② coding 组：主控（含历史 rework）+ 三个子智能体
   const kids = SUB_AGENT_KEYS.map((key) => byKey.get(key))
     .filter((actor): actor is UsageActor => actor !== undefined)
     .sort((a, b) => b.total - a.total)
