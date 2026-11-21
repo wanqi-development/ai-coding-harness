@@ -42,7 +42,7 @@ _PLAN_TOOLS = frozenset(
     }
 )
 
-#: 收尾时该给仓库记忆打底的形态 —— 只有 coding / rework 共用的 orchestrate。
+#: 收尾时该给仓库记忆打底的形态 —— 只有 coding 的 orchestrate。
 _MEMORY_WRITE_FORMS: frozenset[str] = frozenset({ORCHESTRATE_FORM})
 
 # 一轮跑到一半炸了时的标记：已经有正文就说明上面是部分输出，一条都没有就是未产出。

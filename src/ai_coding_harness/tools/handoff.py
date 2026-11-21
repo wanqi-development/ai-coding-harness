@@ -79,7 +79,7 @@ logger = logging.getLogger(__name__)
 NO_STATE = "当前没有轮次上下文，无法交接：请把做不了的原因和已掌握的情况直接讲给用户。"
 ALREADY = "本轮已经交接过一次了：同一个请求只能交出去一次，别来回甩锅，把已知情况讲给用户。"
 NO_REJUDGE = "现在无法重判意图（分类模型不可用），交接会把请求送到错误的能力形态上，请直接讲给用户。"
-NOT_LLM = "重判没有走模型（分类器不可用，退回了关键字口径），不足以推翻原来的判断，请直接讲给用户。"
+NOT_LLM = "重判没有走模型（分类器不可用，已转 qa 澄清），不足以推翻原来的判断，请直接讲给用户。"
 SAME_FORM = "重判结果仍是当前形态：这件事本来就该你做，接着做，别交接。"
 CLARIFY_ONLY = (
     "本轮是低置信度澄清轮：先问清用户意图，不要交接任务，也不要开始执行。"
@@ -267,8 +267,6 @@ def build_handoff_tools(ctx: HandoffContext) -> list[BaseTool]:
         config = RunnableConfig(
             configurable={
                 "thread_id": thread,
-                # 意图要与重判结果一致：指令段（``context_inject``）读的就是它
-                "intent": decision.intent,
                 "redact_terms": get_redact_terms(),
                 # 同一个 TurnState：内层的重复计数与外层合账，``handoffTask`` 的额度也共用
                 "turn_state": state,

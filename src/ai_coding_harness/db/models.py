@@ -476,6 +476,273 @@ class PullRequest(Base):
     plan: Mapped[Plan | None] = relationship(back_populates="pull_requests")
 
 
+class WorkTask(Base):
+    """A user-visible coding task spanning one or more coder submissions.
+
+    The main agent owns the task lifecycle and cumulative summary. Coder writes
+    immutable ``TaskSubmission`` rows after each commit/push.
+    """
+
+    __tablename__ = "work_tasks"
+    __table_args__ = (
+        Index("work_tasks_session_status_idx", "session_id", "status"),
+        Index("work_tasks_pr_idx", "pull_request_id"),
+        {"comment": "代码任务：主控维护的累计需求、分支和交付状态"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
+    )
+    session_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属会话",
+    )
+    owner: Mapped[str] = mapped_column(Text, nullable=False, comment="仓库 owner")
+    repo: Mapped[str] = mapped_column(Text, nullable=False, comment="仓库名")
+    title: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="任务标题"
+    )
+    requirement_summary: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="主控创建任务时记录的原始需求摘要"
+    )
+    current_summary: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="",
+        comment="主控合并全部 submission 后的累计摘要",
+    )
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="active",
+        comment="active / pr_open / merged / closed / cancelled",
+    )
+    branch: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="任务工作分支"
+    )
+    base_ref: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="目标分支"
+    )
+    latest_commit_sha: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="最新 coder 提交 SHA"
+    )
+    latest_head_sha: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="最新已推送 head SHA"
+    )
+    pull_request_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("pull_requests.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="任务交付 PR",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="结束时间"
+    )
+
+
+class TaskSubmission(Base):
+    """An immutable coder submission attached to a WorkTask."""
+
+    __tablename__ = "task_submissions"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "commit_sha",
+            name="task_submissions_task_commit_uq",
+        ),
+        Index("task_submissions_task_created_idx", "task_id", "created_at"),
+        {"comment": "代码任务提交：coder 每次 commit/push 的不可变记录"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
+    )
+    task_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("work_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属任务",
+    )
+    commit_sha: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="本地提交 SHA"
+    )
+    head_sha: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="已推送的远端 head SHA"
+    )
+    branch: Mapped[str] = mapped_column(Text, nullable=False, comment="提交分支")
+    base_ref: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="目标分支"
+    )
+    summary: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="本次 coder 提交摘要"
+    )
+    changed_files: Mapped[list | None] = mapped_column(
+        _JSON, nullable=True, comment="本次提交涉及文件"
+    )
+    verification: Mapped[list | None] = mapped_column(
+        _JSON, nullable=True, comment="本次验证命令与结果"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+
+
+class Review(Base):
+    """代码版本化审查记录；PR 只是发布渠道，不是 Review 的前置条件。"""
+
+    __tablename__ = "reviews"
+    __table_args__ = (
+        Index("reviews_session_created_idx", "session_id", "created_at"),
+        Index("reviews_pull_idx", "pull_request_id"),
+        Index("reviews_revision_idx", "code_revision"),
+        {"comment": "独立代码审查：绑定代码版本，可为本地候选或 PR 最终版本"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
+    )
+    session_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属会话",
+    )
+    plan_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("plans.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="关联方案",
+    )
+    pull_request_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("pull_requests.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="PR 阶段审查关联的 PR；本地审查为空",
+    )
+    stage: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="local",
+        comment="审查阶段：local / pr",
+    )
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="running",
+        comment="running / completed / failed / stale / cancelled",
+    )
+    base_ref: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="目标分支名"
+    )
+    base_sha: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="目标分支 SHA"
+    )
+    head_ref: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="源分支名；本地候选可为空"
+    )
+    head_sha: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="当前 HEAD SHA"
+    )
+    code_revision: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="",
+        comment="base_sha + 工作区相对 base 的规范化变更指纹",
+    )
+    summary: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="审查摘要"
+    )
+    report_markdown: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="完整审查报告"
+    )
+    reviewer_agent: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="reviewer", comment="执行审查的角色"
+    )
+    provider: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="审查模型供应商"
+    )
+    model_name: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="审查模型名"
+    )
+    rules_version: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="v1", comment="审查规则版本"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
+class ReviewFinding(Base):
+    """审查问题；状态独立，便于修复、接受风险与过期追踪。"""
+
+    __tablename__ = "review_findings"
+    __table_args__ = (
+        Index("review_findings_review_idx", "review_id"),
+        Index("review_findings_status_idx", "status"),
+        {"comment": "代码审查问题：P0-P3、位置与处理状态"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        _AUTO_BIGINT, primary_key=True, autoincrement=True, comment="主键"
+    )
+    review_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("reviews.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属审查",
+    )
+    severity: Mapped[str] = mapped_column(
+        String(8), nullable=False, comment="严重级别：P0 / P1 / P2 / P3"
+    )
+    file_path: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="相对仓库路径"
+    )
+    line_number: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="行号"
+    )
+    title: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="问题标题"
+    )
+    description: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", comment="问题描述与建议"
+    )
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="open",
+        comment="open / accepted / fixed / wont_fix / stale",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="更新时间",
+    )
+
+
 class SessionRecord(Base):
     """会话记录（基本信息）：用于页面时间线/列表展示的轻量事件表。
 
@@ -550,6 +817,8 @@ class ModelEndpoint(Base):
       （意图识别走哪一关；见 ``server/intent.py``）。
 
     **明文存 ``api_key``**：与 ``sessions`` 表那两个 git token 同口径（本地场景、单机自用）。
+    ``provider`` + 目录行的 ``protocol`` 共同决定运行时 Adapter；旧行 provider 为空时按
+    ``base_url`` 反推一次，兼容升级前的数据。
     接口只回打码值，写回时留空＝不修改；DB 里的 key 会一并进脱敏词表（``redact.secret_terms``）。
 
     ``context_window`` 为 0 ＝ 用户没填：解析时按「先读到的 → 128k 保守值」兜
@@ -573,7 +842,12 @@ class ModelEndpoint(Base):
         String(32), primary_key=True, comment="智能体键（形态名 / unified / fallback / …）"
     )
     base_url: Mapped[str | None] = mapped_column(
-        Text, nullable=True, comment="OpenAI 兼容入口（留空＝用出厂默认）"
+        Text, nullable=True, comment="模型接口入口（协议由 provider.protocol 决定）"
+    )
+    provider: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="提供商键；空＝旧数据，运行时按 base_url 兼容反推",
     )
     model_name: Mapped[str | None] = mapped_column(
         Text, nullable=True, comment="模型名（留空＝用出厂默认）"
@@ -643,8 +917,9 @@ class UserSetting(Base):
 class ModelProvider(Base):
     """模型提供商目录（界面「提供商」那一栏，2026-10-13 加）。
 
-    **配置的轴仍然是智能体**（见 ``ModelEndpoint``）：这张表只管「界面上挑哪一家、选中带出
-    哪个地址、拉模型列表时去哪拉、怎么鉴权、拉不到时给什么候选」——它不决定谁在用哪个模型。
+    **配置的轴仍然是智能体**（见 ``ModelEndpoint``）：这张表管「界面上挑哪一家、选中带出
+    哪个地址、运行时走哪种协议、拉模型列表时去哪拉、怎么鉴权」——具体哪个行用哪个模型仍由
+    ``ModelEndpoint`` 决定。
 
     启动时读进 ``Settings.providers``；**表为空时**用 ``config/model_providers.toml`` 灌一次
     （之后以库为准 —— 改种子文件不会覆盖已有行，要重新灌走 ``POST /model-config/providers/reload``）。
@@ -661,6 +936,12 @@ class ModelProvider(Base):
     display_name: Mapped[str] = mapped_column(Text, nullable=False, comment="界面显示名")
     default_base_url: Mapped[str | None] = mapped_column(
         Text, nullable=True, comment="选中它时带出的地址（可改；空＝要用户自己填）"
+    )
+    protocol: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default="openai_compatible",
+        comment="运行时协议：openai_compatible / anthropic_messages",
     )
     ui_group: Mapped[str | None] = mapped_column(Text, nullable=True, comment="下拉里的分组名")
     sort_order: Mapped[int] = mapped_column(
@@ -683,6 +964,9 @@ class ModelProvider(Base):
     )
     auth_prefix: Mapped[str | None] = mapped_column(
         Text, nullable=True, comment="鉴权头前缀（默认 'Bearer '）"
+    )
+    extra_headers: Mapped[dict | None] = mapped_column(
+        _JSON, nullable=True, comment="模型列表等平台请求的额外请求头"
     )
     default_models: Mapped[list | None] = mapped_column(
         _JSON,
@@ -818,4 +1102,66 @@ class Clarification(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+
+
+class GitApproval(Base):
+    """One interrupt-style approval for a Git command."""
+
+    __tablename__ = "git_approvals"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "request_hash",
+            name="git_approvals_session_request_uq",
+        ),
+        Index("git_approvals_session_status_idx", "session_id", "status"),
+        {"comment": "Git 危险命令的一次性中断审批"},
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, comment="审批 ID（uuid 字符串）"
+    )
+    session_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属会话",
+    )
+    request_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="命令、分支、HEAD 与工具调用的联合哈希"
+    )
+    tool_call_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, server_default="", comment="LangGraph tool call id"
+    )
+    command: Mapped[str] = mapped_column(Text, nullable=False, comment="完整命令")
+    action: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="", comment="Git 子命令"
+    )
+    risk: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="", comment="风险分类"
+    )
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="pending",
+        comment="pending / approved / denied / terminated / consumed / expired",
+    )
+    choice: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, comment="用户选择：allow / deny / terminate"
+    )
+    options: Mapped[list] = mapped_column(
+        _JSON, nullable=False, comment="选择器选项"
+    )
+    details: Mapped[dict] = mapped_column(
+        _JSON, nullable=False, server_default="{}", comment="风险、targets、恢复快照"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )

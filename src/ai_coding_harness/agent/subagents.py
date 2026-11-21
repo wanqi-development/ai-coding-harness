@@ -21,12 +21,14 @@ from ai_coding_harness.agent.middleware import (
     MemoryMiddleware,
     ModelRedactionMiddleware,
     ReadGuardMiddleware,
+    ReasoningHistoryMiddleware,
     RedactionMiddleware,
     StreamUsageMiddleware,
     ToolCallIdMiddleware,
     ToolErrorGuardMiddleware,
 )
 from ai_coding_harness.agent.prompts import CODER_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT
+from ai_coding_harness.safety.git_approval import GitApprovalContext
 from ai_coding_harness.safety.permissions import CommandSafety
 from ai_coding_harness.safety.policy import AgentPolicy
 
@@ -37,11 +39,11 @@ _ROLES: dict[str, dict[str, str]] = {
         "prompt": PLANNER_PROMPT,
     },
     "coder": {
-        "description": "按 planner 的方案实施代码、测试并创建 PR；按用户指定要修改的审查问题继续修复；纯文档任务可不经方案直接完成并创建 PR。",
+        "description": "按 planner 的方案实施代码和测试，或直接完成纯文档修改；按用户指定要修改的审查问题继续修复；commit + push 并回报结构化 submission，PR 由主控按当前交付目标创建。",
         "prompt": CODER_PROMPT,
     },
     "reviewer": {
-        "description": "对 PR / diff 做只读代码审查，并把结论评论到 PR。",
+        "description": "对本地 diff / PR diff 做只读审查，用 save_review 持久化版本化结论；PR 阶段再评论到 PR。",
         "prompt": REVIEWER_PROMPT,
     },
 }
@@ -55,6 +57,7 @@ def build_subagents(
     model_for: Callable[[str], BaseChatModel],
     policies: Mapping[str, AgentPolicy],
     safety: CommandSafety | None = None,
+    git_approval: GitApprovalContext | None = None,
     fallbacks: Mapping[str, FallbackMiddleware] | None = None,
     memory_factory: Callable[[str], MemoryMiddleware] | None = None,
     plan_recovery_factory: Callable[[str], AgentMiddleware | None] | None = None,
@@ -116,7 +119,7 @@ def build_subagents(
                 "model": model,
                 "middleware": [
                     # 与主控同序：边界在最外侧，记忆紧随其后
-                    BoundaryMiddleware(policies[role], safety),
+                    BoundaryMiddleware(policies[role], safety, git_approval),
                     # planner / coder 也要在进入与正常退出时回收 executing 方案。
                     *([plan_recovery] if plan_recovery is not None else []),
                     # 各角色一份新实例：它们可能在同一回合里并发跑（见上面的 ``memory_factory``）
@@ -134,8 +137,10 @@ def build_subagents(
                     HistoryRepairMiddleware(),
                     # 压缩（含压缩线处的应急裁剪）仍在兜底外面
                     *([summarization] if summarization is not None else []),
-                    # 兜底放在倒数第二层：它重试时不再重跑上面这几层
+                    # 兜底位于主要中间件内侧：它重试时不再重跑上面这几层
                     *([fallbacks[role]] if role in fallbacks else []),
+                    # 思考只展示当轮；子智能体换模型时也不回传历史 reasoning。
+                    ReasoningHistoryMiddleware(),
                     # 与主控同位置：流式用量开关的 400 重试在兜底内侧
                     StreamUsageMiddleware(agent=role),
                 ],

@@ -47,6 +47,7 @@ async def upsert_model_endpoint(
     user_id: int,
     agent: str,
     base_url: str | None = None,
+    provider: str | None = None,
     model_name: str | None = None,
     api_key: str | None = None,
     context_window: int | None = None,
@@ -67,6 +68,7 @@ async def upsert_model_endpoint(
         db.add(row)
     for field, value in (
         ("base_url", base_url),
+        ("provider", provider),
         ("model_name", model_name),
         ("api_key", api_key),
         ("context_window", context_window),
@@ -163,6 +165,7 @@ async def upsert_model_provider(
     provider: str,
     display_name: str,
     default_base_url: str = "",
+    protocol: str = "openai_compatible",
     ui_group: str = "",
     sort_order: int = 0,
     status: int = 1,
@@ -170,6 +173,7 @@ async def upsert_model_provider(
     models_path: str = "/models",
     auth_header: str = "Authorization",
     auth_prefix: str = "Bearer ",
+    extra_headers: dict[str, str] | None = None,
 ) -> None:
     """写一行提供商（没有就插入）。**整行覆盖** —— 与 ``model_endpoints`` 的「留空＝不改」不同：
 
@@ -182,6 +186,7 @@ async def upsert_model_provider(
         db.add(row)
     row.display_name = display_name
     row.default_base_url = default_base_url
+    row.protocol = protocol
     row.ui_group = ui_group
     row.sort_order = sort_order
     row.status = status
@@ -189,6 +194,7 @@ async def upsert_model_provider(
     row.models_path = models_path
     row.auth_header = auth_header
     row.auth_prefix = auth_prefix
+    row.extra_headers = extra_headers or {}
     row.updated_at = _now()
 
 
@@ -206,6 +212,7 @@ async def seed_model_providers(
             provider=meta.provider,
             display_name=meta.display_name,
             default_base_url=meta.default_base_url,
+            protocol=meta.protocol,
             ui_group=meta.ui_group,
             sort_order=meta.sort_order,
             status=meta.status,
@@ -213,6 +220,7 @@ async def seed_model_providers(
             models_path=meta.models_path,
             auth_header=meta.auth_header,
             auth_prefix=meta.auth_prefix,
+            extra_headers=meta.extra_headers,
         )
     return len(metas)
 

@@ -37,6 +37,7 @@ class GatedService:
         self._frames = frames
         self._gate = asyncio.Event()
         self.calls: list[dict[str, Any]] = []
+        self.recovery_calls: list[Any] = []
 
     async def chat(self, session, message, **extra: Any):
         self.calls.append({"message": message, **extra})
@@ -44,6 +45,9 @@ class GatedService:
             await self._gate.wait()
             self._gate.clear()
             yield frame
+
+    async def capture_restart_recovery(self, session: Any) -> None:
+        self.recovery_calls.append(session)
 
     async def advance(self, count: int) -> None:
         """放行 ``count`` 帧，并等它们真的落进缓冲。"""

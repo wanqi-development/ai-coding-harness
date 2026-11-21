@@ -703,6 +703,5 @@ def test_coder_only_writes_the_progress_not_the_plan():
         "get_unexecuted_plan",
         "updatePlanStatus",
         "updatePlanStep",
-        "create_pr",
         "list_pr_comments",
     ]

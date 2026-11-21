@@ -99,7 +99,7 @@ class TurnIntentMixin:
             return []
 
     async def _dialogue(self, session: Session) -> list[dict[str, str]]:
-        """最近三个用户轮次内的完整会话：user / assistant / plan 均保留全文。"""
+        """最近三个未中断完整轮次，外加窗口内的中断消息。"""
         if self._settings.intent_history_turns <= 0:
             return []
         try:
@@ -147,7 +147,7 @@ class TurnIntentMixin:
     async def _last_intent(self, session: Session) -> str | None:
         """上一轮的判定结果（``extra.intent``）。
 
-        对「你为什么不派 coder」「上一轮不是 rework 吗」这类追问，它比字面里的
+        对「你为什么不派 coder」「上一轮不是 coding 吗」这类追问，它比字面里的
         「为什么」可靠：同一个窗口开关（``intent_history_turns=0`` 不碰库），读失败只降级。
         """
         if self._settings.intent_history_turns <= 0:
@@ -172,16 +172,17 @@ class TurnIntentMixin:
         repo_state: str | None = None,
         user_id: int | None = None,
     ) -> IntentDecision:
-        """判定本轮意图：口令 → JEV → 大模型（都带最近几轮用户消息）→ 关键字口径。
+        """判定本轮意图：强口令 → 所选 JEV / 大模型；失败转 qa 意图澄清。
 
         用量记进本轮的累加器（``self._intent_usage``）—— 口令层不调模型，命中时那份额
         自然是空的，正是我们想要的「这一轮没为判定花钱」。
         """
+        mode = intent_mode_for(self._settings, user_id)
         return await detect_intent(
             message,
             history=history,
-            jev=self._jev_for(user_id),
-            model=self._classifier_for(user_id),
+            jev=self._jev_for(user_id) if mode == "jev" else None,
+            model=self._classifier_for(user_id) if mode == "llm" else None,
             timeout=self._settings.intent_timeout_seconds,
             usage=self._intent_usage,
             previous_reply=previous_reply,
@@ -190,7 +191,7 @@ class TurnIntentMixin:
             allowed_intents=allowed_intents,
             repo_state=repo_state,
             # 意图识别走哪一关：jev（三关，默认）/ llm（三关，不碰 JEV）—— 见 intent.detect_intent
-            mode=intent_mode_for(self._settings, user_id),
+            mode=mode,
         )
 
     async def _rejudge_intent(
@@ -229,7 +230,8 @@ class TurnIntentMixin:
         return await detect_intent(
             message,
             history=history,
-            jev=self._jev_for(user_id),
+            # force_llm 代表智能体主动重判，固定只走大模型，不初始化 JEV。
+            jev=None,
             model=self._classifier_for(user_id),
             timeout=self._settings.intent_timeout_seconds,
             force_llm=True,

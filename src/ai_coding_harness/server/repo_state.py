@@ -1,4 +1,4 @@
-"""每轮一次性 PR 快照：意图候选与仓库记忆同步共用同一份列表。"""
+"""每轮一次性 PR 快照：分类上下文与仓库记忆同步共用同一份列表。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from ai_coding_harness.tools.pr_client import (
 
 @dataclass(frozen=True)
 class PullSnapshot:
-    """一次轮首 PR 快照：最近 10 条用于记忆，open 全量用于工作闸门。"""
+    """一次轮首 PR 快照：最近 10 条用于记忆，open 全量用于任务与工作区同步。"""
 
     pulls: tuple[dict[str, Any], ...]
     open_pulls: tuple[dict[str, Any], ...] | None = None
@@ -55,7 +55,7 @@ class PullSnapshot:
 
     @property
     def has_reviewed_open_pr(self) -> bool:
-        """任一 open PR 已有评论，说明审查链路已开始，后续只能 rework。"""
+        """任一 open PR 已有评论，说明审查链路已开始。"""
         return any(bool(pull.get("_has_comments")) for pull in self.owned_open_prs)
 
 
@@ -132,8 +132,8 @@ def _blocked_message(open_pulls: tuple[dict[str, Any], ...]) -> str | None:
     hidden = len(foreign) - len(labels)
     suffix = f"等 {len(foreign)} 个 PR" if hidden > 0 else ""
     return (
-        f"检测到无法确认由当前 Agent 创建的 open PR：{'、'.join(labels)}{suffix}。"
-        "为避免与外部改动冲突，本轮已停止工作；请先处理上述 PR 后再继续。"
+        f"存在非本系统登记的 open PR：{'、'.join(labels)}{suffix}。"
+        "它们不按 PR 归属自动阻断本轮；写代码前只按当前代码任务判断需求是否冲突。"
     )
 
 
@@ -146,8 +146,8 @@ async def load_pull_snapshot(
 ) -> PullSnapshot:
     """拉最近 10 条全部 PR 与完整 open PR，并同步 PR 归属表。
 
-    coder 建完 PR、reviewer 失败时，PR 是 open 但没有评论；这时任务并未进入可返工
-    阶段，coding 仍要能继续收尾。评论只对 open PR 查，closed / merged 不花请求。
+    评论只对 open PR 查，closed / merged 不花请求。PR 状态只作为快照与工作区同步
+    依据，不再决定意图或是否允许写代码。
     """
     client = build_git_client(settings, repo)
     newest_before: int | None = None
@@ -275,18 +275,6 @@ async def load_pull_snapshot(
         open_pulls=open_tuple,
         blocked_reason=_blocked_message(open_tuple),
     )
-def intent_candidates(snapshot: PullSnapshot | None) -> tuple[str, ...]:
-    """PR 查询失败时只允许 qa；正常时按 open PR 收口写侧候选。"""
-    if snapshot is None:
-        return ("qa",)
-    if snapshot.blocked_reason is not None:
-        return ("qa",)
-    if snapshot.has_open_prs:
-        if snapshot.has_unreviewed_open_pr and not snapshot.has_reviewed_open_pr:
-            # reviewer 还没产出评论时，没有可返工对象；只能继续 coding 收尾。
-            return ("qa", "coding")
-        return ("qa", "rework")
-    return ("qa", "plan", "coding")
 
 
 def describe_snapshot(snapshot: PullSnapshot | None) -> str:
@@ -303,7 +291,7 @@ def describe_snapshot(snapshot: PullSnapshot | None) -> str:
         number = str(pull.get("number") or "").strip() or "?"
         title = str(pull.get("title") or "").strip()
         sha = str((pull.get("head") or {}).get("sha") or "").strip()[:8]
-        review = "已有评论" if pull.get("_has_comments") else "暂无评论，coding 可继续"
+        review = "已有评论" if pull.get("_has_comments") else "暂无评论"
         details = f"head {sha}；{review}" if sha else review
         names.append(f"#{number} {title}（{details}）".strip())
     hidden = len(open_prs) - len(names)

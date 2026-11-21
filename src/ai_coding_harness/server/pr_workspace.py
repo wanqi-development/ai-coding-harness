@@ -1,4 +1,4 @@
-"""rework 前的 PR head 安全同步。"""
+"""coding 继续已有 PR 前的 head 安全同步。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ class PullSyncResult:
     ok: bool
     message: str = ""
     pull: dict[str, Any] | None = None
+    preserved: bool = False
 
 
 def target_pull(
@@ -70,15 +71,28 @@ if [ ! -d "$repo_dir/.git" ]; then
   git clone "$repo_url" "$repo_dir"
 fi
 cd "$repo_dir"
-if [ -n "$(git status --porcelain)" ]; then
-  echo "__HARNESS_WORKTREE_DIRTY__"
-  exit 42
-fi
 git fetch origin "$head_ref"
 remote_sha=$(git rev-parse FETCH_HEAD)
 if [ "$remote_sha" != "$head_sha" ]; then
   echo "__HARNESS_HEAD_MOVED__"
   exit 43
+fi
+worktree_dirty=0
+if [ -n "$(git status --porcelain)" ]; then
+  worktree_dirty=1
+fi
+current_sha=$(git rev-parse HEAD)
+if [ "$worktree_dirty" -eq 1 ] && [ "$current_sha" = "$head_sha" ]; then
+  # Restarted mid-run: the persistent workspace volume contains work that has not
+  # been committed yet, but HEAD is already exactly the target PR revision. Do
+  # not discard it and do not attempt a checkout.
+  echo "__HARNESS_WORKTREE_PRESERVED__"
+  echo "__HARNESS_SYNCED__"
+  exit 0
+fi
+if [ "$worktree_dirty" -eq 1 ]; then
+  echo "__HARNESS_WORKTREE_DIRTY__"
+  exit 42
 fi
 if git show-ref --verify --quiet "refs/heads/$head_ref"; then
   if ! git merge-base --is-ancestor "refs/heads/$head_ref" "$head_sha"; then
@@ -149,4 +163,11 @@ async def sync_pull_workspace(
     output = "\n".join(part for part in (result.stdout, result.stderr) if part)
     if result.exit_code != 0 or "__HARNESS_SYNCED__" not in output:
         return PullSyncResult(False, _failure_message(output, number), pull)
+    if "__HARNESS_WORKTREE_PRESERVED__" in output:
+        return PullSyncResult(
+            True,
+            f"PR #{number} 已位于目标 head，保留了重启前未提交的工作区改动。",
+            pull,
+            preserved=True,
+        )
     return PullSyncResult(True, pull=pull)

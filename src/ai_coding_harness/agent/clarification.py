@@ -19,7 +19,6 @@ CLARIFY_INTENTS: tuple[str, ...] = (
     "qa",
     "plan",
     "coding",
-    "rework",
 )
 
 CLARIFY_OPEN = "<CLARIFY>"

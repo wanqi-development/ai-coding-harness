@@ -26,7 +26,7 @@ from langchain_core.runnables.config import var_child_runnable_config
 from ai_coding_harness.agent.middleware import TurnState
 from ai_coding_harness.agent.profiles import QA_FORM
 from ai_coding_harness.config import Settings
-from ai_coding_harness.server.intent import SOURCE_FALLBACK, SOURCE_LLM, IntentDecision
+from ai_coding_harness.server.intent import SOURCE_CLARIFY, SOURCE_LLM, IntentDecision
 from ai_coding_harness.tools.handoff import (
     ALREADY,
     CLARIFY_ONLY,
@@ -210,7 +210,7 @@ class TestRefusals:
         assert len(inner.payloads) == 1, "第二次不该再跑一趟内层"
 
     async def test_missing_rejudge_callback_refuses(self, ambient):
-        """没有重判回调时宁可不交接：拿关键字口径去换个形态等于再猜一次。"""
+        """没有重判回调时宁可不交接：没有模型证据就换个形态等于再猜一次。"""
         ambient(TurnState(message="做点事"))
         inner = _Inner([AIMessage("不该跑到这里")])
         out = await _call(build_handoff_tools(_context(inner))[0])
@@ -218,10 +218,10 @@ class TestRefusals:
         assert inner.payloads == []
 
     async def test_keyword_fallback_judgement_refuses(self, ambient):
-        """重判没走模型（分类器不可用、退回关键字口径）不足以推翻原来的判断。"""
+        """重判没走模型（分类器不可用、转 qa 澄清）不足以推翻原来的判断。"""
         state = TurnState(
             message="做点事",
-            rejudge=_fixed(IntentDecision(intent="coding", source=SOURCE_FALLBACK)),
+            rejudge=_fixed(IntentDecision(intent="coding", source=SOURCE_CLARIFY)),
         )
         ambient(state)
         inner = _Inner([AIMessage("不该跑到这里")])
@@ -340,8 +340,8 @@ class TestDispatch:
 
         assert inner.configs[0]["configurable"]["thread_id"] == "thread-1::handoff-1"
 
-    async def test_inner_run_carries_intent_terms_and_the_same_state(self, ambient):
-        """意图要与重判一致（指令段读它）、词表要带下去（脱敏）、``TurnState`` 与外层同一个。"""
+    async def test_inner_run_carries_terms_and_the_same_state(self, ambient):
+        """词表要带下去（脱敏）、``TurnState`` 与外层同一个；不注入意图文案。"""
         inner = _Inner([AIMessage("做完了")])
         state = TurnState(message="直接改", rejudge=_rejudge("coding"))
         ambient(state, redact_terms=("synth-token",))
@@ -349,7 +349,7 @@ class TestDispatch:
         await _call(build_handoff_tools(_context(inner))[0])
 
         configurable = inner.configs[0]["configurable"]
-        assert configurable["intent"] == "coding"
+        assert "intent" not in configurable
         assert configurable["redact_terms"] == ("synth-token",)
         assert configurable["turn_state"] is state, "换个 state，内层的重复计数就与外层脱账了"
 

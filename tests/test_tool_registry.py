@@ -52,6 +52,7 @@ def _subagent(role: str) -> list[str]:
             repo=REPO,
             database=object(),  # type: ignore[arg-type]  # 只为通过 build_plan_tools 的真值判断
             plan_ctx=PlanContext(session_db_id=1, owner="owner", repo="repo"),
+            backend=_fake_backend(),  # type: ignore[arg-type]
         )
     )
 
@@ -104,11 +105,13 @@ def test_main_can_read_and_post_pr_comments():
         "fetch_url_tool",
         "get_pr_info",
         "list_pr_comments",
+        "create_pr",
         "comment_pr",
         "close_pr",
         "get_unexecuted_plan",
         "planExists",
         "save_repo_memory",
+        "read_repo_memory",
     ]
 
 
@@ -117,10 +120,10 @@ def test_main_cannot_merge_pr():
     assert "merge_pr" not in _main()
 
 
-def test_only_main_writes_repo_memory():
-    """记忆写回统一由 coding / rework 主控负责，子智能体只回报结论。"""
+def test_main_and_qa_write_memory_but_plan_and_subagents_do_not():
+    """QA 可写分析结论；plan 与所有子智能体只读。"""
     assert "save_repo_memory" in _main()
-    assert "save_repo_memory" not in _main_with_handoff(QA_FORM)
+    assert "save_repo_memory" in _main_with_handoff(QA_FORM)
     assert "save_repo_memory" not in _main_with_handoff(PLAN_FORM)
     for role in ("planner", "coder", "reviewer"):
         assert "save_repo_memory" not in _subagent(role)
@@ -129,7 +132,7 @@ def test_only_main_writes_repo_memory():
 def test_coder_can_read_but_not_post_pr_comments():
     names = _subagent("coder")
 
-    assert "create_pr" in names
+    assert "create_pr" not in names
     # 读评论：用来自己拉审查原文（主控只给问题编号，不整段粘贴）
     assert "list_pr_comments" in names
     # 写评论：仍归主智能体
@@ -137,13 +140,32 @@ def test_coder_can_read_but_not_post_pr_comments():
 
 
 def test_reviewer_can_read_and_post_pr_comments():
-    assert _subagent("reviewer") == ["comment_pr", "list_pr_comments", "get_pr_info"]
+    assert _subagent("reviewer") == [
+        "comment_pr",
+        "list_pr_comments",
+        "get_pr_info",
+        "save_review",
+        "latestReview",
+        "read_repo_memory",
+    ]
+
+
+def test_main_owns_pr_creation_and_task_lifecycle():
+    names = set(_main())
+
+    assert "create_pr" in names
+    assert "getActiveWorkTask" not in names  # 无 DB 时任务工具不组装
 
 
 def test_planner_gets_no_pr_tools():
     names = _subagent("planner")
 
-    assert names == ["web_search_tool", "fetch_url_tool", "storePlan"]
+    assert names == [
+        "web_search_tool",
+        "fetch_url_tool",
+        "storePlan",
+        "read_repo_memory",
+    ]
 
 
 def test_plan_form_owns_the_plan_crud_tools():
