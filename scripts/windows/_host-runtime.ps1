@@ -69,4 +69,3 @@ function Reset-HarnessLogFile {
     New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
     [IO.File]::WriteAllText($Path, "", [Text.UTF8Encoding]::new($false))
 }
-
